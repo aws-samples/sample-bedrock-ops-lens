@@ -1,0 +1,37 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Bedrock Ops Lens — ECR repository bootstrap.
+
+  Deploy this FIRST. It creates only the ECR repo so deploy.sh can push the
+  backend image to it BEFORE the main stack creates the ECS service.
+
+  Without this two-pass deploy, the main stack's ECS service tries to pull
+  an image that doesn't exist yet, fails, and CloudFormation rolls back —
+  the whole reason CDK builds awkward custom resources to handle this.
+
+Parameters:
+  StackNamePrefix:
+    Type: String
+    Default: BedrockOpsLens
+
+Resources:
+  BackendRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      # ECR repository names must be lowercase + numbers + (-_./).
+      # Don't set RepositoryName at all — let CFN auto-generate a lowercase
+      # one. Customers don't refer to the repo by name; the URI comes from
+      # the CFN output.
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration: { ScanOnPush: true }
+      # Encrypt repository contents at rest with KMS (Checkov CKV_AWS_136)
+      EncryptionConfiguration:
+        EncryptionType: KMS
+      EmptyOnDelete: true
+
+Outputs:
+  EcrRepoUri:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${BackendRepo}'
+  EcrRepoName:
+    Value: !Ref BackendRepo

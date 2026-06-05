@@ -1,0 +1,437 @@
+body { margin: 0; }
+
+/* Provider icons whose visible elements are dark/black on a transparent
+   background (amazon's "a" + smile, forge, kimi). They become invisible
+   on Cloudscape's dark surface, so we invert them only in dark mode.
+   `hue-rotate(180deg)` after `invert(1)` keeps colors readable instead
+   of producing the cyan-on-orange Photoshop-glitch look you'd otherwise
+   get from a naked invert. */
+.awsui-dark-mode .provider-icon-invertable {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+/* Freshness strip below TopNavigation. Light grey strip in light mode;
+   dark grey to match Cloudscape's dark surfaces in dark mode. The
+   .awsui-dark-mode class is added to <body> by Cloudscape's applyMode(). */
+.mirror-freshness-strip {
+  background: #fafafa;
+  border-bottom: 1px solid #e9ebed;
+}
+.awsui-dark-mode .mirror-freshness-strip {
+  background: #1b262d;
+  border-bottom: 1px solid #2a3640;
+}
+
+/* Dark-mode overrides for the hand-rolled Ops Review surfaces. The light-mode
+   defaults below use #fff / #fafafa backgrounds and dark text - those need
+   to flip when Cloudscape adds .awsui-dark-mode to <body>. */
+
+.awsui-dark-mode .ops-kpi .ops-kpi-card {
+  background: #1d2731;
+  border-color: #2a3640;
+}
+.awsui-dark-mode .ops-kpi .ops-kpi-card:hover {
+  border-color: #539fe5;
+  box-shadow: 0 0 0 1px #539fe5;
+}
+.awsui-dark-mode .ops-kpi .ops-kpi-card[disabled]:hover,
+.awsui-dark-mode .ops-kpi .ops-kpi-card:disabled:hover {
+  border-color: #2a3640;
+}
+.awsui-dark-mode .ops-kpi .ops-kpi-label { color: #95a3b3; }
+.awsui-dark-mode .ops-kpi-num.muted { color: #95a3b3; }
+
+.awsui-dark-mode .ops-timeline {
+  background: #1d2731;
+  border-color: #2a3640;
+}
+.awsui-dark-mode .ops-timeline-row { border-bottom-color: #2a3640; }
+.awsui-dark-mode .ops-timeline-label { border-right-color: #2a3640; }
+.awsui-dark-mode .ops-timeline-modelname { color: #d1d5db; }
+.awsui-dark-mode .ops-timeline-milestone,
+.awsui-dark-mode .ops-timeline-mdate,
+.awsui-dark-mode .ops-timeline-tick { color: #95a3b3; }
+.awsui-dark-mode .ops-timeline-dot { border-color: #1d2731; }
+
+.awsui-dark-mode .ops-mermaid {
+  background: #1d2731;
+  border-color: #2a3640;
+}
+.awsui-dark-mode .ops-mermaid-details {
+  background: #1d2731;
+  border-color: #2a3640;
+}
+.awsui-dark-mode .ops-mermaid-details > summary { color: #539fe5; }
+.awsui-dark-mode .ops-mermaid-details[open] > summary { color: #d1d5db; }
+
+.awsui-dark-mode .ops-narrative blockquote {
+  background: #122436;
+  color: #d1d5db;
+  border-left-color: #539fe5;
+}
+.awsui-dark-mode .ops-narrative th,
+.awsui-dark-mode .ops-narrative td { border-color: #2a3640; }
+.awsui-dark-mode .ops-narrative pre { background: #0f1b2a; }
+.awsui-dark-mode .ops-narrative code { background: #2a3640; color: #d1d5db; }
+.awsui-dark-mode .ops-narrative pre code { background: transparent; }
+
+/* TopNavigation logo + title.
+   Cloudscape ships hashed class names (awsui_logo_<hash>, awsui_title_<hash>)
+   so a flat [class*="awsui_logo"] selector loses the cascade. Anchor inside
+   the .awsui_top-navigation wrapper to win on specificity, and set BOTH
+   height and width (auto-sizing leaves the SVG at its intrinsic size). */
+[class*="awsui_top-navigation"] [class*="awsui_identity"] [class*="awsui_logo"] {
+  display: inline-flex !important;
+  align-items: center !important;
+}
+[class*="awsui_top-navigation"] [class*="awsui_identity"] [class*="awsui_logo"] img,
+[class*="awsui_top-navigation"] [class*="awsui_identity"] [class*="awsui_logo"] svg {
+  height: 22px !important;
+  width: auto !important;
+  max-height: 22px !important;
+  max-width: 48px !important;
+  display: block !important;
+}
+[class*="awsui_top-navigation"] [class*="awsui_identity"] [class*="awsui_title"] {
+  font-size: 22px !important;
+  font-weight: 700 !important;
+  line-height: 26px !important;
+  padding-left: 10px !important;
+}
+
+/* AWS-orange primary button. Reserved STRICTLY for action-triggering
+   buttons: "Generate AI report", "Save preferences", "Export CSV", etc.
+   Never for navigation, never for info, never for "view more". One orange
+   button per page max. Apply via:
+       <Button variant="primary" className="action-orange">…</Button>
+   (Also applied unconditionally inside Flashbar so the Cloudscape primary
+   in there isn't a near-invisible blue-on-blue.) */
+/* `body` prefix bumps specificity so we win against Cloudscape's own hashed
+   primary-button rule (which uses `:where()` for low specificity but is
+   still authored after our stylesheet — without `body` we lose ties). */
+body .action-orange [class*="awsui_button"][class*="awsui_variant-primary"],
+body .action-orange button[class*="awsui_button"][class*="awsui_variant-primary"],
+body .action-orange button[class*="awsui_variant-primary"] {
+  background-color: #ec7211 !important;
+  background: #ec7211 !important;
+  border-color: #ec7211 !important;
+  color: #ffffff !important;
+}
+body .action-orange [class*="awsui_button"][class*="awsui_variant-primary"]:hover,
+body .action-orange button[class*="awsui_button"][class*="awsui_variant-primary"]:hover,
+body .action-orange button[class*="awsui_variant-primary"]:hover {
+  background-color: #d4660d !important;
+  background: #d4660d !important;
+  border-color: #d4660d !important;
+}
+body .action-orange [class*="awsui_button"][class*="awsui_variant-primary"]:active,
+body .action-orange button[class*="awsui_button"][class*="awsui_variant-primary"]:active,
+body .action-orange button[class*="awsui_variant-primary"]:active {
+  background-color: #ba590a !important;
+  background: #ba590a !important;
+}
+body .action-orange [class*="awsui_button"][class*="awsui_variant-primary"]:focus,
+body .action-orange button[class*="awsui_button"][class*="awsui_variant-primary"]:focus,
+body .action-orange button[class*="awsui_variant-primary"]:focus {
+  outline-color: #ec7211 !important;
+}
+/* Make the gen-ai sparkle (and any other icon glyph) white on orange. */
+body .action-orange button[class*="awsui_variant-primary"] svg,
+body .action-orange button[class*="awsui_variant-primary"] svg path {
+  fill: #ffffff !important;
+  color: #ffffff !important;
+}
+
+/* AWS orange brand button - used in the customer-filter Flashbar where the
+   default Cloudscape primary renders white-on-light-blue and is invisible. */
+[class*="awsui_flash"] [class*="awsui_button"][class*="awsui_variant-primary"],
+[class*="awsui_flash"] button[class*="awsui_button"][class*="awsui_variant-primary"] {
+  background-color: #ec7211 !important;
+  border-color: #ec7211 !important;
+  color: #ffffff !important;
+}
+[class*="awsui_flash"] [class*="awsui_button"][class*="awsui_variant-primary"]:hover,
+[class*="awsui_flash"] button[class*="awsui_button"][class*="awsui_variant-primary"]:hover {
+  background-color: #d4660d !important;
+  border-color: #d4660d !important;
+}
+[class*="awsui_flash"] [class*="awsui_button"][class*="awsui_variant-primary"]:focus,
+[class*="awsui_flash"] button[class*="awsui_button"][class*="awsui_variant-primary"]:focus {
+  outline-color: #ec7211 !important;
+}
+[class*="awsui_flash"] [class*="awsui_button"][class*="awsui_variant-normal"],
+[class*="awsui_flash"] button[class*="awsui_button"][class*="awsui_variant-normal"] {
+  background-color: #ffffff !important;
+  border-color: #ffffff !important;
+  color: #16191f !important;
+}
+
+/* Mermaid diagrams: keep them readable. Override the default mermaid CSS
+   font-size (which the lib applies inline at 9-10px) with a comfortable
+   reading size. Gantt charts in particular are unreadable at the default. */
+.ops-mermaid svg { max-width: 100%; height: auto; font-size: 14px !important; }
+.ops-mermaid svg .nodeLabel,
+.ops-mermaid svg .edgeLabel,
+.ops-mermaid svg .titleText,
+.ops-mermaid svg .label,
+.ops-mermaid svg .taskText,
+.ops-mermaid svg .taskTextOutsideRight,
+.ops-mermaid svg .taskTextOutsideLeft,
+.ops-mermaid svg .sectionTitle,
+.ops-mermaid svg .grid .tick text,
+.ops-mermaid svg text,
+.ops-mermaid svg tspan { font-size: 14px !important; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important; }
+.ops-mermaid svg .edgeLabel { background-color: #fff; padding: 2px 4px; }
+.ops-mermaid {
+  background: #fafafa;
+  border: 1px solid #e9ebed;
+  border-radius: 6px;
+  padding: 12px;
+  margin-top: 8px;
+  overflow-x: auto;
+}
+
+/* Collapsible wrapper around each mermaid diagram. Native <details>/<summary>
+   so it works inside dangerouslySetInnerHTML without React state. */
+.ops-mermaid-details {
+  margin: 12px 0;
+  border: 1px solid #e9ebed;
+  border-radius: 8px;
+  padding: 6px 12px;
+  background: #ffffff;
+}
+.ops-mermaid-details > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+  color: #0972d3;
+  list-style: none;
+  padding: 4px 0;
+  user-select: none;
+}
+.ops-mermaid-details > summary::-webkit-details-marker { display: none; }
+.ops-mermaid-details > summary::before {
+  content: "▸ ";
+  display: inline-block;
+  margin-right: 4px;
+  transition: transform 0.15s;
+}
+.ops-mermaid-details[open] > summary::before { content: "▾ "; }
+.ops-mermaid-details[open] > summary { color: #0f1b2a; }
+
+/* AI summary narrative - render the markdown a bit nicer */
+.ops-narrative h2 { font-size: 18px; margin-top: 20px; margin-bottom: 8px; }
+.ops-narrative h3 { font-size: 16px; margin-top: 16px; margin-bottom: 6px; }
+.ops-narrative blockquote {
+  border-left: 4px solid #0972d3;
+  padding: 6px 12px;
+  background: #f2f8fd;
+  margin: 12px 0;
+  color: #0f1b2a;
+}
+.ops-narrative table { border-collapse: collapse; margin: 12px 0; }
+.ops-narrative th, .ops-narrative td { border: 1px solid #e9ebed; padding: 6px 10px; font-size: 13px; }
+.ops-narrative pre { background: #f5f5f5; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+.ops-narrative code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+.ops-narrative pre code { background: transparent; padding: 0; }
+
+/* Lifecycle timeline - horizontal-axis-of-dates style chart, replacing the
+   unreadable Mermaid Gantt. Each row is a flex container: a fixed-width
+   model-name column on the left, then a relative-positioned track on the
+   right with absolutely-positioned milestone markers + a vertical "today"
+   line. Pure CSS so it prints/exports cleanly. */
+.ops-timeline {
+  width: 100%;
+  background: #ffffff;
+  padding: 8px 12px 12px;
+  border: 1px solid #e9ebed;
+  border-radius: 6px;
+}
+.ops-timeline-row {
+  display: flex;
+  align-items: stretch;
+  min-height: 70px;
+  border-bottom: 1px dashed #f1f3f4;
+}
+.ops-timeline-row:last-child { border-bottom: none; }
+.ops-timeline-row.ops-timeline-axis { min-height: 28px; }
+.ops-timeline-label {
+  flex: 0 0 200px;
+  padding: 14px 12px 0 0;
+  border-right: 1px solid #e9ebed;
+}
+.ops-timeline-modelname {
+  font-size: 14px;
+  font-weight: 600;
+  color: #16191f;
+  line-height: 1.2;
+  word-break: break-word;
+}
+.ops-timeline-modelsev {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  margin-top: 4px;
+  font-weight: 600;
+}
+.ops-timeline-track {
+  position: relative;
+  flex: 1;
+  margin-left: 16px;
+}
+.ops-timeline-band {
+  position: absolute;
+  top: 50%;
+  height: 4px;
+  border-radius: 2px;
+  opacity: .25;
+  transform: translateY(-50%);
+}
+.ops-timeline-today-line {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 0;
+  border-left: 2px solid #d91515;
+  z-index: 1;
+}
+.ops-timeline-today-flag {
+  position: absolute;
+  top: -4px;
+  transform: translateX(-50%);
+  background: #d91515;
+  color: #fff;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 2px;
+  font-weight: 600;
+  letter-spacing: .3px;
+}
+.ops-timeline-milestone {
+  position: absolute;
+  transform: translateX(-50%);
+  text-align: center;
+  font-size: 11px;
+  color: #5f6b7a;
+  pointer-events: none;
+}
+.ops-timeline-milestone.above { top: 4px; }
+.ops-timeline-milestone.below { top: calc(50% + 8px); }
+.ops-timeline-mlabel {
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .3px;
+  line-height: 1.1;
+}
+.ops-timeline-mdate {
+  font-size: 11px;
+  color: #5f6b7a;
+  white-space: nowrap;
+  margin-bottom: 2px;
+  margin-top: 2px;
+}
+.ops-timeline-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin: 0 auto;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.1);
+}
+.ops-timeline-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  font-size: 11px;
+  color: #5f6b7a;
+  white-space: nowrap;
+}
+
+/* KPI ribbon counter chips */
+.ops-kpi {
+  display: flex; gap: 12px; flex-wrap: wrap;
+}
+.ops-kpi .ops-kpi-card {
+  flex: 1 1 160px;
+  min-width: 140px;
+  background: #fff;
+  border: 1px solid #e9ebed;
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.05s;
+}
+.ops-kpi .ops-kpi-card:hover {
+  border-color: #0972d3;
+  box-shadow: 0 0 0 1px #0972d3;
+}
+.ops-kpi .ops-kpi-card:active { transform: translateY(1px); }
+.ops-kpi .ops-kpi-card:focus-visible {
+  outline: 2px solid #0972d3;
+  outline-offset: 2px;
+}
+.ops-kpi .ops-kpi-card[disabled],
+.ops-kpi .ops-kpi-card:disabled {
+  cursor: default;
+  opacity: 0.85;
+}
+.ops-kpi .ops-kpi-card[disabled]:hover,
+.ops-kpi .ops-kpi-card:disabled:hover {
+  border-color: #e9ebed;
+  box-shadow: none;
+}
+
+/* Flash highlight applied to a target section when a KPI card is clicked. */
+@keyframes opsFlash {
+  0%   { box-shadow: 0 0 0 0 rgba(9, 114, 211, 0.45); }
+  40%  { box-shadow: 0 0 0 6px rgba(9, 114, 211, 0.20); }
+  100% { box-shadow: 0 0 0 0 rgba(9, 114, 211, 0.00); }
+}
+.ops-flash {
+  border-radius: 16px;
+  animation: opsFlash 1.4s ease-out;
+  scroll-margin-top: 80px;
+}
+#ops-section-summary,
+#ops-section-lifecycle,
+#ops-section-capacity,
+#ops-section-growth,
+#ops-section-burndown,
+#ops-section-shape { scroll-margin-top: 80px; }
+.ops-kpi .ops-kpi-num { font-size: 28px; font-weight: 700; line-height: 1; }
+.ops-kpi .ops-kpi-label { font-size: 12px; color: #5f6b7a; text-transform: uppercase; letter-spacing: .5px; }
+.ops-kpi-num.crit { color: #d91515; }
+.ops-kpi-num.warn { color: #b35900; }
+.ops-kpi-num.ok   { color: #037f0c; }
+.ops-kpi-num.info { color: #0972d3; }
+.ops-kpi-num.muted { color: #5f6b7a; }
+
+/* Print: hide everything except the ops review tab content */
+@media print {
+  [class*="awsui_top-navigation"],
+  [class*="awsui_tools"],
+  [class*="awsui_navigation"],
+  [class*="awsui_tabs-header"],
+  [class*="awsui_breadcrumb"],
+  .no-print {
+    display: none !important;
+  }
+  body { background: #fff !important; }
+  .ops-print-root, .ops-print-root * {
+    visibility: visible !important;
+  }
+  .ops-print-root {
+    position: relative;
+    margin: 0;
+    padding: 0;
+  }
+  .ops-section-break { page-break-before: always; }
+  table { page-break-inside: avoid; }
+  .ops-mermaid { page-break-inside: avoid; }
+}

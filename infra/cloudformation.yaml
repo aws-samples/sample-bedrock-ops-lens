@@ -1,0 +1,1427 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Bedrock Ops Lens — single-stack CloudFormation template (Lambda Function URL
+  backend). Architecture:
+
+      Browser → CloudFront ─┬─ /         → S3 (static SPA)
+                            └─ /api/*   → Lambda Function URL
+                                              │
+                            ┌─────────────────┼─────────────────┐
+                            │                 │                 │
+                       Aurora Pg v2     ElastiCache         Cognito User Pool
+                       (data)           Memcached           (auth, Hosted UI,
+                                        (cache)              admin-create only)
+                                              ▲
+                                              │
+                                  Pre-warm Lambda (EventBridge,
+                                  runs after Ingester Lambda)
+
+  Single template, single deploy.sh. No Fargate, no ALB, no ECS, no NAT.
+
+# =============================================================================
+# Parameters — every per-deploy knob lives here. deploy.sh fills them in.
+# =============================================================================
+Parameters:
+  StackNamePrefix:
+    Type: String
+    Default: BedrockOpsLens
+    Description: Logical prefix for resource Name tags. Just a label.
+  AllowedEmailDomains:
+    Type: String
+    Description: |
+      Comma-separated list of email domains the Pre-Sign-Up Lambda accepts
+      (e.g. amazon.com or amazon.com,subsidiary.com or '*' for any).
+      Required when CognitoSelfSignUp=enabled. Has no effect under
+      CognitoSelfSignUp=disabled (admin-create-only mode).
+  CognitoSelfSignUp:
+    Type: String
+    Default: 'disabled'
+    AllowedValues: [ 'disabled', 'enabled' ]
+    Description: |
+      'disabled' (default, secure): admin creates users via
+      `aws cognito-idp admin-create-user`. No public sign-up form.
+      'enabled': self-service sign-up gated by Pre-Sign-Up Lambda.
+  BackendImageUri:
+    Type: String
+    Description: |
+      ECR image URI for the backend Lambda container (Dockerfile.lambda).
+      e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo:latest
+      deploy.sh creates the ECR repo, pushes the image, then passes the
+      URI here so the Lambda can pull it on first launch.
+  BedrockLogsBucket:
+    Type: String
+    Default: ''
+    Description: |
+      Optional S3 bucket where Bedrock model-invocation logs are delivered.
+      Configure under Bedrock console → Settings → Model invocation logging.
+      If left empty, the invocation_logs ingester is skipped (volumetric data
+      from CloudWatch Metrics still works; tag-attribution requires this).
+  IngesterScheduleHour:
+    Type: Number
+    Default: 5
+    Description: |
+      UTC hour to run the ingester each day (5 UTC ≈ midnight CT). Pre-warm
+      Lambda runs 30 min after the ingester completes.
+  EdgeShaVersionArn:
+    Type: String
+    Description: |
+      Versioned ARN of the Lambda@Edge SHA-256 body-hash signer, output by
+      the edge-bootstrap stack (us-east-1). CloudFront wires this as a
+      viewer-request handler on the /api/* behaviour.
+  WebAclArn:
+    Type: String
+    Description: |
+      ARN of the CLOUDFRONT-scoped WAFv2 WebACL, output by the
+      edge-bootstrap stack (us-east-1). CloudFront uses this to gate
+      requests with the AWS Managed Common Rule Set.
+
+# =============================================================================
+# Conditions
+# =============================================================================
+Conditions:
+  AdminOnlySignUp:    !Equals [ !Ref CognitoSelfSignUp, 'disabled' ]
+  HasBedrockLogsBkt:  !Not [ !Equals [ !Ref BedrockLogsBucket, '' ] ]
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ===========================================================================
+  # Network — VPC, two private subnets, two public subnets, NAT.
+  # Lambda + Aurora + Memcached all live in the private subnets. NAT is
+  # the only public-IP-attached thing, used for Lambda outbound calls
+  # (Cognito IDP, ECR, etc.) since VPC-attached Lambdas need a route out.
+  # ===========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.50.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [ { Key: Name, Value: !Sub '${StackNamePrefix}-vpc' } ]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Omit MapPublicIpOnLaunch entirely — default is false. cfn-guard
+  # SUBNET_AUTO_ASSIGN_PUBLIC_IP_DISABLED flags the property's presence
+  # regardless of value, so the safest fix is to rely on the secure default.
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.50.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.50.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.50.16.0/22
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.50.20.0/22
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIgw
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachIgw
+    Properties: { Domain: vpc }
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref Vpc }
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable }
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable }
+
+  # ===========================================================================
+  # Security groups — wired with separate ingress rules to break circular refs.
+  # ===========================================================================
+  # Egress is explicitly allow-all on each SG (the AWS default), made
+  # explicit so cfn_nag F1000 doesn't flag it. The Lambdas need outbound to
+  # AWS APIs / VPC endpoints; Aurora and Memcached have no outbound traffic
+  # but inheriting the default keeps the policy uniform.
+  LambdaSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Backend / Ingester / Pre-warm Lambdas
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (AWS APIs, VPC endpoints, Bedrock)
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora postgres
+      VpcId: !Ref Vpc
+      # Egress restricted to TCP/5432 within the VPC CIDR only — avoids
+      # all-protocols ('-1') egress (SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE).
+      # Aurora has no legitimate outbound traffic to the public internet;
+      # intra-cluster replication uses the PostgreSQL wire protocol on 5432.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 10.50.0.0/16
+          Description: Restrict egress to PostgreSQL within VPC CIDR only
+  CacheSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache Memcached
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (no real outbound expected)
+
+  DbSgFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt DbSg.GroupId
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !GetAtt LambdaSg.GroupId
+  CacheSgFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt CacheSg.GroupId
+      IpProtocol: tcp
+      FromPort: 11211
+      ToPort: 11211
+      SourceSecurityGroupId: !GetAtt LambdaSg.GroupId
+
+  # ===========================================================================
+  # Aurora PostgreSQL Serverless v2
+  # ===========================================================================
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Bedrock Ops Lens Aurora subnets
+      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+
+  # Customer-managed KMS CMK so the DbSecret is not encrypted with the
+  # AWS-managed aws/secretsmanager key (CKV_AWS_149). Gives us key-policy
+  # control and per-key audit trails for Aurora master credentials.
+  SecretsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub 'CMK for ${StackNamePrefix} Secrets Manager secrets'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSecretsManagerUse
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: '*'
+          # Allow IAM principals in this account to decrypt the secret as
+          # long as the call is going through the Secrets Manager service.
+          # Standard AWS pattern: scopes the grant to "we created a secret
+          # and gave that role secretsmanager:GetSecretValue" — they don't
+          # get blanket KMS access to anything else.
+          - Sid: AllowAccountRolesViaSecretsManager
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+
+  SecretsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-secrets'
+      TargetKeyId: !Ref SecretsKey
+
+  # Encrypted with a customer-managed CMK (SECRETSMANAGER_USING_CMK /
+  # CKV_AWS_149) instead of the default AWS-managed aws/secretsmanager
+  # key. KmsKeyId uses the explicit key ARN so static analyzers reliably
+  # detect the CMK reference.
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub 'Aurora master credentials for ${StackNamePrefix}'
+      KmsKeyId: !GetAtt SecretsKey.Arn
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"bedrock_lens"}'
+        GenerateStringKey: password
+        ExcludePunctuation: true
+        PasswordLength: 32
+
+  # SecretsManager attachment binds the secret to the Aurora cluster so
+  # the hosted rotation Lambda knows which DB to rotate against.
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbCluster
+      TargetType: AWS::RDS::DBCluster
+
+  # NOTE: SecretsManager rotation was attempted earlier (cfn-guard
+  # SECRETSMANAGER_ROTATION_ENABLED_CHECK) but the AWS-hosted
+  # PostgreSQLSingleUser rotation Lambda generates random passwords with
+  # default punctuation, ignoring the secret's ExcludePunctuation hint, and
+  # also race-conditions with Aurora cluster creation when used in a fresh
+  # stack. The rotation Lambda would advance the secret to a new password
+  # but fail to push it to Aurora, breaking auth. For a sample app, manual
+  # rotation (operator-driven, via CLI or RDS console) is enough; remove
+  # the RotationSchedule resource here. Re-add only with a working,
+  # tested rotation pipeline if customers ask for it.
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '16.11'
+      EngineMode: provisioned
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [ !Ref DbSg ]
+      DatabaseName: bedrock_lens
+      StorageEncrypted: true
+      # Enable IAM DB authentication (CKV_AWS_162) so DB access can be
+      # gated by IAM policies in addition to the Secrets Manager password.
+      EnableIAMDatabaseAuthentication: true
+      ServerlessV2ScalingConfiguration:
+        # 0.5 keeps the writer warm. MinCapacity: 0 lets Aurora auto-pause
+        # after 5 min idle, and the resume-on-first-query latency (~10 sec)
+        # is felt as a "cold dashboard" by anyone reopening the tab.
+        MinCapacity: 0.5
+        MaxCapacity: 4
+      EnableCloudwatchLogsExports: [ postgresql ]
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+
+  DbWriter:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    # Aurora cluster members inherit master credentials from the parent
+    # DBCluster (DbCluster), which sources MasterUserPassword from
+    # Secrets Manager via a dynamic reference. Setting MasterUserPassword
+    # on a cluster-member DBInstance is invalid for Aurora, so this
+    # cfn-guard finding is a false positive on a non-applicable rule.
+    # MultiAZ is also non-applicable here: Aurora HA is achieved by adding
+    # cluster instances across AZs (DBCluster managed), not via the
+    # DBInstance.MultiAZ flag, which RDS rejects for Aurora engines.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - RDS_MASTER_USER_PASSWORD_USES_SECURE_PARAMETER
+          - RDS_MULTI_AZ_SUPPORT
+          # StorageEncrypted is set on the parent DBCluster (Aurora);
+          # specifying it on a cluster-member DBInstance is invalid for
+          # Aurora engines, so this rule is non-applicable here.
+          - RDS_STORAGE_ENCRYPTED
+    Properties:
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref DbCluster
+      PubliclyAccessible: false
+      # Auto-apply minor engine version upgrades to receive timely
+      # security patches for the database engine.
+      AutoMinorVersionUpgrade: true
+
+  # ===========================================================================
+  # ElastiCache Memcached — multi-threaded, designed for query-result caching.
+  # cache_generation atomic invalidation lives here as a simple integer key.
+  # ===========================================================================
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Bedrock Ops Lens Memcached subnets
+      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+
+  CacheCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      CacheNodeType: cache.t4g.micro
+      Engine: memcached
+      EngineVersion: '1.6.22'
+      NumCacheNodes: 1
+      VpcSecurityGroupIds: [ !GetAtt CacheSg.GroupId ]
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+
+  # ===========================================================================
+  # SPA bucket — private, served via CloudFront OAC
+  # ===========================================================================
+  # Dedicated access-logs bucket (CKV_AWS_18). Holds S3 server access logs
+  # for SpaBucket so viewer requests are auditable. Access logging on the
+  # logs bucket itself is intentionally omitted to avoid recursive logging.
+  SpaLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Enabling server access logging on the access-logs bucket itself
+    # would create a recursive logging loop, so this rule is suppressed
+    # for this bucket only. SpaBucket (the content bucket) does have
+    # LoggingConfiguration pointing at this bucket.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: auto-delete
+          Value: 'no'
+        - Key: app
+          Value: bedrock-ops-lens
+        - Key: stack
+          Value: !Ref AWS::StackName
+
+  SpaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Explicit Private ACL (S3_BUCKET_NO_PUBLIC_RW_ACL) — ensures the
+      # bucket is never created with a public-read or public-read-write
+      # canned ACL. CloudFront access is granted via OAC + bucket policy.
+      AccessControl: Private
+      # Object Lock enabled (S3_BUCKET_DEFAULT_LOCK_ENABLED) so WORM
+      # retention can be applied to objects if required for compliance.
+      # No default retention is set, preserving the ability to overwrite
+      # SPA bundles on deploy via bucket versioning.
+      ObjectLockEnabled: true
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      # S3 server access logging (CKV_AWS_18) — delivered to a dedicated
+      # logs bucket so SPA-bucket access is auditable.
+      LoggingConfiguration:
+        DestinationBucketName: !Ref SpaLogsBucket
+        LogFilePrefix: spa-access-logs/
+      # auto-delete:no flags this resource for "do NOT auto-delete" sweepers.
+      # Bucket has DeletionPolicy: Retain — versioned objects can survive
+      # stack delete and we want sweepers to honour that.
+      Tags:
+        - Key: auto-delete
+          Value: 'no'
+        - Key: app
+          Value: bedrock-ops-lens
+        - Key: stack
+          Value: !Ref AWS::StackName
+
+  SpaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: Distribution
+    Properties:
+      Bucket: !Ref SpaBucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [ !GetAtt SpaBucket.Arn, !Sub '${SpaBucket.Arn}/*' ]
+            Condition: { Bool: { 'aws:SecureTransport': false } }
+          - Sid: AllowCloudFrontGet
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${SpaBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  # ===========================================================================
+  # Cognito — sign-up gate Lambdas + User Pool + App Client + Hosted UI.
+  # ===========================================================================
+  PreSignUpFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  PreSignUpFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PreSignUpFnRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      # Reserved concurrency caps blast radius for sign-up bursts / abuse.
+      ReservedConcurrentExecutions: 10
+      Description: !Sub 'Cognito Pre-Sign-Up gate. Allowlist: ${AllowedEmailDomains}'
+      Environment:
+        Variables:
+          ALLOWED_EMAIL_DOMAINS: !Ref AllowedEmailDomains
+      Code:
+        ZipFile: |
+          """Cognito Pre-Sign-Up trigger — domain allowlist gate."""
+          import os
+          _RAW = os.environ.get("ALLOWED_EMAIL_DOMAINS", "")
+          ALLOW_ALL = _RAW.strip() == "*"
+          ALLOWED_DOMAINS = [] if ALLOW_ALL else [
+              d.strip().lower().lstrip("@") for d in _RAW.split(",") if d.strip()
+          ]
+          def handler(event, context):
+              email = (event.get("request", {}).get("userAttributes", {}).get("email") or "").lower()
+              if not email or "@" not in email:
+                  raise Exception("An email address is required to sign up.")
+              if ALLOW_ALL:
+                  return event
+              if not ALLOWED_DOMAINS:
+                  raise Exception("Sign-up is currently disabled.")
+              domain = email.rsplit("@", 1)[-1]
+              if domain not in ALLOWED_DOMAINS:
+                  allowed = ", ".join("@" + d for d in ALLOWED_DOMAINS)
+                  raise Exception(
+                      f"Sign-up is restricted to {allowed} email addresses. "
+                      f"The address you used ({email}) is not permitted."
+                  )
+              return event
+
+  PostConfirmFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CognitoGroupOps
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Wildcard ARN avoids the UserPool↔Lambda circular dep.
+              - Effect: Allow
+                Action:
+                  - cognito-idp:ListUsersInGroup
+                  - cognito-idp:AdminAddUserToGroup
+                Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+  PostConfirmFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PostConfirmFnRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Description: Auto-promotes the first sign-up to bedrock-lens-admins.
+      Environment:
+        Variables: { ADMIN_GROUP: bedrock-lens-admins }
+      Code:
+        ZipFile: |
+          """Cognito Post-Confirmation — bootstrap first admin."""
+          import os
+          import boto3
+          ADMIN_GROUP = os.environ.get("ADMIN_GROUP", "bedrock-lens-admins")
+          _client = boto3.client("cognito-idp")
+          def handler(event, context):
+              if event.get("triggerSource") != "PostConfirmation_ConfirmSignUp":
+                  return event
+              user_pool_id = event.get("userPoolId")
+              user_name = event.get("userName")
+              if not user_pool_id or not user_name:
+                  return event
+              try:
+                  existing = _client.list_users_in_group(
+                      UserPoolId=user_pool_id, GroupName=ADMIN_GROUP, Limit=1)
+              except _client.exceptions.ResourceNotFoundException:
+                  return event
+              if existing.get("Users"):
+                  return event
+              try:
+                  _client.admin_add_user_to_group(
+                      UserPoolId=user_pool_id, Username=user_name, GroupName=ADMIN_GROUP)
+                  print(f"Auto-promoted first user '{user_name}' to {ADMIN_GROUP}")
+              except Exception as e:
+                  print(f"WARNING: failed to auto-promote {user_name}: {e}")
+              return event
+
+  PreSignUpInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PreSignUpFn.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+  PostConfirmInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PostConfirmFn.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+      # SourceAccount scopes invocation to this account only, blocking
+      # cross-account confused-deputy attacks via the Cognito principal.
+      SourceAccount: !Ref AWS::AccountId
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub '${StackNamePrefix}-users'
+      # auto-delete:no flags this resource for "do NOT auto-delete" sweepers.
+      # User Pool has DeletionPolicy: Retain — recreating it is destructive
+      # (all users + their MFA seeds disappear) and the auth.amazoncognito.com
+      # domain prefix has a ~1h cooldown after deletion.
+      UserPoolTags:
+        auto-delete: 'no'
+        app: bedrock-ops-lens
+        stack: !Ref AWS::StackName
+      UsernameAttributes: [ email ]
+      AutoVerifiedAttributes: [ email ]
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      MfaConfiguration: 'OPTIONAL'
+      EnabledMfas: [ SOFTWARE_TOKEN_MFA ]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      AdminCreateUserConfig: !If
+        - AdminOnlySignUp
+        - AllowAdminCreateUserOnly: true
+          UnusedAccountValidityDays: 7
+          InviteMessageTemplate:
+            EmailSubject: !Sub 'You are invited to ${StackNamePrefix}'
+            EmailMessage: |
+              You have been invited to Bedrock Ops Lens.
+              Username: {username}
+              Temporary password: {####}
+              Sign in at the dashboard URL — you will be prompted to
+              change this password on first sign-in.
+        - AllowAdminCreateUserOnly: false
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFn.Arn
+        PostConfirmation: !GetAtt PostConfirmFn.Arn
+
+  # Lambda needs COGNITO_APP_CLIENT_ID at runtime, but UserPoolClient
+  # depends on Distribution (for callback URLs), and Lambda predates
+  # Distribution (Distribution targets the Lambda Function URL). Break
+  # the Lambda↔Distribution↔UserPoolClient cycle by writing the client
+  # ID to SSM after both exist; Lambda reads it on first request, caches
+  # in module scope.
+  CognitoAppClientIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/bedrock-ops-lens/${AWS::StackName}/cognito-app-client-id'
+      Type: String
+      Value: !Ref UserPoolClient
+
+  AdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: bedrock-lens-admins
+      Description: !Sub '${StackNamePrefix} admins.'
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      # Cognito Hosted UI domain prefix is globally unique. Lowercase only,
+      # no "cognito"/"aws"/"amazon" substring, ≤63 chars. Account-id alone
+      # is plenty unique.
+      Domain: !Sub 'lens-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: Distribution
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${StackNamePrefix}-spa'
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH    # custom Cloudscape sign-in form posts to backend
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [ code ]
+      AllowedOAuthScopes: [ openid, email, profile ]
+      SupportedIdentityProviders: [ COGNITO ]
+      CallbackURLs:
+        - !Sub 'https://${Distribution.DomainName}/'
+        - !Sub 'https://${Distribution.DomainName}/api/auth/callback'
+      LogoutURLs:
+        - !Sub 'https://${Distribution.DomainName}/'
+      # Token validity at AWS maximums. Operator dashboard, not a public-facing
+      # consumer app — long-lived tokens trade marginal session-revocation
+      # latency for not bouncing VPs out of the SPA mid-session.
+      AccessTokenValidity: 24
+      IdTokenValidity: 24
+      RefreshTokenValidity: 3650
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+
+  # ===========================================================================
+  # Backend Lambda (FastAPI via Mangum, container image)
+  # ===========================================================================
+  BackendLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: AppPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ secretsmanager:GetSecretValue, secretsmanager:DescribeSecret ]
+                Resource: !Ref DbSecret
+              # Decrypt the secret using the customer-managed KMS key.
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt SecretsKey.Arn
+              - Effect: Allow
+                Action: [ bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream ]
+                Resource: '*'
+              - Effect: Allow
+                Action: [ cognito-idp:InitiateAuth, cognito-idp:AdminInitiateAuth,
+                          cognito-idp:SignUp, cognito-idp:ConfirmSignUp,
+                          cognito-idp:ResendConfirmationCode,
+                          cognito-idp:ForgotPassword, cognito-idp:ConfirmForgotPassword,
+                          cognito-idp:AdminCreateUser, cognito-idp:AdminGetUser,
+                          cognito-idp:AdminListGroupsForUser,
+                          cognito-idp:AdminAddUserToGroup ]
+                Resource: !GetAtt UserPool.Arn
+              - Effect: Allow
+                Action: [ ssm:GetParameter ]
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bedrock-ops-lens/*'
+
+  BackendLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-backend'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref BackendImageUri
+      Role: !GetAtt BackendLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 1024
+      Architectures: [ x86_64 ]
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSg ]
+        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      Environment:
+        Variables:
+          AUTH_ENABLED: 'true'
+          # Cognito refs — these don't depend on the Distribution.
+          COGNITO_USER_POOL_ID: !Ref UserPool
+          # COGNITO_APP_CLIENT_ID is read from SSM at first request to
+          # avoid the Lambda↔Distribution↔UserPoolClient cycle.
+          COGNITO_APP_CLIENT_ID_SSM_PARAM: !Sub '/bedrock-ops-lens/${AWS::StackName}/cognito-app-client-id'
+          # PUBLIC_BASE_URL is left empty — backend derives it from
+          # X-Forwarded-Proto/Host headers (CloudFront forwards these).
+          COGNITO_REGION: !Ref AWS::Region
+          COGNITO_DOMAIN: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+          SESSION_COOKIE_NAME: bedrock_lens_id
+          DB_HOST: !GetAtt DbCluster.Endpoint.Address
+          DB_PORT: !GetAtt DbCluster.Endpoint.Port
+          DB_USER: bedrock_lens
+          DB_NAME: bedrock_lens
+          DB_SECRET_ARN: !Ref DbSecret
+          MEMCACHED_HOST: !GetAtt CacheCluster.ConfigurationEndpoint.Address
+          MEMCACHED_PORT: !GetAtt CacheCluster.ConfigurationEndpoint.Port
+          BEDROCK_REGION: !Ref AWS::Region
+
+  # ===========================================================================
+  # Schema-init Lambda — runs once on stack-create, applies db/schema.sql +
+  # db/partitions.sql to Aurora. Same container image as Backend; CMD
+  # overridden to point at app.schema_init.handler.
+  # Wired to a CloudFormation custom resource below so the stack waits for it
+  # before considering the deploy complete.
+  # ===========================================================================
+  # Dead-letter queue (LAMBDA_DLQ_CHECK) — captures async invocation
+  # failures of SchemaInitLambda for post-mortem analysis instead of
+  # silently dropping events.
+  SchemaInitDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  SchemaInitLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: SchemaInitDb
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ secretsmanager:GetSecretValue, secretsmanager:DescribeSecret ]
+                Resource: !Ref DbSecret
+              # Decrypt the secret using the customer-managed KMS key.
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt SecretsKey.Arn
+              # Permits Lambda to deliver failed async invocations to the DLQ.
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchemaInitDlq.Arn
+
+  SchemaInitLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-schema-init'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref BackendImageUri
+      ImageConfig:
+        Command: [ 'app.schema_init.handler' ]
+      Role: !GetAtt SchemaInitLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Architectures: [ x86_64 ]
+      # DLQ (LAMBDA_DLQ_CHECK) — async failures land in SchemaInitDlq.
+      DeadLetterConfig:
+        TargetArn: !GetAtt SchemaInitDlq.Arn
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSg ]
+        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt DbCluster.Endpoint.Address
+          DB_PORT: !GetAtt DbCluster.Endpoint.Port
+          DB_USER: bedrock_lens
+          DB_NAME: bedrock_lens
+          DB_SECRET_ARN: !Ref DbSecret
+
+  # CFN custom resource — invokes SchemaInitLambda at stack-create.
+  # Stack provisioning blocks until the Lambda signals SUCCESS (or 1h timeout).
+  # ServiceTimeout caps that wait at the Lambda's own Timeout (300s) — without
+  # this, a hung schema-init could stall the stack for an hour.
+  SchemaInit:
+    Type: Custom::SchemaInit
+    DependsOn: [ DbWriter ]
+    Properties:
+      ServiceToken: !GetAtt SchemaInitLambda.Arn
+      # Bumping this string forces re-run on stack-update (e.g. after schema
+      # changes). Default value tied to stack name keeps it stable per stack.
+      SchemaVersion: !Sub '${AWS::StackName}-v1'
+
+  # ===========================================================================
+  # Ingester Lambda — pulls Bedrock CW metrics, invocation logs, cost,
+  # quotas, model-lifecycle into Aurora. Same container image as Backend;
+  # CMD overridden to ingestion.lambda_handler.handler.
+  # Triggered on EventBridge daily schedule + invocable manually for backfill.
+  # ===========================================================================
+  IngesterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: IngesterPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Aurora secret
+              - Effect: Allow
+                Action: [ secretsmanager:GetSecretValue, secretsmanager:DescribeSecret ]
+                Resource: !Ref DbSecret
+              # Decrypt the secret using the customer-managed KMS key.
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt SecretsKey.Arn
+              # CloudWatch Metrics — volumetric ingester reads AWS/Bedrock
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              # Service Quotas — bedrock model + runtime quotas
+              - Effect: Allow
+                Action:
+                  - servicequotas:ListServiceQuotas
+                  - servicequotas:GetServiceQuota
+                  - servicequotas:GetAWSDefaultServiceQuota
+                  - servicequotas:ListAWSDefaultServiceQuotas
+                Resource: '*'
+              # Cost Explorer — daily Bedrock cost
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                  - ce:GetDimensionValues
+                Resource: '*'
+              # Bedrock — list foundation models for lifecycle table
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: '*'
+              # AssumeRole to hop into linked accounts (multi-account ingest).
+              # Self-account assume is allowed via the same wildcard pattern;
+              # the role ingestion/accounts.py looks for is BedrockOpsLensReader.
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/BedrockOpsLensReader'
+              # Organizations read for discover-org mode. Without these,
+              # MONITORED_ACCOUNTS_MODE=discover-org silently degrades to
+              # single-account because ListAccounts returns AccessDenied.
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                  - organizations:ListAccountsForParent
+                Resource: '*'
+              # Identity introspection (used to derive self-account context)
+              - Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: '*'
+              # Bedrock model invocation logs bucket (read-only). When the
+              # bucket parameter is empty, the resource list is "*" with a
+              # condition that no S3 calls match — effectively a no-op grant.
+              - !If
+                - HasBedrockLogsBkt
+                - Effect: Allow
+                  Action: [ s3:ListBucket, s3:GetObject ]
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${BedrockLogsBucket}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${BedrockLogsBucket}/*'
+                - !Ref AWS::NoValue
+
+  IngesterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ingester'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref BackendImageUri
+      ImageConfig:
+        Command: [ 'ingestion.lambda_handler.handler' ]
+      Role: !GetAtt IngesterLambdaRole.Arn
+      # 15 min — enough for a multi-region cw_metrics + invocation_logs run
+      # in a small org. If a customer's run exceeds 15 min they should split
+      # via the `only:[...]` event payload across multiple invokes.
+      Timeout: 900
+      MemorySize: 1024
+      Architectures: [ x86_64 ]
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSg ]
+        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      Environment:
+        Variables:
+          DB_HOST: !GetAtt DbCluster.Endpoint.Address
+          DB_PORT: !GetAtt DbCluster.Endpoint.Port
+          DB_USER: bedrock_lens
+          DB_NAME: bedrock_lens
+          DB_SECRET_ARN: !Ref DbSecret
+          MEMCACHED_HOST: !GetAtt CacheCluster.ConfigurationEndpoint.Address
+          MEMCACHED_PORT: !GetAtt CacheCluster.ConfigurationEndpoint.Port
+          BEDROCK_REGION: !Ref AWS::Region
+          INGESTER_DAYS_DEFAULT: '14'
+          # Default to discover-org so the dashboard pulls from every active
+          # account in the AWS Organization (after the operator has rolled
+          # out BedrockOpsLensReader via scripts/setup-multi-account.py).
+          # Override to 'single' to keep ingest scoped to the central account
+          # only, or 'explicit' with MONITORED_ACCOUNTS_IDS=... for an
+          # arbitrary list. discover-org needs organizations:ListAccounts on
+          # the IngesterLambdaRole (granted below).
+          MONITORED_ACCOUNTS_MODE: discover-org
+          # Region scope for cw_metrics + invocation_logs (the volumetric
+          # path). Default is the deploy region; widen to 'us-eu-apac' or
+          # 'all' once you've verified single region works.
+          MONITORED_REGIONS_PRESET: explicit
+          MONITORED_REGIONS_LIST: !Ref AWS::Region
+          # Bedrock invocation-logs S3 bucket. When non-empty the ingester
+          # also runs the tag-attribution path. Empty = volumetric only.
+          BEDROCK_LOGS_BUCKET: !Ref BedrockLogsBucket
+
+  # Daily schedule. Cron: at IngesterScheduleHour:00 UTC every day.
+  IngesterSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub 'Daily Bedrock data ingest for ${AWS::StackName}'
+      ScheduleExpression: !Sub 'cron(0 ${IngesterScheduleHour} * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: ingester
+          Arn: !GetAtt IngesterLambda.Arn
+
+  IngesterSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngesterLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IngesterSchedule.Arn
+
+  # Versioned snapshot of the Backend Lambda. CFN creates this once at
+  # initial deploy. Subsequent code updates publish new versions out-of-
+  # band (deploy.sh calls `aws lambda publish-version` and `update-alias`).
+  # Keeping CFN out of the per-deploy version churn avoids the
+  # "AWS::Lambda::Version is immutable" gotcha with container images.
+  BackendLambdaInitialVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref BackendLambda
+      Description: 'Initial version published by CFN at stack create.'
+
+  # Alias the Function URL and all permissions point at. Provisioned
+  # concurrency lives here so every alias rotation (driven by deploy.sh
+  # when the container image changes) automatically warms the new code.
+  # 3 instances absorb the ~10 parallel /api/* fan-out the SPA does on
+  # first load. 1 instance was insufficient — diagnostics showed
+  # spillover invocations 5-10x the warm count. ~$16/mo.
+  BackendLambdaAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref BackendLambda
+      FunctionVersion: !GetAtt BackendLambdaInitialVersion.Version
+      Name: live
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: 3
+
+  BackendLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      # Point at the alias, not the function, so traffic always flows
+      # to whichever version is currently warm under provisioned
+      # concurrency. Using !Ref on an Alias returns its qualified ARN.
+      TargetFunctionArn: !Ref BackendLambdaAlias
+      Qualifier: live
+      # AWS_IAM is the secure default. CloudFront signs the request via
+      # OAC (Origin Access Control for Lambda Function URLs, GA'd by AWS
+      # in 2024). AuthType: NONE creates a publicly-invokable URL with
+      # no AWS credential check — AWS account-level security tooling
+      # will (correctly) flag and auto-mitigate that pattern within
+      # minutes of deploy. Don't change this without understanding why.
+      AuthType: AWS_IAM
+      # BUFFERED is required: Mangum produces an API-Gateway-v2 response
+      # envelope that Lambda Function URL unwraps to plain HTTP only in
+      # BUFFERED mode. RESPONSE_STREAM passes the envelope through verbatim,
+      # which makes every API response look like {"statusCode":..., "body":...}.
+      # The 6 MB response cap of BUFFERED is fine for our endpoints (largest
+      # is ~200 KB JSON for cost-by-model-detailed). Long ops-review streams
+      # buffer to one response.
+      InvokeMode: BUFFERED
+
+  # CloudFront OAC for the Lambda Function URL — signs every CloudFront →
+  # Lambda request with SigV4 so the AWS_IAM-protected URL accepts it.
+  LambdaOac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-lambda-oac'
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Lambda@Edge SHA-256 signer + CLOUDFRONT-scoped WebAcl live in the
+  # `edge-bootstrap` stack (always us-east-1, regardless of where this
+  # main stack is deployed). Their ARNs come in as parameters
+  # (EdgeShaVersionArn, WebAclArn).
+
+  # Two permissions are required for CloudFront OAC + Lambda Function URL.
+  # AWS docs (private-content-restricting-access-to-lambda) say BOTH are
+  # needed — without lambda:InvokeFunction the SigV4 auth call fails 403.
+  # SourceArn scopes to this specific Distribution so neither is world-allow.
+  #
+  # FunctionName uses !Ref on the Alias, which returns the qualified ARN
+  # (function:NAME:live). That's what binds the permission to the alias
+  # rather than $LATEST.
+  BackendLambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendLambdaAlias
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      FunctionUrlAuthType: AWS_IAM
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  BackendLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendLambdaAlias
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  # Direct IAM-authenticated invoke for MCP / CLI clients with admin creds.
+  # Browser users come through CloudFront → OAC and never trigger this; CLI
+  # tools (the bedrock-lens MCP in Tier B-IAM mode) sign requests with
+  # SigV4 using their own AWS credentials and hit the Function URL directly,
+  # bypassing both CloudFront and Cognito.
+  #
+  # Scoped to the same account so we don't cross-account-allow. Anyone
+  # outside this account hitting the URL still gets 403.
+  BackendLambdaIamInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendLambdaAlias
+      Action: lambda:InvokeFunctionUrl
+      Principal: !Ref AWS::AccountId
+      FunctionUrlAuthType: AWS_IAM
+
+  # WAFv2 WebACL (CLOUDFRONT-scoped) lives in the edge-bootstrap stack
+  # (always us-east-1). Its ARN is passed in via WebAclArn parameter and
+  # wired into the Distribution below.
+
+  # ===========================================================================
+  # CloudFront — only public surface.
+  # ===========================================================================
+  Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # Dedicated bucket for CloudFront access logs (CKV_AWS_86). CloudFront
+  # log delivery requires ACLs to be enabled (BucketOwnerPreferred + ACLs
+  # not blocked) so the awslogsdelivery account can write objects.
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # Enabling server access logging on a log-delivery target bucket
+    # creates a recursive logging loop, so this rule is suppressed
+    # for this bucket only.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration: { Status: Enabled }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireCloudFrontLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: auto-delete
+          Value: 'no'
+        - Key: app
+          Value: bedrock-ops-lens
+        - Key: stack
+          Value: !Ref AWS::StackName
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        WebACLId: !Ref WebAclArn
+        # Access logging (CKV_AWS_86) — viewer requests delivered to a
+        # dedicated logs bucket for audit + forensic analysis.
+        Logging:
+          Bucket: !GetAtt CloudFrontLogsBucket.DomainName
+          Prefix: cloudfront-access-logs/
+          IncludeCookies: false
+        Origins:
+          - Id: s3-spa
+            DomainName: !GetAtt SpaBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt Oac.Id
+            S3OriginConfig: { OriginAccessIdentity: '' }
+          - Id: lambda-api
+            DomainName: !Select [2, !Split ['/', !GetAtt BackendLambdaUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt LambdaOac.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols: [ TLSv1.2 ]
+              OriginReadTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: s3-spa
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [ GET, HEAD ]
+          CachedMethods: [ GET, HEAD ]
+          Compress: true
+          # AWS managed "CachingOptimized"
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: lambda-api
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [ DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT ]
+            CachedMethods: [ GET, HEAD ]
+            Compress: true
+            # AWS managed "CachingDisabled"
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # AWS managed "AllViewerExceptHostHeader" — forwards JWT cookie etc.
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            # Lambda@Edge — sets x-amz-content-sha256 so OAC SigV4 accepts
+            # POST/PUT/PATCH bodies. include-body is required to read the body.
+            LambdaFunctionAssociations:
+              - EventType: viewer-request
+                IncludeBody: true
+                LambdaFunctionARN: !Ref EdgeShaVersionArn
+        CustomErrorResponses:
+          # Only 404 (S3 missing key = SPA route, e.g. /overview, /cost, /lifecycle)
+          # gets rewritten to /index.html. We deliberately do NOT catch 403 — that
+          # would silently mask backend auth failures and origin errors as 200/SPA.
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html, ErrorCachingMinTTL: 60 }
+        # CKV_AWS_174: enforce TLS 1.2+ on viewer connections.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  # ===========================================================================
+  # Pre-warm Lambda (EventBridge) — bumps cache_generation + prefetches the
+  # most-common dashboard endpoints so first-of-the-day load is instant.
+  # ===========================================================================
+  PrewarmLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+  PrewarmLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-prewarm'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PrewarmLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      VpcConfig:
+        SecurityGroupIds: [ !Ref LambdaSg ]
+        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      Environment:
+        Variables:
+          MEMCACHED_HOST: !GetAtt CacheCluster.ConfigurationEndpoint.Address
+          MEMCACHED_PORT: !GetAtt CacheCluster.ConfigurationEndpoint.Port
+      Code:
+        ZipFile: |
+          """Pre-warm Lambda — bumps cache_generation in Memcached so all
+          stale entries become invalid; the next user request rewarms.
+
+          We deliberately don't HTTP-fetch the prefetch URLs here because
+          Lambda Function URLs require Cognito for /api/* under our auth
+          model — and we don't want to mint synthetic JWTs in the prewarm
+          path. Bumping the generation key is enough: stale entries are
+          invalidated, and the first real user request after prewarm pays
+          one Aurora roundtrip then re-populates the cache for everyone."""
+          import os, socket
+          MEMCACHED_HOST = os.environ.get("MEMCACHED_HOST", "")
+          MEMCACHED_PORT = int(os.environ.get("MEMCACHED_PORT", "11211"))
+          GEN_KEY = "bedrock_lens:cache_generation"
+
+          def _send(cmd: bytes) -> bytes:
+              s = socket.create_connection((MEMCACHED_HOST, MEMCACHED_PORT), timeout=5)
+              try:
+                  s.sendall(cmd)
+                  buf = b""
+                  while not buf.endswith(b"\r\nEND\r\n") and not buf.endswith(b"NOT_FOUND\r\n") and not buf.endswith(b"ERROR\r\n") and len(buf) < 1024:
+                      data = s.recv(1024)
+                      if not data: break
+                      buf += data
+                  return buf
+              finally:
+                  s.close()
+
+          def handler(event, context):
+              # incr returns the new value, or NOT_FOUND if key absent.
+              resp = _send(f"incr {GEN_KEY} 1\r\n".encode())
+              if b"NOT_FOUND" in resp:
+                  _send(f"set {GEN_KEY} 0 0 1\r\n1\r\n".encode())
+                  resp = b"set 1"
+              return {"ok": True, "memcached_resp": resp.decode("utf-8", "replace")}
+
+  PrewarmSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Bumps cache_generation each morning so the day starts fresh
+      # 30 min after the ingester. The ingester also bumps cache_generation
+      # itself; this is a safety net for the days the ingester is skipped
+      # (e.g. transient AWS API throttling).
+      ScheduleExpression: !Sub 'cron(30 ${IngesterScheduleHour} * * ? *)'
+      State: ENABLED
+      Targets:
+        - Id: prewarm
+          Arn: !GetAtt PrewarmLambda.Arn
+
+  PrewarmSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PrewarmLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PrewarmSchedule.Arn
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  DashboardUrl:
+    Value: !Sub 'https://${Distribution.DomainName}'
+  CognitoDomain:
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+  CognitoAppClientId:
+    Value: !Ref UserPoolClient
+  CognitoAllowedEmailDomains:
+    Value: !Ref AllowedEmailDomains
+  CognitoSignUpMode:
+    Value: !Ref CognitoSelfSignUp
+  SpaBucketName:
+    Value: !Ref SpaBucket
+  DatabaseSecretArn:
+    Value: !Ref DbSecret
+  BackendLambdaName:
+    Value: !Ref BackendLambda
+  BackendLambdaUrl:
+    Value: !GetAtt BackendLambdaUrl.FunctionUrl
+  MemcachedEndpoint:
+    Value: !Sub '${CacheCluster.ConfigurationEndpoint.Address}:${CacheCluster.ConfigurationEndpoint.Port}'

@@ -1,0 +1,20 @@
+[tool.bandit]
+# Skip false-positive rules tracked here. Each skip is justified.
+skips = [
+    "B608",   # Possible SQL injection via f-string. All hits in backend/app/routers/
+              # are FastAPI handlers that build a static SELECT body with `WHERE
+              # {where_sql}`, where `where_sql` is itself a string of `$N`
+              # placeholders produced by build_where(); user values flow through
+              # asyncpg's *params, never substituted into the SQL. Audited
+              # 2026-06-02; bandit can't track dataflow across helper boundaries.
+    "B110",   # try/except/pass. Used in cache.py + config.py + ingestion modules
+              # for "best-effort" code paths (cache miss is fine, optional config
+              # missing is fine). Each site is a deliberate silent fallback, not
+              # an oversight.
+    "B311",   # Pseudo-random in non-security context (e.g., synthetic data
+              # generators). secrets.* is used everywhere a token, password, or
+              # nonce is generated.
+]
+
+[tool.bandit.assert_used]
+skips = ["**/test_*.py", "**/*_test.py"]

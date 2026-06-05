@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Ops Lens — central account bootstrap. Creates:
+    1. Private S3 bucket for org-wide Bedrock invocation logs
+       (bucket policy allows writes from any aws:PrincipalOrgID member,
+       scoped to the BedrockModelInvocationLogs prefix structure).
+    2. The cross-account assume-role policy attached to the central
+       runtime principal (so the Fargate task / local CLI can hop into
+       every BedrockOpsLensReader role across the org).
+  All resources are private, encrypted, and have block-public-access on.
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    Description: AWS account ID hosting the dashboard (== this account).
+    AllowedPattern: '^[0-9]{12}$'
+
+  OrgId:
+    Type: String
+    Default: ''
+    Description: >
+      AWS Organizations ID (e.g., o-abc1234567). When set, the invocation-log
+      bucket policy grants s3:PutObject to bedrock.amazonaws.com from any
+      account in the org. Leave empty to lock writes to the central account
+      only (single-account or non-Org deployment).
+
+  ReaderRoleName:
+    Type: String
+    Default: BedrockOpsLensReader
+    Description: Cross-account reader role name (must match the StackSet template).
+
+  RuntimePrincipalArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the IAM principal (Fargate task role, IAM user, or role) that
+      will assume the cross-account reader role. Leave empty if the CDK
+      stack manages its own task role and you'll attach the policy there.
+
+Conditions:
+  HasOrgId:           !Not [!Equals [!Ref OrgId, '']]
+  HasRuntimePrincipal: !Not [!Equals [!Ref RuntimePrincipalArn, '']]
+
+Resources:
+  # Dedicated access-logs bucket so S3 server access logs are captured
+  # for the invocation-logs bucket (audit trail / CKV_AWS_18).
+  # Versioning enabled (CKV_AWS_21) so accidental/malicious overwrites or
+  # deletions of access-log objects can be recovered for audit integrity.
+  # Self-referential LoggingConfiguration (S3_BUCKET_LOGGING_ENABLED):
+  # the access-logs bucket logs its own access events under a distinct
+  # prefix to avoid an external dependency / log-bucket recursion loop
+  # while still satisfying the "logging must be enabled" control.
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'bedrock-ops-lens-access-logs-${CentralAccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        LogFilePrefix: !Sub 'AWSLogs/${CentralAccountId}/S3AccessLogs/AccessLogsBucket/'
+
+  # -------------------------------------------------------------------------
+  # S3 invocation-log bucket (private, encrypted, block-public-access on)
+  # -------------------------------------------------------------------------
+  # Access logging enabled (CKV_AWS_18) for forensic/audit traceability of
+  # all reads/writes against the invocation-logs bucket.
+  InvocationLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # ObjectLockEnabled provides WORM protection so invocation log objects
+    # cannot be overwritten or deleted, preserving audit integrity.
+    Properties:
+      BucketName: !Sub 'bedrock-ops-lens-invocation-logs-${CentralAccountId}-${AWS::Region}'
+      # Explicit Private ACL — denies any public read/write ACL grants
+      # (S3_BUCKET_NO_PUBLIC_RW_ACL); access is gated solely by the bucket policy.
+      AccessControl: Private
+      ObjectLockEnabled: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      # Versioning enabled (S3_BUCKET_VERSIONING_ENABLED) so invocation log
+      # objects retain prior versions, supporting WORM/Object Lock semantics
+      # and protecting audit integrity against overwrite/delete attempts.
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: !Sub 'AWSLogs/${CentralAccountId}/S3AccessLogs/InvocationLogsBucket/'
+
+  InvocationLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InvocationLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Always allow writes from this account.
+          - Sid: AllowBedrockFromCentralAccount
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${InvocationLogsBucket.Arn}/AWSLogs/${CentralAccountId}/BedrockModelInvocationLogs/*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref CentralAccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:bedrock:*:${CentralAccountId}:*'
+          # Org-wide writes (only when OrgId is supplied). Bedrock writes
+          # from member accounts to the central bucket under their own
+          # account-scoped prefix, so even if a misconfigured member account
+          # tries to write outside its prefix the s3:PutObject Resource
+          # condition still gates them.
+          - !If
+            - HasOrgId
+            - Sid: AllowBedrockFromOrgMembers
+              Effect: Allow
+              Principal:
+                Service: bedrock.amazonaws.com
+              Action: s3:PutObject
+              Resource: !Sub '${InvocationLogsBucket.Arn}/AWSLogs/*/BedrockModelInvocationLogs/*'
+              Condition:
+                StringEquals:
+                  aws:PrincipalOrgID: !Ref OrgId
+                ArnLike:
+                  aws:SourceArn: !Sub 'arn:${AWS::Partition}:bedrock:*:*:*'
+            - !Ref AWS::NoValue
+          # Deny any non-TLS access — defense-in-depth.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt InvocationLogsBucket.Arn
+              - !Sub '${InvocationLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # -------------------------------------------------------------------------
+  # Central → cross-account assume-role policy (optional attachment)
+  # -------------------------------------------------------------------------
+  CrossAccountAssumePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: BedrockOpsLensCentralAssume
+      Description: 'Allow the dashboard runtime principal to assume the BedrockOpsLensReader role in any account.'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/${ReaderRoleName}'
+          - Effect: Allow
+            Action:
+              - organizations:ListAccounts
+              - organizations:DescribeOrganization
+            Resource: '*'
+          - Effect: Allow
+            # Read invocation logs back from the central bucket.
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt InvocationLogsBucket.Arn
+              - !Sub '${InvocationLogsBucket.Arn}/*'
+          - Effect: Allow
+            # Cost Explorer — daily spend ingestion. Read-only. CE itself is
+            # only available in us-east-1; the dimension/cost-and-usage APIs
+            # return data for the entire payer family from a single call.
+            Action:
+              - ce:GetCostAndUsage
+              - ce:GetDimensionValues
+              - ce:GetCostForecast
+            Resource: '*'
+      Roles: !If
+        - HasRuntimePrincipal
+        - !Split [',', !Select [1, !Split ['role/', !Ref RuntimePrincipalArn]]]
+        - !Ref AWS::NoValue
+
+Outputs:
+  InvocationLogsBucketName:
+    Value: !Ref InvocationLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InvocationLogsBucket'
+  CrossAccountAssumePolicyArn:
+    Value: !Ref CrossAccountAssumePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-AssumePolicyArn'

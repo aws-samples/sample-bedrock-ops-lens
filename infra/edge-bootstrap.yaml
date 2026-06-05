@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Bedrock Ops Lens — edge-bootstrap stack.
+
+  Two AWS resources are CloudFront-global and the AWS APIs only accept
+  them in us-east-1, regardless of where the rest of the application
+  lives:
+
+    1. AWS::WAFv2::WebACL with Scope=CLOUDFRONT
+    2. AWS::Lambda::Function used as Lambda@Edge (SHA-256 body-hash signer
+       for OAC POST/PUT requests to the backend Lambda Function URL)
+
+  This template is therefore always deployed to us-east-1. The main stack
+  (which can live in any region) consumes the two output ARNs as input
+  parameters.
+
+Parameters:
+  StackNamePrefix:
+    Type: String
+    Description: Logical prefix used in resource names + the CW metric name.
+
+Resources:
+  # ===========================================================================
+  # Lambda@Edge — SHA-256 body-hash signer.
+  #
+  # CloudFront with OriginAccessControl strips the x-amz-content-sha256
+  # header on requests with a body, which breaks SigV4 against the backend
+  # Lambda Function URL. This viewer-request function recomputes the hash
+  # and re-injects the header so OAC->Lambda auth succeeds.
+  #
+  # Lambda@Edge has hard rules:
+  #   - must be in us-east-1
+  #   - must be a published version (not $LATEST)
+  #   - cannot use environment variables
+  # ===========================================================================
+  EdgeShaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  EdgeShaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs20.x
+      Role: !GetAtt EdgeShaRole.Arn
+      Handler: index.handler
+      Timeout: 5
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          'use strict';
+          const crypto = require('crypto');
+          // Lambda@Edge cannot use environment variables. Keep this function
+          // pure — no external calls, no async I/O beyond the hash.
+          exports.handler = async (event) => {
+              const req = event.Records[0].cf.request;
+              // Body is base64-encoded when present. Compute SHA256 over the
+              // raw bytes (or empty-string hash for GET/HEAD/no-body).
+              let payload = Buffer.alloc(0);
+              if (req.body && req.body.data) {
+                  payload = Buffer.from(req.body.data, req.body.encoding || 'base64');
+              }
+              const hash = crypto.createHash('sha256').update(payload).digest('hex');
+              req.headers['x-amz-content-sha256'] = [
+                  { key: 'x-amz-content-sha256', value: hash }
+              ];
+              return req;
+          };
+
+  EdgeShaVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref EdgeShaFunction
+
+  # ===========================================================================
+  # WAF — CloudFront-scoped, AWS managed common rule set.
+  # ===========================================================================
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${StackNamePrefix}-waf'
+      Scope: CLOUDFRONT
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${StackNamePrefix}WafMetric'
+      Rules:
+        - Name: AWSManagedCommonRules
+          Priority: 0
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedCommonRules
+        # AWSManagedRulesKnownBadInputsRuleSet contains the Log4JRCE rule
+        # that blocks JNDI message-lookup payloads (CVE-2021-44228).
+        - Name: AWSManagedKnownBadInputs
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedKnownBadInputs
+
+Outputs:
+  WebAclArn:
+    Description: ARN of the CLOUDFRONT-scoped Web ACL.
+    Value: !GetAtt WebAcl.Arn
+  EdgeShaVersionArn:
+    Description: Versioned ARN of the Lambda@Edge SHA-256 signer.
+    Value: !Ref EdgeShaVersion

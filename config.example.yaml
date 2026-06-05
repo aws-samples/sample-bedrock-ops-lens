@@ -1,0 +1,109 @@
+# =============================================================================
+# Bedrock Ops Lens — customer configuration.
+#
+# Copy this file to `config.yaml` and edit. The deploy script (deploy.sh),
+# the multi-account pipeline bootstrap (./setup-pipeline.sh), and the
+# ingesters all read from this single file so there's one place to
+# change a region or add an account.
+#
+# Any value here can be overridden at runtime via the matching env var (the
+# env var name appears in [BRACKETS] next to each setting below).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Deploy region — the SINGLE region where dashboard infrastructure lives:
+#   Aurora Postgres, Fargate task, ALB, CloudFront origin, S3 invocation-logs
+#   bucket, ECR repository, Cognito User Pool. CloudFront itself is global.
+#
+# Has nothing to do with which regions the INGESTER reads metrics from
+# (see `monitored_regions` below — that's typically multi-region).
+# -----------------------------------------------------------------------------
+deploy_region: us-east-1                                  # [DEPLOY_REGION]
+
+# -----------------------------------------------------------------------------
+# Monitored accounts — which AWS accounts the ingester pulls Bedrock data
+# from. The default is `discover-org`, which:
+#   - enumerates every ACTIVE account in your AWS Organization (no list to
+#     maintain — works whether you have 1 account or 1,000),
+#   - deploys the cross-account reader role to all of them via a service-
+#     managed CloudFormation StackSet,
+#   - auto-enrolls any account that joins the org later.
+#
+# Three modes for customers who need something other than the default:
+#
+#   discover-org   (default) Use AWS Organizations to enumerate every
+#                  ACTIVE account. Requires the central account to be the
+#                  management account or a delegated administrator for
+#                  Organizations.
+#
+#   explicit       A fixed list of account IDs. Useful when you only want
+#                  to monitor a subset of your org, or you don't have an
+#                  organization at all (each account must have the
+#                  BedrockOpsLensReader role deployed; setup-pipeline.sh
+#                  --scope accounts --accounts ID,ID handles this).
+#
+#   single         Just the central account (where the dashboard runs).
+#                  Simplest single-account deployment, no cross-account
+#                  roles needed.
+# -----------------------------------------------------------------------------
+monitored_accounts:
+  mode: discover-org                                      # [MONITORED_ACCOUNTS_MODE]
+  # Used only when mode == "explicit":
+  ids: []
+    # - "111111111111"
+    # - "222222222222"
+
+# -----------------------------------------------------------------------------
+# Monitored regions — which AWS regions the ingester scrapes per-account.
+# Three named presets plus an escape hatch:
+#
+#   us-major     us-east-1, us-east-2, us-west-2
+#                3 regions. Fastest first-time scrape. Good when all your
+#                Bedrock traffic is in the US.
+#
+#   us-eu-apac   us-east-1, us-east-2, us-west-2, eu-west-1, eu-west-2,
+#                eu-central-1, ap-southeast-1, ap-northeast-1
+#                8 regions. Covers every region where Anthropic Claude
+#                models are GA today. Sensible default for most fleets.
+#
+#   all          Live-discover every region currently enabled in the
+#                account (account:ListRegions) and filter to the ones
+#                where Bedrock is reachable. Most thorough; slowest.
+#
+#   explicit     Use the `regions` list below verbatim.
+# -----------------------------------------------------------------------------
+monitored_regions:
+  preset: us-eu-apac                                      # [MONITORED_REGIONS_PRESET]
+  # Used only when preset == "explicit":
+  regions: []
+
+# -----------------------------------------------------------------------------
+# Bedrock model invocation logging — required to populate the per-tag
+# attribution tables (f_daily_tagged, dim_tags). When enabled, each monitored
+# account is configured to deliver invocation logs to the central S3 bucket
+# created by deploy.sh.
+#
+# Reversal: aws bedrock delete-model-invocation-logging-configuration --region $REGION
+# -----------------------------------------------------------------------------
+invocation_logging:
+  enabled: true                                           # [INVOCATION_LOGGING_ENABLED]
+  text_data:      true                                    # [INVOCATION_LOG_TEXT]
+  image_data:     false                                   # [INVOCATION_LOG_IMAGE]
+  embedding_data: false                                   # [INVOCATION_LOG_EMBEDDING]
+  video_data:     false                                   # [INVOCATION_LOG_VIDEO]
+
+# -----------------------------------------------------------------------------
+# Bedrock model used for Ops Review LLM synthesis. MUST be a CRIS-prefixed
+# inference profile ID (us. / eu. / global.) — bare on-demand IDs are
+# rejected by Bedrock for Claude 4.x.
+# -----------------------------------------------------------------------------
+ops_review:
+  bedrock_region:   us-east-1                             # [BEDROCK_REGION]
+  bedrock_model_id: us.anthropic.claude-opus-4-1-20250805-v1:0  # [BEDROCK_MODEL_ID]
+
+# -----------------------------------------------------------------------------
+# IAM — cross-account reader role.
+# -----------------------------------------------------------------------------
+iam:
+  reader_role_name: BedrockOpsLensReader                  # [BEDROCK_OPS_LENS_ROLE_NAME]
+  external_id: ""                                         # [BEDROCK_OPS_LENS_EXTERNAL_ID]

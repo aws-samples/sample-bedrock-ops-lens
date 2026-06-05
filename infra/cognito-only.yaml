@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Cognito-only stack for LOCAL-MACHINE testing of the Bedrock Ops Lens
+  auth flow. Creates the same User Pool / Hosted UI / Pre-Sign-Up gate
+  as the main stack — but configured with localhost callback URLs so you
+  can run the dashboard at http://localhost:5173 and test real sign-up
+  / sign-in / sign-out without spinning up Fargate, Aurora, ALB, etc.
+
+  Cost: free tier covers ~50k MAU, so this is effectively $0 while
+  developing.
+
+Parameters:
+  AllowedEmailDomains:
+    Type: String
+    Description: Comma-separated email domains allowed to sign up. "*" = any.
+  LocalCallbackBase:
+    Type: String
+    Default: 'http://localhost:5173'
+    Description: Base URL of your local frontend dev server.
+  LocalBackendPort:
+    Type: Number
+    Default: 8001
+    Description: Port your local FastAPI backend listens on.
+
+Resources:
+
+  # Shared DLQ for Lambda async-invoke failures (LAMBDA_DLQ_CHECK).
+  # Cognito triggers are sync, but the DLQ is still required by policy
+  # and catches any future async invocations.
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  PreSignUpFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: DLQSend
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt LambdaDLQ.Arn
+
+  PreSignUpFn:
+    Type: AWS::Lambda::Function
+    # Cap concurrency to bound blast radius if the trigger is abused/looped
+    # (LAMBDA_CONCURRENCY_CHECK). Sign-up volume is tiny; 5 is plenty.
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PreSignUpFnRole.Arn
+      Timeout: 5
+      MemorySize: 128
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Description: !Sub 'Cognito Pre-Sign-Up gate. Allowlist: ${AllowedEmailDomains}.'
+      Environment:
+        Variables:
+          ALLOWED_EMAIL_DOMAINS: !Ref AllowedEmailDomains
+      Code:
+        ZipFile: |
+          """Cognito Pre-Sign-Up trigger — domain allowlist gate."""
+          import os
+          _RAW = os.environ.get("ALLOWED_EMAIL_DOMAINS", "")
+          ALLOW_ALL = _RAW.strip() == "*"
+          ALLOWED_DOMAINS = [] if ALLOW_ALL else [
+              d.strip().lower().lstrip("@")
+              for d in _RAW.split(",")
+              if d.strip()
+          ]
+          def handler(event, context):
+              email = (event.get("request", {}).get("userAttributes", {}).get("email") or "").lower()
+              if not email or "@" not in email:
+                  raise Exception("An email address is required to sign up.")
+              if ALLOW_ALL:
+                  return event
+              if not ALLOWED_DOMAINS:
+                  raise Exception("Sign-up is currently disabled.")
+              domain = email.rsplit("@", 1)[-1]
+              if domain not in ALLOWED_DOMAINS:
+                  allowed = ", ".join("@" + d for d in ALLOWED_DOMAINS)
+                  raise Exception(
+                      f"Sign-up is restricted to {allowed} email addresses. "
+                      f"The address you used ({email}) is not permitted."
+                  )
+              return event
+
+  # Inline policies on IAM roles are flagged by IAM_NO_INLINE_POLICY_CHECK;
+  # use a standalone managed policy attached to the role instead.
+  PostConfirmFnCognitoGroupOpsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${AWS::StackName}-PostConfirmFn-CognitoGroupOps'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - cognito-idp:ListUsersInGroup
+              - cognito-idp:AdminAddUserToGroup
+            Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+      Roles:
+        - !Ref PostConfirmFnRole
+
+  PostConfirmFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  PostConfirmFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PostConfirmFnRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Description: Auto-promotes the first sign-up to bedrock-lens-admins.
+      Environment:
+        Variables:
+          ADMIN_GROUP: bedrock-lens-admins
+      Code:
+        ZipFile: |
+          """Cognito Post-Confirmation — bootstrap first admin."""
+          import os
+          import boto3
+          ADMIN_GROUP = os.environ.get("ADMIN_GROUP", "bedrock-lens-admins")
+          _client = boto3.client("cognito-idp")
+          def handler(event, context):
+              if event.get("triggerSource") != "PostConfirmation_ConfirmSignUp":
+                  return event
+              user_pool_id = event.get("userPoolId")
+              user_name = event.get("userName")
+              if not user_pool_id or not user_name:
+                  return event
+              try:
+                  existing = _client.list_users_in_group(
+                      UserPoolId=user_pool_id, GroupName=ADMIN_GROUP, Limit=1)
+              except _client.exceptions.ResourceNotFoundException:
+                  return event
+              if existing.get("Users"):
+                  return event
+              try:
+                  _client.admin_add_user_to_group(
+                      UserPoolId=user_pool_id, Username=user_name, GroupName=ADMIN_GROUP)
+                  print(f"Auto-promoted first user '{user_name}' to {ADMIN_GROUP}")
+              except Exception as e:
+                  print(f"WARNING: failed to auto-promote {user_name}: {e}")
+              return event
+
+  PreSignUpInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PreSignUpFn.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+  PostConfirmInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PostConfirmFn.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Delete   # local-test stack — easy to recreate
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UsernameAttributes: [ email ]
+      AutoVerifiedAttributes: [ email ]
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      # OPTIONAL is the floor cfn_nag accepts (F78). Users can enroll TOTP
+      # but aren't required to. ON would block sign-in until MFA enrolment,
+      # which is wrong for a local-test stack.
+      MfaConfiguration: 'OPTIONAL'
+      EnabledMfas: [ 'SOFTWARE_TOKEN_MFA' ]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFn.Arn
+        PostConfirmation: !GetAtt PostConfirmFn.Arn
+
+  AdminsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: bedrock-lens-admins
+      Description: Bedrock Ops Lens admins.
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      # Cognito Hosted UI domain prefix is globally unique across all
+      # Cognito tenants. Rules: lowercase + numbers + hyphens only, ≤63
+      # chars, must not contain "cognito", "aws", or "amazon". The
+      # account ID alone is fine as a uniqueness anchor; we add a short
+      # `lens` prefix so the URL still reads as ours.
+      Domain: !Sub 'lens-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${AWS::StackName}-spa'
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        # USER_PASSWORD_AUTH lets the backend pass {USERNAME, PASSWORD}
+        # directly to InitiateAuth with no admin IAM creds. We use this
+        # because the SPA shows our own Cloudscape sign-in form (no Hosted
+        # UI redirect) and POSTs the credentials to the FastAPI backend.
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [ code ]
+      AllowedOAuthScopes: [ openid, email, profile ]
+      SupportedIdentityProviders: [ COGNITO ]
+      # Cognito allows http:// callbacks ONLY for localhost — we exploit that
+      # so the dashboard runs on http://localhost:5173 unmodified.
+      #
+      # The CALLBACK url is on :5173 (the Vite dev server), not the backend
+      # port. Vite proxies /api/* to the backend, so cookies set by the
+      # callback handler end up on :5173 — same origin as the SPA, which
+      # is what we need for SameSite=Lax cookies to flow on subsequent
+      # /api/* requests.
+      CallbackURLs:
+        - !Sub '${LocalCallbackBase}/'
+        - !Sub '${LocalCallbackBase}/api/auth/callback'
+      LogoutURLs:
+        - !Sub '${LocalCallbackBase}/'
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      PreventUserExistenceErrors: ENABLED
+
+Outputs:
+  CognitoDomain:
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+    Description: Cognito Hosted UI base URL
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+  CognitoAppClientId:
+    Value: !Ref UserPoolClient
+  CognitoRegion:
+    Value: !Ref AWS::Region
+  LocalEnvFile:
+    Description: |
+      Drop these into backend/.env (or `export` them) before running uvicorn.
+      PUBLIC_BASE_URL points at :5173 (Vite) because that's the user-facing
+      origin — Vite proxies /api/* to :8001, so the backend sees the request
+      but cookies live on :5173 where the SPA can use them.
+    Value: !Sub |
+      AUTH_ENABLED=true
+      COGNITO_USER_POOL_ID=${UserPool}
+      COGNITO_APP_CLIENT_ID=${UserPoolClient}
+      COGNITO_REGION=${AWS::Region}
+      COGNITO_DOMAIN=https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+      PUBLIC_BASE_URL=${LocalCallbackBase}
