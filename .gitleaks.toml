@@ -1,0 +1,18 @@
+# Gitleaks configuration. Extends the default ruleset with allowlists for
+# patterns that the generic API-key detector catches as false positives.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "False positives in this repo"
+# AWS region codes (eu-south-2, ap-northeast-3, me-central-1, …) trip the
+# generic-api-key detector because they're alphanumeric tokens of "secret-y"
+# length next to a colon. They're public AWS region identifiers, not secrets.
+regexes = [
+  '''(eu|us|ap|ca|sa|me|af|il|cn)-(north|south|east|west|central|northeast|northwest|southeast|southwest)-[0-9]''',
+]
+# Anchor-allow specific files that contain region tables, in case the regex
+# above ever needs to evolve.
+paths = [
+  '''frontend/src/App.jsx''',
+]

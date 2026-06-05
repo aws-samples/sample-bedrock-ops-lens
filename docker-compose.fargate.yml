@@ -1,0 +1,156 @@
+# Fargate-equivalent local harness.
+#
+# Goal: catch container/IAM/env/auth bugs in 30 seconds — locally — instead
+# of after a 20-minute Aurora-creation cloud round-trip.
+#
+# Approach:
+#   1. Build the EXACT image we'd push to ECR (linux/amd64) and run it under
+#      docker-compose.
+#   2. Wire the container with the SAME env vars CFN injects in production:
+#      DB_HOST/DB_PORT/DB_USER/DB_PASSWORD/DB_NAME, COGNITO_*, AUTH_ENABLED.
+#   3. Side a Postgres container so the backend can connect to a real DB.
+#   4. Side an `amazon-ecs-local-container-endpoints` instance and point
+#      AWS_CONTAINER_CREDENTIALS_RELATIVE_URI at it — so any boto3 client
+#      in the backend gets temporary creds via the same metadata path
+#      Fargate uses in production. Catches bugs like "missing IAM action"
+#      or "wrong region passed to a service client" without needing a real
+#      Task Role.
+#
+# Usage:
+#   docker compose -f docker-compose.fargate.yml up --build
+#   then: curl http://localhost:8000/api/health   # sanity-check
+#
+# Stop:
+#   docker compose -f docker-compose.fargate.yml down -v
+
+services:
+
+  # ------------------------------------------------------------------
+  # Postgres — stand-in for Aurora. Schema is loaded on first boot from
+  # db/schema.sql (the bind mount in docker-entrypoint-initdb.d).
+  # ------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: bedrock-lens-fargate-pg
+    environment:
+      POSTGRES_USER: bedrock_lens
+      POSTGRES_PASSWORD: bedrock_lens_local
+      POSTGRES_DB: bedrock_lens
+    volumes:
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bedrock_lens -d bedrock_lens"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    networks:
+      bedrock-lens:
+        ipv4_address: 169.254.170.10
+
+  # ------------------------------------------------------------------
+  # Redis — stand-in for ElastiCache. Optional in this harness; the
+  # backend tolerates Redis being absent.
+  # ------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: bedrock-lens-fargate-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+    networks:
+      bedrock-lens:
+        ipv4_address: 169.254.170.11
+
+  # ------------------------------------------------------------------
+  # ECS Local Container Endpoints — emulates the Fargate task metadata
+  # endpoint at 169.254.170.2. Any boto3 client in the backend will hit
+  # AWS_CONTAINER_CREDENTIALS_RELATIVE_URI and get temporary credentials
+  # signed using the local AWS profile (env-passed, not baked in).
+  #
+  # `network_mode: bridge` + a fixed IP at 169.254.170.2 mirrors the IMDS
+  # location used by Fargate. The backend container then sees the same
+  # path it would in production.
+  # ------------------------------------------------------------------
+  ecs-local-endpoints:
+    image: amazon/amazon-ecs-local-container-endpoints
+    container_name: bedrock-lens-ecs-endpoints
+    volumes:
+      - /var/run:/var/run
+      - $HOME/.aws/:/home/.aws/
+    environment:
+      HOME: /home
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+    networks:
+      bedrock-lens:
+        ipv4_address: 169.254.170.2
+
+  # ------------------------------------------------------------------
+  # Backend — the same Dockerfile we ship to ECR. Wired with the EXACT
+  # env vars our CFN template injects in production, plus the IMDS path
+  # so boto3 finds Task Role credentials at the conventional URI.
+  # ------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      platforms:
+        - linux/amd64    # match Fargate's default platform
+    image: bedrock-ops-lens-backend:fargate-test
+    container_name: bedrock-lens-fargate-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ecs-local-endpoints:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    environment:
+      # --- DB (mirrors CFN-injected vars) ---
+      DB_HOST: 169.254.170.10
+      DB_PORT: "5432"
+      DB_USER: bedrock_lens
+      DB_NAME: bedrock_lens
+      DB_PASSWORD: bedrock_lens_local
+      # --- Cognito ---
+      # Pre-set with a known-good test pool ID from the previous
+      # cognito-only stack so the JWT verifier has a JWKS endpoint to
+      # hit at startup. Override via shell env if you want a different
+      # pool. AUTH_ENABLED=false keeps the backend unauthed for fast
+      # smoke tests; flip to true when validating Cognito wiring.
+      AUTH_ENABLED: "false"
+      COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:-}
+      COGNITO_APP_CLIENT_ID: ${COGNITO_APP_CLIENT_ID:-}
+      COGNITO_REGION: ${COGNITO_REGION:-us-east-1}
+      COGNITO_DOMAIN: ${COGNITO_DOMAIN:-}
+      PUBLIC_BASE_URL: http://localhost:8000
+      SESSION_COOKIE_NAME: bedrock_lens_id
+      # --- Fargate IMDS emulation ---
+      # boto3 walks this URI to get credentials. ECS local endpoints
+      # answers at 169.254.170.2 with creds signed from the host's AWS
+      # config (so anything you have permissions for via your dev profile
+      # the container has too).
+      AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: /creds
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+      # --- Bedrock + ingestion ---
+      BEDROCK_REGION: us-east-1
+    networks:
+      bedrock-lens:
+        ipv4_address: 169.254.170.20
+
+# ----------------------------------------------------------------------
+# Custom bridge network so we can pin static 169.254.170.0/24 IPs (the
+# IMDS subnet AWS reserves on EC2/Fargate). Pinning is required so the
+# `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` reaches the right container.
+# ----------------------------------------------------------------------
+networks:
+  bedrock-lens:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 169.254.170.0/24

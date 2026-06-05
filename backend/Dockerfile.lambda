@@ -1,0 +1,33 @@
+# Lambda container image for the FastAPI backend.
+#
+# Built FROM AWS's official Python 3.12 Lambda base image. That image
+# already ships the Lambda Runtime Interface Client and the boto3 SDK
+# pre-installed — we just layer our deps and code on top.
+#
+# Build context: REPO ROOT (deploy.sh sets it to "$ROOT"). Mirrors the
+# Fargate Dockerfile so paths stay consistent.
+#
+# CMD points at the Mangum handler in `app/main.py` so any Lambda
+# invocation routes through the FastAPI app.
+
+FROM public.ecr.aws/lambda/python:3.12
+
+# Lambda's task root is the conventional `/var/task`; LAMBDA_TASK_ROOT
+# is set by the base image. Install our deps there.
+COPY backend/requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt -t ${LAMBDA_TASK_ROOT}
+
+# App code + ingestion library + DDL files.
+# The same image runs as three Lambdas (different CMD overrides in CFN):
+#   - Backend  (default):  app.main.handler                   (FastAPI/Mangum)
+#   - Ingester:            ingestion.lambda_handler.handler   (orchestrator)
+#   - Schema-init:         app.schema_init.handler            (CFN bootstrap)
+# DDL ships in the image so schema-init has no S3 dependency.
+COPY backend/app  ${LAMBDA_TASK_ROOT}/app
+COPY ingestion    ${LAMBDA_TASK_ROOT}/ingestion
+COPY db           ${LAMBDA_TASK_ROOT}/db
+COPY config.yaml  ${LAMBDA_TASK_ROOT}/config.yaml
+
+# Default CMD is the FastAPI handler; ingester + schema-init Lambdas
+# override CMD in CFN to point at their own entrypoints.
+CMD ["app.main.handler"]

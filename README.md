@@ -1,286 +1,312 @@
-# Bedrock Ops Review - AI-Powered Operational Assessment Tool
+# Bedrock Ops Lens
 
-## Overview
+A Bedrock observability dashboard you can deploy in your own AWS account, plus an MCP server that exposes the same data to Claude Code, Cursor, and Kiro (CLI or IDE).
 
-### Problem Statement
-Organizations running Amazon Bedrock workloads lack a systematic way to assess their operational posture - quota utilization, model lifecycle status, CRIS configuration, throttling risk, and cost exposure. Manual reviews are time-consuming and error-prone, often missing critical issues like approaching model end-of-life dates or silent throttling from CRIS quota gaps.
+![Architecture](images/architecture.png)
 
-### Bedrock Ops Review
-This MCP server automates the entire operational review process using public AWS APIs. It collects quota configuration, model inventory, CloudWatch metrics, and logging status across your accounts and regions, then generates a comprehensive assessment report through your AI assistant. All data stays in your account - no external APIs, no data sharing.
 
-### Key Capabilities
-- **Model Lifecycle Assessment** - identifies LEGACY models with active traffic, calculates financial exposure, and provides copy-paste-ready upgrade paths with pricing impact
-- **CRIS Gap Analysis** - detects mismatches between regional CRIS quotas and Global CRIS quotas that cause silent throttling
-- **Financial Impact Analysis** - calculates actual spend per model from CloudWatch token counts, with projected monthly/annual costs and migration cost comparisons
-- **Quota Configuration Review** - per-model RPM/TPM analysis across accounts and regions
-- **Throttling Detection** - identifies models experiencing throttle events from CloudWatch basic metrics
-- **Deterministic Analysis** - all numbers computed by Python, never by the LLM. The AI only writes the narrative assessment from pre-computed facts
+## What it does
 
-## Architecture
+Cost Explorer rolls all of Bedrock into one line. CloudWatch is per-account. Invocation logs are JSON in S3. This dashboard joins those three signals so you can see per-account, per-model, per-tag attribution in one place. The MCP exposes the same data to your IDE, so you can ask the question instead of clicking through tabs.
 
-```
-You ask: "Run ops review for accounts 111111111111 in regions us-east-1,us-west-2"
-    |
-    v
-AI Assistant (Kiro, Amazon Q, Cursor, VS Code, Claude Code)
-    |
-    +-- bedrock-ops-review-mcp
-    |       |
-    |       +-- collect_public.py  ->  boto3 API calls (service-quotas, bedrock, cloudwatch)
-    |       +-- analyze.py         ->  deterministic number crunching (Python)
-    |       +-- returns metrics report + assessment skill prompt
-    |
-    v
-AI generates narrative assessment from the numbers (never counts or calculates)
-```
 
-## Prerequisites
+## Two ways to use it
 
-### AWS Requirements
-- **AWS CLI** configured with credentials (`aws configure`, SSO, or environment variables)
-- **IAM Permissions**:
+```mermaid
+flowchart TB
+    subgraph A["Tier A. MCP only"]
+        direction TB
+        A1["You, in your IDE"]
+        A2["bedrock-lens-mcp<br/>running locally"]
+        A1 --> A2
+    end
 
-| Permission | Service | Purpose |
-|---|---|---|
-| `bedrock:ListFoundationModels` | Bedrock | Model inventory and lifecycle status |
-| `bedrock:ListInferenceProfiles` | Bedrock | CRIS routing configuration |
-| `bedrock:GetModelInvocationLoggingConfiguration` | Bedrock | Logging status check |
-| `service-quotas:ListServiceQuotas` | Service Quotas | Applied (non-default) quotas |
-| `service-quotas:ListAWSDefaultServiceQuotas` | Service Quotas | Default quota baselines |
-| `cloudwatch:ListMetrics` | CloudWatch | Discover models with metrics |
-| `cloudwatch:GetMetricStatistics` | CloudWatch | Invocations, throttles, tokens, latency |
+    subgraph B["Tier B. Full dashboard"]
+        direction TB
+        B1["You, in a browser<br/>or in your IDE"]
+        B2["Web dashboard<br/>+ bedrock-lens-mcp"]
+        B3["Hosted backend<br/>with daily refresh"]
+        B1 --> B2 --> B3
+    end
 
-### System Requirements
-- **Python**: 3.10 or higher
-- **Operating System**: macOS, Linux, or Windows with WSL
+    bottom[("Your AWS account.<br/>Bedrock, CloudWatch, Cost Explorer, Service Quotas.")]
 
-## MCP Deployment
+    A2 --> bottom
+    B3 --> bottom
 
-### MCP Installation Options
+    classDef tierBox fill:#fff8d6,stroke:#b89b1a,stroke-width:1px,color:#000
+    classDef innerBox fill:#dcd6f7,stroke:#6c5ce7,stroke-width:1px,color:#000
+    classDef sharedBox fill:#fff8d6,stroke:#b89b1a,stroke-width:1px,color:#000
 
-#### Option A: Local Install (via pip)
-
-Runs the MCP server locally on your machine, connecting directly to AWS APIs using your local credentials.
-
-> **1) Quick install** (recommended for first time):
-
-```bash
-git clone <this-repo>
-cd Bedrock-MCP
-bash install.sh
+    class A,B tierBox
+    class A1,A2,B1,B2,B3 innerBox
+    class bottom sharedBox
 ```
 
-The install script creates a venv, installs dependencies, and auto-configures Kiro CLI.
-
-> **2) Configure your AI assistant:**
-
-**<img src="https://kiro.dev/favicon.ico" width="16" height="16"> Kiro CLI:**
-```bash
-# Auto-configured by install.sh, or add manually:
-kiro-cli mcp add --force --name bedrock-ops-review-mcp \
-  --command "<path-to>/Bedrock-MCP/venv/bin/python3" \
-  --args "<path-to>/Bedrock-MCP/mcp_server.py" \
-  --env AWS_PROFILE=default
-```
-
-**<img src="https://kiro.dev/favicon.ico" width="16" height="16"> Kiro IDE / Cursor / VS Code:**
-
-Add to your MCP settings (`.kiro/settings/mcp.json`, `.cursor/mcp.json`, or VS Code MCP config):
-```json
-{
-  "mcpServers": {
-    "bedrock-ops-review-mcp": {
-      "command": "<path-to>/Bedrock-MCP/venv/bin/python3",
-      "args": ["<path-to>/Bedrock-MCP/mcp_server.py"],
-      "env": {
-        "AWS_PROFILE": "default"
-      }
-    }
-  }
-}
-```
-
-**Claude Code:**
-```bash
-claude mcp add bedrock-ops-review-mcp -- <path-to>/Bedrock-MCP/venv/bin/python3 <path-to>/Bedrock-MCP/mcp_server.py
-```
-
-**Amazon Q Developer CLI:**
-
-Go to Settings -> Capabilities -> MCP tab -> "+ Add Server":
-- ID: `bedrock-ops-review-mcp`
-- Name: `Bedrock Ops Review`
-- Command: `<path-to>/Bedrock-MCP/venv/bin/python3`
-- Arguments: `<path-to>/Bedrock-MCP/mcp_server.py`
-- Timeout (s): `300`
-
-> **Requirements**: Python 3.10+, AWS credentials configured.
-
-#### Option B: Remote Deploy (via Lambda)
-
-Deploys the MCP server as a Lambda function in your AWS account. Team members connect via [mcp-proxy-for-aws](https://pypi.org/project/mcp-proxy-for-aws/) - no local Python or venv needed.
-
-> **1) Deploy to Lambda:**
-
-```bash
-chmod +x deploy.sh
-./deploy.sh
-```
-
-The script will:
-1. Build and upload the Lambda deployment package to S3
-2. Deploy a CloudFormation stack with Lambda (Graviton/ARM64) and Function URL
-3. Output the Function URL for client configuration
-
-> **2) Configure your AI assistant:**
-
-**Kiro CLI:**
-```bash
-kiro-cli mcp add --force --name bedrock-ops-review-mcp \
-  --command uvx \
-  --args "mcp-proxy-for-aws@latest" "<FUNCTION_URL>mcp" "--service" "lambda" "--profile" "default" "--region" "us-east-1"
-```
-
-**Kiro IDE / Cursor / VS Code:**
-```json
-{
-  "mcpServers": {
-    "bedrock-ops-review-mcp": {
-      "command": "uvx",
-      "args": [
-        "mcp-proxy-for-aws@latest",
-        "<FUNCTION_URL>mcp",
-        "--service", "lambda",
-        "--profile", "default",
-        "--region", "us-east-1"
-      ]
-    }
-  }
-}
-```
-
-**Claude Code:**
-```bash
-claude mcp add bedrock-ops-review-mcp -- uvx mcp-proxy-for-aws@latest <FUNCTION_URL>mcp --service lambda --profile default --region us-east-1
-```
-
-**Amazon Q Developer CLI:**
-
-Go to Settings -> Capabilities -> MCP tab -> "+ Add Server":
-- ID: `bedrock-ops-review-mcp`
-- Name: `Bedrock Ops Review`
-- Command: `uvx`
-- Arguments: `mcp-proxy-for-aws@latest <FUNCTION_URL>mcp --service lambda --profile default --region us-east-1`
-- Timeout (s): `300`
-
-> **Note**: Requires `uv` installed ([install guide](https://docs.astral.sh/uv/getting-started/installation/)). Replace `<FUNCTION_URL>` with the Lambda Function URL from the deployment output.
-
-> **Authentication**: [mcp-proxy-for-aws](https://pypi.org/project/mcp-proxy-for-aws/) runs locally as a client-side bridge that signs requests with AWS SigV4 using your local AWS credentials. The Lambda Function URL uses IAM auth - no separate OAuth or API keys needed.
-
-**Cleanup:**
-```bash
-aws cloudformation delete-stack --stack-name bedrock-ops-review-mcp --region us-east-1
-```
-
-### Verify It Works
-
-After deployment, restart your AI assistant and try:
-
-```
-Run ops review for account 111111111111 in regions us-east-1,us-west-2
-```
-
-## Usage
-
-### Example Prompts
-
-```
-# Standard review (last 14 days of metrics)
-Run ops review for account 111111111111 in regions us-east-1,us-west-2
-
-# Extended lookback (up to 455 days)
-Run ops review for account 111111111111 in regions us-east-1,us-west-2 for 90 days
-
-# Specific region
-Run ops review for account 111111111111 in regions eu-west-1
-```
-
-### What You Get
-
-| Section | Description |
+| Tier | Use it when |
 |---|---|
-| **Model Lifecycle** | LEGACY models with active traffic, invocation counts, financial exposure, upgrade paths with exact model IDs |
-| **CRIS Gap Analysis** | Regional vs Global CRIS quota mismatches with gap ratios |
-| **Financial Impact** | Per-model spend in the period, projected monthly/annual, migration cost comparison |
-| **Per-Model Quotas** | RPM/TPM configuration across accounts and regions |
-| **Model Inventory** | Full catalog with ACTIVE/LEGACY status and provider breakdown |
-| **Recommendations** | Prioritized actions with effort/impact/cost ratings |
-| **Priority Actions** | Ordered table: CRITICAL to HIGH to MEDIUM to LOW |
+| A. MCP only | You want quick answers in your IDE, no infrastructure. Cannot do heavy historical or tag-attributed work because there is no database. |
+| C. Full dashboard | Finance, leadership, or anyone without AWS access needs the same insights. Includes the web UI and the MCP. |
 
-### Tool Parameters
+Tier A is light. The MCP runs on your laptop and calls AWS APIs live. Useful for quick lookups but cannot do heavy historical work or per-tag cost attribution because there is no database behind it.
 
-| Parameter | Required | Default | Description |
-|---|---|---|---|
-| `accounts` | Yes | - | AWS account ID |
-| `regions` | No | `us-east-1,us-west-2` | Comma-separated AWS regions |
-| `days` | No | `14` | CloudWatch metrics lookback period (max: 455 days) |
+Tier B is everything else. The Cloudscape web dashboard, sign-in, CloudFront, daily ingester, Aurora, Memcached, and the same MCP wired up to talk to the hosted backend. Most teams deploy this so non-engineers can get the same insights without a terminal.
 
-### Multi-Account Reviews
 
-The tool runs using your active AWS credentials. For reviewing multiple accounts:
+## Quick start
 
-**Option 1: Run per account (simplest)**
-```
-# Switch profile and run
-export AWS_PROFILE=account-a
-Run ops review for account 111111111111 in regions us-east-1,us-west-2
+```bash
+git clone https://github.com/aws-samples/sample-bedrock-ops-lens.git
+cd sample-bedrock-ops-lens
+ALLOWED_EMAIL_DOMAINS=yourcompany.com ./deploy.sh --yes
 ```
 
-**Option 2: Cross-account IAM roles**
-Set up `~/.aws/config` with assume-role profiles:
-```ini
-[profile target-account]
-role_arn = arn:aws:iam::222222222222:role/BedrockOpsReviewRole
-source_profile = default
-```
-Then `export AWS_PROFILE=target-account` before running.
+The script handles everything: VPC, Aurora, Memcached, Cognito, CloudFront, WAF, schema, ingester, and a first ingest run. About 12 minutes. It prints the dashboard URL when done.
 
-## Security and Privacy
+Open the dashboard URL and sign up. Anyone whose email domain matches `ALLOWED_EMAIL_DOMAINS` can create their own account; the first verified user is auto-promoted to admin.
 
-- All API calls use your local AWS credentials - no external services
-- Data collection runs locally on your machine (Option A) or in your own Lambda (Option B)
-- No data is sent to any third party
-- The MCP server has no network access beyond AWS APIs
-- Bedrock processes all inference requests within [AWS Mantle](https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-mantle.html) - a zero-operator-access architecture
 
-## Project Structure
+## Wiring up the MCP
 
-```
-Bedrock-MCP/
-+-- mcp_server.py          # MCP server - orchestrates collection + analysis
-+-- collect_public.py      # Data collection via public AWS APIs (boto3)
-+-- analyze.py             # Deterministic analysis engine (Python)
-+-- skills/
-|   +-- bedrock_ops_review.md   # Assessment generation skill
-|   +-- orchestrator.md         # Multi-step orchestration skill
-+-- install.sh             # One-command local installer (Option A)
-+-- deploy.sh              # Lambda remote deployment (Option B)
-+-- lambda_handler.py      # Lambda Function URL handler
-+-- bedrock-ops-review-mcp.yaml  # CloudFormation template
-+-- requirements.txt       # Python dependencies (mcp, boto3)
-+-- README.md
+Install the MCP server first.
+
+```bash
+cd mcp
+pipx install -e .
 ```
 
-## Troubleshooting
+Pick the option that matches how you deployed.
 
-| Issue | Cause | Fix |
-|---|---|---|
-| `AccessDeniedException` | Missing IAM permissions | Add permissions from Prerequisites table |
-| `No metrics data` | No Bedrock invocations in the lookback period | Increase `days` parameter (e.g., 30 or 90) |
-| `MCP connection failed` | Server crashed on startup | Run `python3 mcp_server.py` directly to see the error |
-| Slow execution | Many accounts x regions | Each account-region combo makes ~5 API calls. May take 1-2 minutes |
-| `Connection closed` in Amazon Q | print() to stdout corrupts MCP protocol | Ensure all logging goes to stderr (already fixed in current version) |
+<details>
+<summary><b>Option 1. Tier A. No deployment, uses your local AWS credentials</b></summary>
 
-## Contributing
+Best for: a quick, solo setup. The MCP calls AWS directly.
 
-Issues and PRs welcome. The analysis engine (`analyze.py`) is designed to be extended - add new sections by following the existing pattern of data collection, aggregation, text output.
+```bash
+claude mcp add bedrock-lens -- bedrock-lens-mcp
+```
+
+</details>
+
+<details>
+<summary><b>Option 2. Tier B, no password (recommended if you have AWS credentials)</b></summary>
+
+Best for: anyone with AWS credentials who deployed the stack. Uses SigV4 signing so there is no Cognito password to manage.
+
+```bash
+FN_URL=$(aws cloudformation describe-stacks \
+  --stack-name BedrockOpsLens-<suffix> \
+  --query 'Stacks[0].Outputs[?OutputKey==`BackendLambdaUrl`].OutputValue' \
+  --output text)
+
+claude mcp add bedrock-lens \
+  --env BEDROCK_LENS_FUNCTION_URL="$FN_URL" \
+  -- bedrock-lens-mcp
+```
+
+</details>
+
+<details>
+<summary><b>Option 3. Tier B with a Cognito password (for users without AWS credentials)</b></summary>
+
+Best for sharing access with someone who does not have AWS credentials. They sign in with email and password instead.
+
+Set your credentials as environment variables first, then add the server. Do not commit the password.
+
+```bash
+export BEDROCK_LENS_API=https://<distribution>.cloudfront.net
+export BEDROCK_LENS_USER=you@yourcompany.com
+export BEDROCK_LENS_PASSWORD=...   # paste the password here, do not check it in
+
+claude mcp add bedrock-lens \
+  --env BEDROCK_LENS_API="$BEDROCK_LENS_API" \
+  --env BEDROCK_LENS_USER="$BEDROCK_LENS_USER" \
+  --env BEDROCK_LENS_PASSWORD="$BEDROCK_LENS_PASSWORD" \
+  -- bedrock-lens-mcp
+```
+
+</details>
+
+Then ask Claude something like:
+
+> Run the bedrock-lens health check.
+
+> What was our Bedrock spend last 30 days, and which day had the biggest jump?
+
+> Are we using any models that are Legacy or about to hit EOL?
+
+> Run an ops review of the last 14 days and summarize the top 3 issues.
+
+
+## Daily refresh
+
+After deploy, EventBridge invokes the ingester every day at 05:00 UTC. The ingester reads CloudWatch metrics, Cost Explorer, Service Quotas, Bedrock APIs, and Bedrock invocation logs from S3, then writes everything into Aurora and bumps the cache generation. Open the dashboard the next morning, yesterday's data is there.
+
+Manual backfill if you change the schedule or want a fresh run:
+
+```bash
+aws lambda invoke \
+  --function-name BedrockOpsLens-<suffix>-ingester \
+  --invocation-type RequestResponse --cli-read-timeout 900 \
+  /tmp/out.json
+```
+
+
+## Multi-account data pipeline
+
+The central Lambda pulls Bedrock data from every account you point it at. One script does the whole thing: it deploys a read-only `BedrockOpsLensReader` role into each account via a CloudFormation StackSet, reconfigures the central ingester to use those roles, and triggers the first ingest run synchronously so you see real data immediately.
+
+```bash
+./setup-pipeline.sh --scope <single|ou|org-root|accounts> [opts]
+```
+
+For Cost Explorer, no per-account role is needed at all: the management account's Cost Explorer is org-aware natively and the central Lambda calls it once.
+
+<details>
+<summary><b>Option 1. Just my own account (single)</b></summary>
+
+The simplest case. No StackSet. Reader role deployed to the central account itself; ingester pulls from this one account.
+
+```bash
+./setup-pipeline.sh --scope single
+```
+
+</details>
+
+<details>
+<summary><b>Option 2. All accounts under one or more OUs (recommended for orgs)</b></summary>
+
+Service-managed StackSet, deployed to the OUs you list. Auto-deploy is ON, so accounts joining the OU later are auto-onboarded. Run from the management account, or pass `--delegated-admin` from a delegated administrator account.
+
+```bash
+./setup-pipeline.sh --scope ou --ou-id ou-xxxx-yyyyyyyy
+```
+
+For multiple OUs, comma-separate them.
+
+</details>
+
+<details>
+<summary><b>Option 3. Whole org root</b></summary>
+
+Same as option 2 but targets every account in the organization. Useful for small orgs where OU-scoping isn't worth it.
+
+```bash
+./setup-pipeline.sh --scope org-root
+```
+
+</details>
+
+<details>
+<summary><b>Option 4. Explicit account list (no AWS Organizations)</b></summary>
+
+Self-managed StackSet. Doesn't require AWS Organizations, but each member account needs the AWS-provided `AWSCloudFormationStackSetExecutionRole` pre-provisioned (one-time, per the [AWS docs](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-prereqs-self-managed.html)).
+
+```bash
+./setup-pipeline.sh --scope accounts \
+  --accounts 111111111111,222222222222,333333333333
+```
+
+Or via file:
+
+```bash
+./setup-pipeline.sh --scope accounts \
+  --accounts-file accounts.txt
+```
+
+</details>
+
+The script is idempotent: re-run any time accounts are added or removed. Use `--dry-run` to preview without touching anything, `--skip-ingest` to skip the post-rollout ingest run.
+
+### What `setup-pipeline.sh` does
+
+1. Validates the central stack exists (auto-discovers from `.deploy-stack-name`).
+2. Calls `scripts/setup-multi-account.py` to roll out the reader role via the right CloudFormation API for the chosen scope (service-managed StackSet for `ou` / `org-root`, self-managed for `accounts`, plain stack for `single`).
+3. Reconfigures `MONITORED_ACCOUNTS_MODE` on the central ingester Lambda (`discover-org` for `ou`/`org-root`, `explicit` for `accounts`, `single` for `single`).
+4. Triggers one ingest run synchronously and prints the per-module summary.
+
+After this, EventBridge fires the ingester daily at 05:00 UTC. Re-run the script any time the OU shape changes.
+
+### Scale
+
+Validated end-to-end up to ~100 accounts in one ingester Lambda. Past that, the central Lambda starts hitting CloudWatch (50 TPS) and Service Quotas (5 TPS) per-account API limits.
+
+For larger orgs (200+ accounts), shard by OU and run one StackSet per shard, each producing its own ingester:
+
+```bash
+./setup-pipeline.sh --scope ou --ou-id ou-engineering-...
+./setup-pipeline.sh --scope ou --ou-id ou-data-...
+./setup-pipeline.sh --scope ou --ou-id ou-experimental-...
+```
+
+For very large customers (500+ accounts) the pull architecture becomes the wrong fit. Reach out and we'll point you at the push-mode pattern (CW Metric Streams → Firehose → S3 → central ingester).
+
+
+## Dashboard tabs
+
+| Tab | Answer |
+|---|---|
+| Overview | Total requests, accounts, tokens, error rate, spend in the window |
+| Quotas | Applied versus default quotas, peak usage, severity-coded utilisation |
+| Cost Insights | Real Cost Explorer dollars, daily trend, by-account and by-model breakdowns |
+| Health and Errors | Errors by model, by account, daily and hourly trends |
+| Latency | p50, p90, p99 by model |
+| Capacity and Adoption | CRIS adoption, throttle rates, prompt caching opportunities, Claude 4 burndown risk |
+| Model Insights | Per-model deep dive: requests, tokens, cache hit rate, errors, accounts |
+| Model Lifecycle | Live ListFoundationModels joined with usage, timeline of legacy and EOL bands |
+| Ops Review | LLM-synthesized executive brief covering the top 3 issues |
+| Settings | Auth identity, ingestion freshness, region and account scope, pinned tag keys |
+
+
+## Cost
+
+Idle, with Aurora paused, the stack runs around fifty dollars per month. NAT Gateway is the largest fixed cost at about thirty-two. Aurora is between zero and forty-five depending on activity. ElastiCache Memcached is about thirteen. Lambda, CloudFront, S3, Cognito, and WAF together are around five.
+
+
+## Verify
+
+```bash
+DASH_URL=$(aws cloudformation describe-stacks \
+  --stack-name BedrockOpsLens-<suffix> \
+  --query 'Stacks[0].Outputs[?OutputKey==`DashboardUrl`].OutputValue' \
+  --output text)
+
+curl -sf "$DASH_URL/api/health"
+```
+
+For end-to-end UI validation:
+
+```bash
+cd frontend
+DASH_URL="$DASH_URL" \
+TEST_EMAIL="you@yourcompany.com" \
+TEST_PASS="$BEDROCK_LENS_PASSWORD" \
+  npx playwright test tests/deployed-smoke.spec.js --project=chromium --reporter=list
+```
+
+
+## Local development
+
+```bash
+docker compose up -d
+psql -d bedrock_lens -f db/schema.sql
+psql -d bedrock_lens -f db/partitions.sql
+cd backend && PYTHONPATH=.. uvicorn app.main:app --port 8001
+cd frontend && npm install && npm run dev
+```
+
+Frontend at http://localhost:5173. Same FastAPI app and same ingester code that runs in Lambda runs locally under uvicorn.
+
+
+## Tear down
+
+```bash
+./deploy.sh destroy
+```
+
+Cognito User Pool and the SPA bucket survive the delete on purpose, so re-deploys don't reset users. Delete them by hand if you want a fully clean account.
+
+
+## License
+
+MIT License. See `LICENSE` for details.

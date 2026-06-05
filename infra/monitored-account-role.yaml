@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Ops Lens — read-only IAM role for cross-account metric ingestion.
+  Deploy this in EVERY account whose Bedrock usage you want surfaced in the
+  central dashboard. Use a CloudFormation StackSet from the AWS Organizations
+  management account to deploy it org-wide in one shot.
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    Description: >
+      AWS account ID where Bedrock Ops Lens is deployed (the "central"
+      observability account that runs the ingester).
+    AllowedPattern: '^[0-9]{12}$'
+
+  RoleName:
+    Type: String
+    Default: BedrockOpsLensReader
+    Description: >
+      IAM role name. Must match the value the ingester uses when constructing
+      the assume-role ARN (default: BedrockOpsLensReader).
+
+  ExternalId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional external ID for the trust policy (defense-in-depth against the
+      "confused deputy" problem). If set, the central ingester must pass the
+      same value when calling sts:AssumeRole.
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, '']]
+
+Resources:
+  # Use a customer-managed policy instead of an inline policy (cfn-guard IAM_NO_INLINE_POLICY_CHECK).
+  BedrockOpsLensReaderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: 'Read-only role used by Bedrock Ops Lens to ingest CloudWatch metrics and Service Quotas.'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TrustCentralAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${CentralAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              !If
+                - HasExternalId
+                - StringEquals:
+                    sts:ExternalId: !Ref ExternalId
+                - !Ref AWS::NoValue
+      ManagedPolicyArns:
+        - !Ref BedrockOpsLensReadPolicy
+
+  # Managed policy holding the read-only permissions previously inlined on the role.
+  BedrockOpsLensReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${RoleName}-Read'
+      Description: 'Read-only permissions for Bedrock Ops Lens cross-account ingestion.'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # CloudWatch — list and pull AWS/Bedrock metrics.
+          - Sid: CloudWatchRead
+            Effect: Allow
+            Action:
+              - cloudwatch:ListMetrics
+              - cloudwatch:GetMetricData
+              - cloudwatch:GetMetricStatistics
+            Resource: '*'
+          # Service Quotas — applied + default values.
+          - Sid: ServiceQuotasRead
+            Effect: Allow
+            Action:
+              - servicequotas:GetServiceQuota
+              - servicequotas:GetAWSDefaultServiceQuota
+              - servicequotas:ListServiceQuotas
+              - servicequotas:ListAWSDefaultServiceQuotas
+              - servicequotas:ListServices
+            Resource: '*'
+          # Bedrock — read-only, only for the invocation-logging-config check
+          # (so the dashboard can tell the operator whether logging is on).
+          - Sid: BedrockReadOnly
+            Effect: Allow
+            Action:
+              - bedrock:GetModelInvocationLoggingConfiguration
+              - bedrock:ListFoundationModels
+              - bedrock:GetFoundationModel
+              - bedrock:ListInferenceProfiles
+            Resource: '*'
+
+Outputs:
+  RoleArn:
+    Description: ARN of the cross-account reader role.
+    Value: !GetAtt BedrockOpsLensReaderRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
