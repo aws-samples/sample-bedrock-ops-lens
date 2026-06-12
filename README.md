@@ -58,8 +58,11 @@ Tier B is everything else. The Cloudscape web dashboard, sign-in, CloudFront, da
 ```bash
 git clone https://github.com/aws-samples/sample-bedrock-ops-lens.git
 cd sample-bedrock-ops-lens
+cp config.example.yaml config.yaml      # then edit: deploy_region, monitored accounts/regions
 ALLOWED_EMAIL_DOMAINS=yourcompany.com ./deploy.sh --yes
 ```
+
+`config.yaml` is required (it drives the deploy region and which accounts/regions get monitored). Copy the example and edit it before deploying; the defaults work for a single-account, single-region setup.
 
 The script handles everything: VPC, Aurora, Memcached, Cognito, CloudFront, WAF, schema, ingester, and a first ingest run. About 12 minutes. It prints the dashboard URL when done.
 
@@ -160,7 +163,7 @@ The central Lambda pulls Bedrock data from every account you point it at. One sc
 ./setup-pipeline.sh --scope <single|ou|org-root|accounts> [opts]
 ```
 
-For Cost Explorer, no per-account role is needed at all: the management account's Cost Explorer is org-aware natively and the central Lambda calls it once.
+For Cost Explorer, no per-account role is needed at all — the management account's Cost Explorer is org-aware natively and the central Lambda calls it once.
 
 <details>
 <summary><b>Option 1. Just my own account (single)</b></summary>
@@ -216,7 +219,7 @@ Or via file:
 
 </details>
 
-The script is idempotent: re-run any time accounts are added or removed. Use `--dry-run` to preview without touching anything, `--skip-ingest` to skip the post-rollout ingest run.
+The script is idempotent — re-run any time accounts are added or removed. Use `--dry-run` to preview without touching anything, `--skip-ingest` to skip the post-rollout ingest run.
 
 ### What `setup-pipeline.sh` does
 

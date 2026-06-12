@@ -461,6 +461,29 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Roll the Ingester + Schema-init Lambdas to the just-pushed image.
+#
+# Both are PackageType=Image Lambdas pinned to ":latest". CFN resolves that
+# tag to a digest at create time and does NOT re-pull when the tag string is
+# unchanged, so on a code-only redeploy (same image tag, new digest) these
+# Lambdas keep running the STALE image. update-function-code with the same
+# :latest URI forces Lambda to resolve the tag to the new digest. The
+# backend Lambda is handled above via publish-version; these two have no
+# alias so a direct code update is the right tool.
+# -----------------------------------------------------------------------------
+for FN in "${MAIN_STACK}-ingester" "${MAIN_STACK}-schema-init"; do
+    if aws lambda get-function --function-name "$FN" --region "$REGION" >/dev/null 2>&1; then
+        echo "    refreshing $FN to latest image digest..."
+        aws lambda update-function-code \
+            --function-name "$FN" \
+            --image-uri "$ECR_URI:latest" \
+            --region "$REGION" \
+            --query 'LastUpdateStatus' --output text >/dev/null 2>&1 || true
+        aws lambda wait function-updated --function-name "$FN" --region "$REGION" 2>/dev/null || true
+    fi
+done
+
+# -----------------------------------------------------------------------------
 # Initial ingester run.
 #
 # The schedule fires once a day, but on a fresh deploy the dashboard would

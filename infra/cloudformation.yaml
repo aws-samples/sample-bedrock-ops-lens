@@ -1055,11 +1055,15 @@ Resources:
           # arbitrary list. discover-org needs organizations:ListAccounts on
           # the IngesterLambdaRole (granted below).
           MONITORED_ACCOUNTS_MODE: discover-org
-          # Region scope for cw_metrics + invocation_logs (the volumetric
-          # path). Default is the deploy region; widen to 'us-eu-apac' or
-          # 'all' once you've verified single region works.
-          MONITORED_REGIONS_PRESET: explicit
-          MONITORED_REGIONS_LIST: !Ref AWS::Region
+          # Region scope for cw_metrics + invocation_logs comes from
+          # config.yaml's `monitored_regions` (baked into the Lambda image
+          # at build time). We intentionally do NOT set MONITORED_REGIONS_*
+          # env vars here — doing so would override (shadow) the customer's
+          # config.yaml, silently narrowing ingestion to the deploy region.
+          # To change monitored regions: edit config.yaml and re-run
+          # deploy.sh (which rebuilds the image). To override per-invocation
+          # without a redeploy, set MONITORED_REGIONS_PRESET /
+          # MONITORED_REGIONS_LIST on the Lambda directly.
           # Bedrock invocation-logs S3 bucket. When non-empty the ingester
           # also runs the tag-attribution path. Empty = volumetric only.
           BEDROCK_LOGS_BUCKET: !Ref BedrockLogsBucket

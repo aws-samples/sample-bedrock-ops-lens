@@ -4,9 +4,12 @@ Runs in two contexts:
   * EventBridge daily schedule  (event = {"source": "aws.events", ...})
   * Manual `aws lambda invoke`  (event = {"only": ["cw_metrics", ...]} or {})
 
-Order matters: lifecycle/quotas first (cheap, dim tables), then volumetric
-(cw_metrics), then tag-attributed (invocation_logs), then cost. Each step is
-isolated — one failing module does NOT abort the rest.
+Order matters: lifecycle first (cheap dim table), then volumetric
+(cw_metrics), then cost, then tag-attributed (invocation_logs), and
+quotas LAST. quotas is the slowest module at org/multi-region scale
+(Service Quotas API rate-limits), so it runs last to avoid starving the
+primary-data modules of the 15-min Lambda budget. Each step is isolated —
+one failing or timed-out module does NOT abort the rest.
 
 After everything finishes the cache_generation key in Memcached is bumped so
 the dashboard sees fresh data on the next request.
@@ -95,16 +98,23 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
     # BEDROCK_OPS_LENS_FORCE_ASSUME_SELF — that would force an assume into a
     # non-existent BedrockOpsLensReader role and 4-of-5 modules would skip.
 
+    # Order matters. quotas runs LAST: at org scale across many regions the
+    # Service Quotas API rate-limits hard and quotas can run for 10+ minutes,
+    # so if it ran early it would starve the volumetric/cost modules of the
+    # 15-min Lambda budget and they'd never execute. Running the fast,
+    # primary-data modules (lifecycle, cw_metrics, cost) first guarantees the
+    # dashboard's core data always lands even if quotas later times out; a
+    # partial quotas pass simply resumes on the next scheduled run.
     schedule = [
         ("model_lifecycle", "ingestion.model_lifecycle",
          ["model_lifecycle", "--db-url", db_url]),
-        ("quotas",          "ingestion.quotas",
-         ["quotas",          "--db-url", db_url]),
         ("cw_metrics",      "ingestion.cw_metrics",
          ["cw_metrics",      "--db-url", db_url, "--days", str(days)]),
         ("cost",            "ingestion.cost",
          ["cost",            "--db-url", db_url, "--days", str(max(days, 30))]),
     ]
+    # quotas is appended LAST (after invocation_logs below) — see the
+    # ordering note in the module docstring.
 
     # invocation_logs is opt-in: it requires Bedrock model invocation logging
     # to be enabled with an S3 destination. If BEDROCK_LOGS_BUCKET isn't set,
@@ -126,6 +136,15 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
              "--accounts", self_acct or "",
              "--regions", region]
         ))
+
+    # quotas LAST: slowest module at org/multi-region scale (Service Quotas
+    # API rate-limits). Appended after invocation_logs so a long/timed-out
+    # quotas pass can never starve the primary-data modules above. A partial
+    # quotas run resumes on the next scheduled invocation.
+    schedule.append((
+        "quotas", "ingestion.quotas",
+        ["quotas", "--db-url", db_url]
+    ))
 
     if only:
         schedule = [s for s in schedule if s[0] in set(only)]
