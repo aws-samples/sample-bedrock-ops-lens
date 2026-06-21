@@ -209,18 +209,25 @@ export const SECTION_INFO = {
   /* --------------------------------------------------------------------- */
   /* Errors tab                                                            */
   /* --------------------------------------------------------------------- */
+  'status-codes': {
+    title: 'Status Codes',
+    body: 'Stacked hourly breakdown of every request by true HTTP status — 200 OK plus per-code errors (400, 403, 404, 408, 424, 429, 500, 503). This chart is sourced ONLY from Bedrock model invocation logs, which carry a real per-request errorCode. If invocation logging is not enabled for the monitored account(s), the chart shows a notice instead of fabricating a breakdown — CloudWatch metrics expose only all-4xx / all-5xx aggregates and cannot distinguish individual codes.',
+    why: 'Individual codes have different owners and fixes: 429 = quota exceeded (platform), 400 = bad request (your client), 403 = IAM/model-access denial, 404 = wrong model/profile ID, 408 = model timeout, 424 = model error, 500/503 = Bedrock-side. A true per-code view tells you who to page.',
+    action: 'To populate this chart, enable Bedrock model invocation logging to S3 (see the deployment README) and re-run ingestion. 429 sustained → request a Service Quotas increase. 5xx sustained → check the AWS Health Dashboard. 400/404 spike after a deploy → roll back.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html',
+  },
   'error-trend': {
-    title: 'Error trend (by status code)',
-    body: 'Stacked daily breakdown of failed invocations split by HTTP status: 400 (ValidationException), 403 (AccessDeniedException), 429 (ThrottlingException), 500 (InternalServerException), 503 (ServiceUnavailableException). Click any bar to drill into hourly breakdown for that day (last 7 days only).',
-    why: '429 = quota exceeded. 400 = bad request from your client. 403 = IAM or model-access denial. 500/503 = Bedrock-side issue. Different codes have different owners and different fix paths.',
-    action: '429 sustained → request a Service Quotas increase TODAY. 5xx sustained → check the AWS Health Dashboard. 400 spike correlated with a deploy → roll back. 403 → audit recent IAM policy or Bedrock model-access changes.',
-    docLink: 'https://docs.aws.amazon.com/bedrock/latest/APIReference/CommonErrors.html',
+    title: 'Error trend (429 / 4xx / 5xx)',
+    body: 'Stacked daily breakdown of failed invocations from CloudWatch metrics. AWS/Bedrock publishes three trustworthy error counters: InvocationThrottles (real 429s), InvocationClientErrors (all 4xx) and InvocationServerErrors (all 5xx). This chart shows throttles (429), the remaining non-throttle 4xx aggregate, and the 5xx aggregate — it does NOT split the non-throttle 4xx into individual codes. For a true per-code view (403 vs 404 vs 408 vs 424 …), see the Status Codes chart above, sourced from invocation logs. Click any bar to drill into the hourly breakdown (last 7 days only).',
+    why: '429 = quota exceeded (request a Service Quotas increase). Non-throttle 4xx = client-side request problems. 5xx = Bedrock-side. Separating real throttles from the rest tells you immediately whether you are quota-bound or have a client bug.',
+    action: '429 sustained → request a quota increase. 4xx (non-throttle) spike after a deploy → roll back / check payloads. 5xx sustained → check the AWS Health Dashboard. For exact non-throttle codes, enable invocation logging and use the Status Codes chart.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-cw.html',
   },
   'errors-by-model': {
     title: 'Errors by model',
-    body: 'Per-model failure breakdown by status code. Each row is one model with its absolute counts in the 400/403/429/500/503 columns.',
-    why: 'A single misbehaving model usually dominates the error count, so isolating it scopes the investigation. Different status codes need different owners — 429 is platform/quota, 400 is application/client, 5xx is AWS.',
-    action: 'Pick the model with the highest 429 → drill into Throttle hotspots filtered to that model. Pick the model with the highest 400 → engage the application owner; the issue is in their request payload.',
+    body: 'Per-model failure breakdown from CloudWatch. Columns: 429 (real throttles), 4xx* (remaining non-throttle 4xx aggregate), 5xx (all server errors). CloudWatch does not expose individual non-throttle codes — see the Status Codes chart for those.',
+    why: 'A single misbehaving model usually dominates the error count, so isolating it scopes the investigation. 429 is quota-side, 4xx* is client-side, 5xx is AWS-side.',
+    action: 'Highest 429 → drill into Throttle hotspots for that model and check its quota. Highest 4xx* → engage the application owner (request payloads). Highest 5xx → check the AWS Health Dashboard for that model/region.',
   },
 
   /* --------------------------------------------------------------------- */
@@ -260,7 +267,7 @@ export const SECTION_INFO = {
   },
   'ops-burndown': {
     title: 'Claude 4+ burndown risk',
-    body: 'Starting with Claude 4, Bedrock counts each output token as 5 against TPM (instead of 1). Bedrock also reserves max_tokens × 5 × RPM worth of TPM at request time, only adjusting after the request completes. This table shows the effective peak TPM (peak_tpm + 4 × peak_output_tpm) and the burndown overhead %.',
+    body: 'Starting with Claude 4, Bedrock counts each output token as 5 against TPM (instead of 1). Bedrock also reserves max_tokens × 5 × RPM worth of TPM at request time, only adjusting after the request completes. This table shows the effective peak TPM (peak_tpm + 4 × peak_output_tpm) and the burndown overhead %. Peak TPM excludes cache-read input tokens (they do not count toward the TPM quota — matches CloudWatch EstimatedTPMQuotaUsage). Hours predating the cache-read column are excluded from the peak rather than counted at their old inflated value.',
     why: 'If max_tokens is set to the model maximum (4k or 8k) but actual avg output is 300 tokens, Bedrock still reserves the full budget. The workload hits ThrottlingException with 80%+ unused real capacity. Highest-impact, zero-cost fix for Claude 4+ throttling.',
     action: 'Set max_tokens close to actual expected output (check the Avg output column for the right ballpark — typically 200-1000), not the model maximum. One-line client change. Throttling drops without any quota increase.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/quotas.html',

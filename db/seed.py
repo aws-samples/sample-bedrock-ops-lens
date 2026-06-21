@@ -107,15 +107,25 @@ def model_size_factor(model_id: str) -> float:
 
 
 def status_split(total: int, throttle_rate: float, error_rate: float) -> tuple[int, int, int, int, int, int]:
-    """Returns (failed, s400, s403, s429, s500, s503)."""
-    failed = int(total * (throttle_rate + error_rate))
-    s429 = int(total * throttle_rate)
-    server_total = int(total * error_rate)
-    s500 = int(server_total * 0.6)
-    s503 = server_total - s500
-    s400 = max(0, failed - s429 - s500 - s503)
-    s403 = max(0, int(failed * 0.02))
-    return failed, s400, s403, s429, s500, s503
+    """Returns (failed, s400, s403, s429, s500, s503) in the HONEST CloudWatch
+    shape used by f_daily / f_hourly_errors. CloudWatch gives three trustworthy
+    counters: all-4xx, all-5xx, and real throttles (InvocationThrottles). So:
+      s429 = real throttle count, s400 = remaining non-throttle 4xx aggregate,
+      s500 = all-5xx aggregate; s403/s503 stay 0 (indistinguishable from CW).
+    The genuine per-code split (403/404/408/424/503) lives in f_hourly_status,
+    seeded from the invocation-log model — see seed_hourly_status."""
+    c4xx = int(total * throttle_rate)             # throttles dominate 4xx for Bedrock
+    c5xx = int(total * error_rate)
+    s429 = int(c4xx * rng_uniform_throttle())     # most 4xx are throttles
+    non_throttle_4xx = max(0, c4xx - s429)
+    failed = c4xx + c5xx
+    return failed, non_throttle_4xx, 0, s429, c5xx, 0
+
+
+def rng_uniform_throttle() -> float:
+    """Fraction of 4xx that are throttles in synthetic data. Module-level RNG
+    isn't threaded here, so use a fixed realistic ratio (most 4xx = 429)."""
+    return 0.85
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +304,51 @@ def seed_hourly_errors(cur, today: date, rng: random.Random) -> int:
     return len(rows)
 
 
+def seed_hourly_status(cur, today: date, rng: random.Random) -> int:
+    """7-day rolling REAL per-status-code hourly rows → f_hourly_status.
+
+    Represents data sourced from Bedrock model invocation logs (the only place
+    a genuine per-code breakdown exists). Distinct from f_hourly_errors, which
+    holds the honest CloudWatch 4xx/5xx aggregates. We seed both so the local
+    demo exercises the "Status Codes" chart with realistic per-code shapes."""
+    rows = []
+    for d_offset in range(7):
+        d = today - timedelta(days=d_offset)
+        for hour in range(24):
+            for acct in rng.sample(ACCOUNTS, k=3):
+                for model in rng.sample(MODELS, k=3):
+                    for region in rng.sample(REGIONS, k=1):
+                        total = rng.randint(50, 500)
+                        # Realistic distribution: throttles dominate errors,
+                        # everything else is comparatively rare.
+                        s429 = int(total * rng.uniform(0.0, 0.05))
+                        s400 = int(total * rng.uniform(0.0, 0.015))
+                        s403 = int(total * rng.uniform(0.0, 0.004))
+                        s404 = int(total * rng.uniform(0.0, 0.002))
+                        s408 = int(total * rng.uniform(0.0, 0.003))
+                        s424 = int(total * rng.uniform(0.0, 0.002))
+                        s500 = int(total * rng.uniform(0.0, 0.01))
+                        s503 = int(total * rng.uniform(0.0, 0.004))
+                        errs = s429 + s400 + s403 + s404 + s408 + s424 + s500 + s503
+                        s200 = max(0, total - errs)
+                        rows.append((
+                            d, hour, acct, model, region, total,
+                            s200, s400, s403, s404, s408, s424, s429, s500, s503,
+                        ))
+    cur.executemany(
+        """
+        INSERT INTO f_hourly_status (
+            event_date, hour, accountId, modelId, region, total_requests,
+            status_200_count, status_400_count, status_403_count,
+            status_404_count, status_408_count, status_424_count,
+            status_429_count, status_500_count, status_503_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        rows,
+    )
+    return len(rows)
+
+
 def seed_latency_daily(cur, today: date, rng: random.Random) -> int:
     rows = []
     for d_offset in range(DAYS):
@@ -420,6 +475,7 @@ def stamp_meta(cur) -> None:
         INSERT INTO ingestion_meta (key, value, updated_at)
         VALUES ('last_refresh_utc', now()::text, now()),
                ('seed_source', 'synthetic', now()),
+               ('last_invocation_logs_refresh', now()::text, now()),
                ('days_window', %s, now())
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
         """,
@@ -432,6 +488,7 @@ def truncate_facts(cur) -> None:
         """
         TRUNCATE
             f_daily, f_daily_tagged, f_hourly_peak, f_hourly_errors,
+            f_hourly_status,
             f_latency_daily, f_context_length, f_quotas,
             dim_tags, ingestion_days, ingestion_meta
         """
@@ -469,6 +526,10 @@ def main() -> int:
 
             print("[5/8] seeding f_hourly_errors (7-day rolling)...")
             n = seed_hourly_errors(cur, today, rng)
+            print(f"      {n:,} rows")
+
+            print("[5b/8] seeding f_hourly_status (real per-code, 7-day)...")
+            n = seed_hourly_status(cur, today, rng)
             print(f"      {n:,} rows")
 
             print("[6/8] seeding f_latency_daily...")

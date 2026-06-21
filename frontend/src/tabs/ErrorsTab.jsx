@@ -2,16 +2,56 @@
 import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, BarChart, LineChart, Grid, Box,
-  Button, Spinner, Alert,
+  Button, Spinner, Alert, SegmentedControl,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtPct, api as apiCall } from '../api.js';
-import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
+import { ChartLoading, SectionHeader, InfoLink, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
+
+// Per-code palette + render order for the "Status Codes" stacked chart.
+// 200 OK first (bottom of stack), then client codes, then server codes.
+// Distinct, high-contrast hues so adjacent stacked segments never blur into
+// each other (the previous orange/brown/red ramp was hard to tell apart).
+const STATUS_SERIES = [
+  { key: 'ok',   title: '200 OK', color: '#2e7d32' },  // green
+  { key: 's400', title: '400',    color: '#f59e0b' },  // amber
+  { key: 's403', title: '403',    color: '#8b5cf6' },  // violet
+  { key: 's404', title: '404',    color: '#0ea5e9' },  // sky blue
+  { key: 's408', title: '408',    color: '#ec4899' },  // pink
+  { key: 's424', title: '424',    color: '#a16207' },  // brown
+  { key: 's429', title: '429',    color: '#ef4444' },  // red
+  { key: 's500', title: '500',    color: '#111827' },  // near-black
+  { key: 's503', title: '503',    color: '#6b7280' },  // gray
+];
 
 export default function ErrorsTab({ filters, onInfo }) {
   const byModel = useApi('/errors-by-model', filters, [JSON.stringify(filters)]);
   const byAcct = useApi('/errors-by-account', filters, [JSON.stringify(filters)]);
   const trend = useApi('/errors-daily-trend', filters, [JSON.stringify(filters)]);
+  const statusCodes = useApi('/status-codes', filters, [JSON.stringify(filters)]);
+
+  // "All requests" includes 200 OK; "Errors only" drops it so the Y-axis
+  // autoscales to the error magnitude (200 OK otherwise dwarfs every error
+  // code into an invisible sliver). Default to errors-only — this is an
+  // errors view, after all.
+  const [statusView, setStatusView] = useState('errors');
+
+  // Real per-code hourly series from invocation logs. Drop all-zero series so
+  // the legend stays readable when a code never occurs in the window.
+  const statusSeries = useMemo(() => {
+    const rows = statusCodes.data?.series || [];
+    if (!rows.length) return [];
+    const visible = statusView === 'errors'
+      ? STATUS_SERIES.filter(s => s.key !== 'ok')   // hide 200 OK
+      : STATUS_SERIES;
+    return visible
+      .filter(s => rows.some(r => Number(r[s.key] || 0) > 0))
+      .map(s => ({
+        title: s.title, type: 'bar', color: s.color,
+        data: rows.map(r => ({ x: new Date(r.ts), y: Number(r[s.key] || 0) })),
+      }));
+  }, [statusCodes.data, statusView]);
+  const loggingEnabled = statusCodes.data?.logging_enabled === true;
 
   const [drill, setDrill] = useState(null);   // {year, month, day} | null
   const [hourly, setHourly] = useState(null); // payload | null
@@ -35,24 +75,23 @@ export default function ErrorsTab({ filters, onInfo }) {
     }
   };
 
+  // Daily trend comes from f_daily, fed by CloudWatch. AWS/Bedrock gives three
+  // trustworthy error counters: real throttles (status_429_count), all-4xx and
+  // all-5xx. We surface 429 (Throttles) separately and show the remaining
+  // non-throttle 4xx and the 5xx aggregate. Individual non-throttle codes
+  // (403/404/408/424/503) come only from invocation logs — see Status Codes.
   const trendBarSeries = useMemo(() => {
     if (!trend.data) return [];
     return [
       { title: 'Throttled (429)', type: 'bar',
         data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_429 || 0) })),
-        color: '#ff9900' },
-      { title: 'Server (500)', type: 'bar',
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_500 || 0) })),
-        color: '#d13212' },
-      { title: 'Server (503)', type: 'bar',
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_503 || 0) })),
-        color: '#7d2105' },
-      { title: 'Client (400)', type: 'bar',
+        color: '#ef4444' },
+      { title: '4xx (non-throttle)', type: 'bar',
         data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_400 || 0) })),
-        color: '#ffcc00' },
-      { title: 'Forbidden (403)', type: 'bar',
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_403 || 0) })),
-        color: '#5a5a5a' },
+        color: '#f59e0b' },
+      { title: '5xx Server errors', type: 'bar',
+        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_500 || 0) })),
+        color: '#b91c1c' },
     ];
   }, [trend.data]);
 
@@ -67,19 +106,75 @@ export default function ErrorsTab({ filters, onInfo }) {
     }];
   }, [trend.data]);
 
+  // Hourly drill-down is also CloudWatch-sourced (f_hourly_errors): real 429
+  // throttles + non-throttle 4xx + 5xx aggregate.
   const hourlySeries = useMemo(() => {
     if (!hourly) return [];
     return [
-      { title: '429', type: 'bar', data: hourly.map(h => ({ x: h.hour, y: Number(h.status_429 || 0) })), color: '#ff9900' },
-      { title: '500', type: 'bar', data: hourly.map(h => ({ x: h.hour, y: Number(h.status_500 || 0) })), color: '#d13212' },
-      { title: '503', type: 'bar', data: hourly.map(h => ({ x: h.hour, y: Number(h.status_503 || 0) })), color: '#7d2105' },
-      { title: '400', type: 'bar', data: hourly.map(h => ({ x: h.hour, y: Number(h.status_400 || 0) })), color: '#ffcc00' },
+      { title: 'Throttled (429)', type: 'bar', data: hourly.map(h => ({ x: h.hour, y: Number(h.status_429 || 0) })), color: '#ef4444' },
+      { title: '4xx (non-throttle)', type: 'bar', data: hourly.map(h => ({ x: h.hour, y: Number(h.status_400 || 0) })), color: '#f59e0b' },
+      { title: '5xx Server errors', type: 'bar', data: hourly.map(h => ({ x: h.hour, y: Number(h.status_500 || 0) })), color: '#b91c1c' },
     ];
   }, [hourly]);
 
   return (
     <SpaceBetween size="l">
-      <Container header={<SectionHeader title="Error trend (by status code)" sectionId="error-trend" onInfo={onInfo} />}>
+      <Container header={
+        <SectionHeader
+          title="Status Codes"
+          actions={
+            <SpaceBetween direction="horizontal" size="xs">
+              {loggingEnabled && (
+                <SegmentedControl
+                  selectedId={statusView}
+                  onChange={({ detail }) => setStatusView(detail.selectedId)}
+                  label="Status code view"
+                  options={[
+                    { id: 'errors', text: 'Errors only' },
+                    { id: 'all', text: 'All requests' },
+                  ]}
+                />
+              )}
+              <InfoLink sectionId="status-codes" onInfo={onInfo} />
+            </SpaceBetween>
+          }
+        />
+      }>
+        {statusCodes.loading ? <ChartLoading /> :
+          !loggingEnabled ? (
+            <Alert type="info" header="Per-code breakdown unavailable">
+              Bedrock model invocation logging is not enabled for the monitored
+              account(s), so a true per-status-code breakdown (403 / 404 / 408 /
+              424 / 429 …) can't be shown. CloudWatch metrics only expose
+              all-4xx and all-5xx aggregates — those are in the “Error trend”
+              chart below. To populate this chart, enable model invocation
+              logging to S3 (see the deployment README) and re-run ingestion.
+            </Alert>
+          ) : (
+            <BarChart
+              series={statusSeries}
+              xScaleType="categorical"
+              stackedBars
+              hideFilter
+              ariaLabel="Request status codes by hour"
+              i18nStrings={{
+                ...CHART_I18N,
+                xTickFormatter: d => new Date(d).toLocaleString(undefined, {
+                  month: 'short', day: 'numeric', hour: 'numeric',
+                }),
+              }}
+              xTitle="Hour (UTC)"
+              yTitle={statusView === 'errors' ? 'Error requests' : 'Requests'}
+              height={300}
+              empty={<Box textAlign="center" color="inherit">
+                {statusView === 'errors' ? 'No errors in window' : 'No requests in window'}
+              </Box>}
+            />
+          )
+        }
+      </Container>
+
+      <Container header={<SectionHeader title="Error trend (4xx / 5xx)" sectionId="error-trend" onInfo={onInfo} />}>
         {trend.loading ? <ChartLoading /> :
           <Grid gridDefinition={[{ colspan: 8 }, { colspan: 4 }]}>
             <BarChart
@@ -154,11 +249,11 @@ export default function ErrorsTab({ filters, onInfo }) {
                 } },
               { id: 't',  header: 'Total',  cell: r => fmt(r.total_requests) },
               { id: 'f',  header: 'Failed', cell: r => fmt(r.failed_requests) },
-              { id: 'c4', header: '400',    cell: r => fmt(r.status_400) },
-              { id: 'c3', header: '403',    cell: r => fmt(r.status_403) },
-              { id: 'c9', header: '429',    cell: r => fmt(r.status_429) },
-              { id: 'c5', header: '500',    cell: r => fmt(r.status_500) },
-              { id: 'c0', header: '503',    cell: r => fmt(r.status_503) },
+              // CloudWatch gives real throttles (429) + 4xx/5xx aggregates.
+              // Individual non-throttle codes are in the Status Codes chart.
+              { id: 'c9', header: '429',  cell: r => fmt(r.status_429) },
+              { id: 'c4', header: '4xx*', cell: r => fmt(r.status_400) },
+              { id: 'c5', header: '5xx',  cell: r => fmt(r.status_500) },
             ]}
             empty="No errors in window"
           />
@@ -176,8 +271,8 @@ export default function ErrorsTab({ filters, onInfo }) {
               { id: 't', header: 'Total',   cell: r => fmt(r.total_requests) },
               { id: 'f', header: 'Failed',  cell: r => fmt(r.failed_requests) },
               { id: 'c9', header: '429',    cell: r => fmt(r.status_429) },
-              { id: 'c5', header: '500',    cell: r => fmt(r.status_500) },
-              { id: 'c0', header: '503',    cell: r => fmt(r.status_503) },
+              { id: 'c4', header: '4xx*',   cell: r => fmt(r.status_400) },
+              { id: 'c5', header: '5xx',    cell: r => fmt(r.status_500) },
             ]}
             empty="No errors"
           />

@@ -47,6 +47,10 @@ DAILY_METRICS = {
     "Invocations":              ("total_requests",                 "Sum"),
     "InvocationClientErrors":   ("failed_requests_4xx",            "Sum"),
     "InvocationServerErrors":   ("failed_requests_5xx",            "Sum"),
+    # Real throttle (429) counter — published by AWS/Bedrock separately from
+    # InvocationClientErrors (which is ALL 4xx). Pulling it lets us store an
+    # accurate 429 count instead of using all-4xx as a proxy.
+    "InvocationThrottles":      ("throttles_429",                  "Sum"),
     "InputTokenCount":          ("total_input_tokens",             "Sum"),
     "OutputTokenCount":         ("total_output_tokens",            "Sum"),
     "CacheReadInputTokenCount": ("total_cache_read_input_tokens",  "Sum"),
@@ -173,7 +177,8 @@ def _build_hourly_queries(models: list[tuple[str, str | None]]) -> tuple[list[di
         seen_models.add(mid)
         for metric_name in ("Invocations", "InputTokenCount", "OutputTokenCount",
                             "CacheReadInputTokenCount",
-                            "InvocationClientErrors", "InvocationServerErrors"):
+                            "InvocationClientErrors", "InvocationServerErrors",
+                            "InvocationThrottles"):
             qid = _safe_id("h", counter)
             queries.append({
                 "Id": qid,
@@ -254,12 +259,24 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         total = int(m.get("total_requests", 0) or 0)
         c4xx = int(m.get("failed_requests_4xx", 0) or 0)
         c5xx = int(m.get("failed_requests_5xx", 0) or 0)
+        c429 = int(m.get("throttles_429", 0) or 0)
         if total <= 0:
             continue
-        # Approximation: throttles (429) is a subset of client errors. CW also
-        # exposes InvocationThrottles separately on some accounts; we treat
-        # ClientErrors as the conservative throttled-count proxy and put server
-        # errors into status_500.
+        # HONEST per-code storage. CloudWatch AWS/Bedrock exposes three error
+        # counters we can trust: InvocationClientErrors (ALL 4xx),
+        # InvocationServerErrors (ALL 5xx), and InvocationThrottles (real 429s).
+        # It does NOT break the rest of the 4xx down by code, so we DON'T
+        # fabricate a per-code split. Mapping:
+        #   status_429 = real throttle count (InvocationThrottles)
+        #   status_400 = the remaining non-throttle 4xx aggregate (4xx − 429),
+        #                surfaced in the UI as "4xx (non-throttle)"
+        #   status_500 = ALL 5xx aggregate ("5xx Server")
+        #   403/503    = 0 (indistinguishable from CloudWatch)
+        # Real per-code data (403/404/408/424/503 individually) only comes from
+        # Bedrock invocation logs and lands in f_hourly_status.
+        # 429 can't exceed the all-4xx counter; clamp so non_throttle_4xx >= 0.
+        c429 = min(c429, c4xx)
+        non_throttle_4xx = max(0, c4xx - c429)
         daily_rows.append((
             d, account, mid, region,
             "__none__", "__none__", "__none__", "__none__",  # operation/traffic/tier/profile
@@ -270,8 +287,8 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
             int(m.get("total_output_tokens", 0) or 0),
             int(m.get("total_cache_read_input_tokens", 0) or 0),
             int(m.get("total_cache_write_input_tokens", 0) or 0),
-            0, 0, c4xx,                     # status_400, status_403, status_429 (proxy)
-            c5xx, 0,                        # status_500, status_503
+            non_throttle_4xx, 0, c429,      # status_400 (non-throttle 4xx), 403=0, status_429 (real)
+            c5xx, 0,                        # status_500 = ALL 5xx (aggregate); 503=0
         ))
 
     if daily_rows:
@@ -322,6 +339,7 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
             "CacheReadInputTokenCount": "total_cache_read_input_tokens",
             "InvocationClientErrors":   "client_errors_4xx",
             "InvocationServerErrors":   "server_errors_5xx",
+            "InvocationThrottles":      "throttles_429",
         }
         col = col_map[metric]
         for ts, v in zip(raw.get(qid, {}).get("timestamps", []),
@@ -338,6 +356,8 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         total = int(m.get("total_requests", 0) or 0)
         c4xx = int(m.get("client_errors_4xx", 0) or 0)
         c5xx = int(m.get("server_errors_5xx", 0) or 0)
+        c429 = min(int(m.get("throttles_429", 0) or 0), c4xx)  # real 429s, clamped ≤ 4xx
+        non_throttle_4xx = max(0, c4xx - c429)
         if total > 0:
             hourly_rows.append((
                 d, hr, account, mid, region,
@@ -345,20 +365,19 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
                 int(m.get("total_input_tokens", 0) or 0),
                 int(m.get("total_output_tokens", 0) or 0),
                 int(m.get("total_cache_read_input_tokens", 0) or 0),
-                c4xx,  # use client-errors as throttle proxy in peak table
+                c429,  # real throttle count (InvocationThrottles) in peak table
             ))
         # Error rows: only within the rolling 7-day window AND only when
         # there's at least one failure to report.
         if (c4xx > 0 or c5xx > 0) and d >= err_window_start:
             failed = c4xx + c5xx
-            # Same approximation as f_daily: split 5xx 60/40 between 500/503;
-            # treat all 4xx as 429 (throttle proxy) until logs are wired in.
-            s500 = int(c5xx * 0.6)
-            s503 = c5xx - s500
+            # HONEST mapping (see f_daily note): status_429 = real throttles,
+            # status_400 = remaining non-throttle 4xx aggregate, status_500 = all
+            # 5xx aggregate. 403/503 stay 0 — CloudWatch can't distinguish them.
             err_rows.append((
                 d, hr, account, mid, region,
                 total, failed,
-                0, 0, c4xx, s500, s503,
+                non_throttle_4xx, 0, c429, c5xx, 0,
             ))
 
     if hourly_rows:

@@ -105,9 +105,56 @@ def _read_log_lines(s3, bucket: str, key: str):
         return
 
 
-def _parse_log_entry(entry: dict) -> tuple[date, str, str, str, str, dict, int, int, int]:
-    """Returns (date, accountId, modelId, region, operation, requestMetadata,
-              total_in_tokens, total_out_tokens, status_code) or None."""
+# Real per-code statuses we track. Mirrors f_hourly_status columns.
+STATUS_CODES = (200, 400, 403, 404, 408, 424, 429, 500, 503)
+
+
+def _http_status_from_log(entry: dict) -> int:
+    """Map a Bedrock invocation-log record to a true HTTP status code.
+
+    Unlike CloudWatch (which only exposes all-4xx and all-5xx aggregates),
+    the raw invocation log carries a genuine per-request `errorCode` — the
+    Bedrock exception name. We translate each exception to its HTTP status so
+    the dashboard can show a real per-code breakdown.
+
+    Preference order:
+      1. An explicit numeric status if the log carries one (future-proofing —
+         some log schemas include httpStatusCode).
+      2. The exception name in `errorCode` / `error`.
+      3. No error → 200.
+    """
+    http = entry.get("httpStatusCode") or (entry.get("output") or {}).get("httpStatusCode")
+    if http:
+        try:
+            code = int(http)
+            return code if code in STATUS_CODES else (
+                400 if 400 <= code < 500 else 500 if 500 <= code < 600 else 200)
+        except (TypeError, ValueError):
+            pass
+
+    err = entry.get("errorCode") or entry.get("error")
+    if not err:
+        return 200
+    e = str(err)
+    # Bedrock exception names → HTTP status. Order matters (most specific first).
+    return (
+        429 if "Throttl" in e else
+        403 if "AccessDenied" in e or "Forbidden" in e or "Unauthorized" in e else
+        404 if "NotFound" in e else                              # ResourceNotFoundException
+        408 if "Timeout" in e else                               # ModelTimeoutException / RequestTimeout
+        424 if "ModelError" in e or "FailedDependency" in e
+              or "DependencyFailed" in e or "ModelNotReady" in e else
+        400 if "Validation" in e or "BadRequest" in e
+              or "Malformed" in e or "Serialization" in e else
+        503 if "ServiceUnavailable" in e or "Unavailable" in e else
+        500  # InternalServerException / ServiceException / default
+    )
+
+
+def _parse_log_entry(entry: dict) -> tuple[date, int, str, str, str, str, dict, int, int, int]:
+    """Returns (date, hour, accountId, modelId, region, operation,
+              requestMetadata, total_in_tokens, total_out_tokens,
+              status_code) or None."""
     ts = entry.get("timestamp")
     acct = entry.get("accountId", "")
     region = entry.get("region", "")
@@ -116,21 +163,17 @@ def _parse_log_entry(entry: dict) -> tuple[date, str, str, str, str, dict, int, 
     if not (ts and acct and region and op and model_id):
         return None
     try:
-        d = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc).date()
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(timezone.utc)
     except (ValueError, AttributeError):
         return None
+    d, hr = dt.date(), dt.hour
     metadata = entry.get("requestMetadata") or {}
     if not isinstance(metadata, dict):
         metadata = {}
     in_t = int((entry.get("input") or {}).get("inputTokenCount") or 0)
     out_t = int((entry.get("output") or {}).get("outputTokenCount") or 0)
-    err = entry.get("errorCode") or entry.get("error")
-    status = 200 if not err else (
-        429 if "Throttl" in str(err) else
-        500 if "Server" in str(err) or "Internal" in str(err) else
-        400
-    )
-    return d, acct, model_id, region, op, metadata, in_t, out_t, status
+    status = _http_status_from_log(entry)
+    return d, hr, acct, model_id, region, op, metadata, in_t, out_t, status
 
 
 async def _ensure_log_objects_table(conn: asyncpg.Connection) -> None:
@@ -180,6 +223,11 @@ async def main() -> int:
                     "total_input_tokens": 0, "total_output_tokens": 0,
                     "cache_read": 0, "cache_write": 0,
                 })
+                # Per (date, hour, account, model, region) → real per-status-code
+                # counts. This is the genuine per-code data CloudWatch can't give;
+                # it feeds f_hourly_status and the dashboard's "Status Codes" chart.
+                status_buckets: dict[tuple, dict[int, int]] = defaultdict(
+                    lambda: {c: 0 for c in STATUS_CODES})
 
                 for key in pending:
                     obj_rows = 0
@@ -188,8 +236,13 @@ async def main() -> int:
                         parsed = _parse_log_entry(entry)
                         if not parsed:
                             continue
-                        d, a, mid, r, op, metadata, in_t, out_t, status = parsed
+                        d, hr, a, mid, r, op, metadata, in_t, out_t, status = parsed
                         obj_rows += 1
+                        # Real per-code hourly tally (one bump per request).
+                        sb = status_buckets[(d, hr, a, mid, r)]
+                        sb[status if status in sb else (
+                            400 if 400 <= status < 500 else
+                            500 if 500 <= status < 600 else 200)] += 1
                         # Fan out to one row per tag_key. If no tags, write a single
                         # row with sentinel '__none__'.
                         if not metadata:
@@ -238,12 +291,57 @@ async def main() -> int:
                     )
                     total_tagged_rows += len(rows)
 
+                # Real per-status-code hourly rows → f_hourly_status. Additive
+                # upsert so re-runs over overlapping windows accumulate correctly
+                # (matches f_daily_tagged semantics). Only emit hours that had at
+                # least one request.
+                if status_buckets:
+                    status_rows = []
+                    for (d, hr, a, mid, r), sc in status_buckets.items():
+                        total = sum(sc.values())
+                        if total <= 0:
+                            continue
+                        status_rows.append((
+                            d, hr, a, mid, r, total,
+                            sc[200], sc[400], sc[403], sc[404], sc[408],
+                            sc[424], sc[429], sc[500], sc[503],
+                        ))
+                    if status_rows:
+                        await conn.executemany(
+                            """
+                            INSERT INTO f_hourly_status (
+                                event_date, hour, accountId, modelId, region,
+                                total_requests,
+                                status_200_count, status_400_count, status_403_count,
+                                status_404_count, status_408_count, status_424_count,
+                                status_429_count, status_500_count, status_503_count
+                            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                            ON CONFLICT (event_date, hour, accountId, modelId, region)
+                            DO UPDATE SET
+                                total_requests   = f_hourly_status.total_requests   + EXCLUDED.total_requests,
+                                status_200_count = COALESCE(f_hourly_status.status_200_count,0) + EXCLUDED.status_200_count,
+                                status_400_count = COALESCE(f_hourly_status.status_400_count,0) + EXCLUDED.status_400_count,
+                                status_403_count = COALESCE(f_hourly_status.status_403_count,0) + EXCLUDED.status_403_count,
+                                status_404_count = COALESCE(f_hourly_status.status_404_count,0) + EXCLUDED.status_404_count,
+                                status_408_count = COALESCE(f_hourly_status.status_408_count,0) + EXCLUDED.status_408_count,
+                                status_424_count = COALESCE(f_hourly_status.status_424_count,0) + EXCLUDED.status_424_count,
+                                status_429_count = COALESCE(f_hourly_status.status_429_count,0) + EXCLUDED.status_429_count,
+                                status_500_count = COALESCE(f_hourly_status.status_500_count,0) + EXCLUDED.status_500_count,
+                                status_503_count = COALESCE(f_hourly_status.status_503_count,0) + EXCLUDED.status_503_count
+                            """,
+                            status_rows,
+                        )
+
         if new_keys:
             await conn.executemany(
                 "INSERT INTO ingestion_log_objects (s3_key, row_count, tag_count) "
                 "VALUES ($1, $2, $3) ON CONFLICT (s3_key) DO NOTHING",
                 new_keys,
             )
+
+        # Keep f_hourly_status to a rolling 7-day window (matches f_hourly_errors).
+        await conn.execute(
+            "DELETE FROM f_hourly_status WHERE event_date < current_date - INTERVAL '7 days'")
 
         # Refresh dim_tags from f_daily_tagged
         await conn.execute("DELETE FROM dim_tags")
@@ -265,7 +363,9 @@ async def main() -> int:
             datetime.now(timezone.utc).isoformat(),
         )
 
-        print(f"DONE. parsed {total_logs} log lines → {total_tagged_rows} f_daily_tagged rows.")
+        n_status = await conn.fetchval("SELECT COUNT(*) FROM f_hourly_status")
+        print(f"DONE. parsed {total_logs} log lines → {total_tagged_rows} f_daily_tagged rows, "
+              f"f_hourly_status now has {n_status} rows.")
     finally:
         await conn.close()
     return 0

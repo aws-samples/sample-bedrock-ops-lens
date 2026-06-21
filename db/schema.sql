@@ -182,6 +182,47 @@ CREATE INDEX IF NOT EXISTS ix_f_hourly_errors_brin  ON f_hourly_errors USING BRI
 CREATE INDEX IF NOT EXISTS ix_f_hourly_errors_model ON f_hourly_errors (modelId);
 
 -- ----------------------------------------------------------------------------
+-- f_hourly_status — REAL per-status-code hourly breakdown, sourced ONLY from
+-- Bedrock model invocation logs (ingestion/invocation_logs.py), which carry a
+-- genuine per-request `errorCode`. This is the ONLY place true per-code data
+-- exists: the CloudWatch AWS/Bedrock namespace exposes just two error metrics
+-- (InvocationClientErrors = all 4xx, InvocationServerErrors = all 5xx) and
+-- cannot distinguish 400 from 403 from 429. So this table is populated only
+-- when a customer has enabled invocation logging to S3; when logging is off it
+-- simply stays empty and the dashboard degrades gracefully (shows the honest
+-- CloudWatch 4xx/5xx aggregates instead, with a clear note).
+--
+-- Rolling 7-day window, same as f_hourly_errors. Small; not partitioned.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_hourly_status (
+    event_date  DATE      NOT NULL,
+    year        SMALLINT  GENERATED ALWAYS AS (EXTRACT(YEAR  FROM event_date)::SMALLINT) STORED,
+    month       SMALLINT  GENERATED ALWAYS AS (EXTRACT(MONTH FROM event_date)::SMALLINT) STORED,
+    day         SMALLINT  GENERATED ALWAYS AS (EXTRACT(DAY   FROM event_date)::SMALLINT) STORED,
+    hour        SMALLINT  NOT NULL,
+
+    accountId   TEXT NOT NULL,
+    modelId     TEXT NOT NULL,
+    region      TEXT NOT NULL,
+
+    total_requests   BIGINT NOT NULL,
+    status_200_count BIGINT,
+    status_400_count BIGINT,
+    status_403_count BIGINT,
+    status_404_count BIGINT,
+    status_408_count BIGINT,
+    status_424_count BIGINT,
+    status_429_count BIGINT,
+    status_500_count BIGINT,
+    status_503_count BIGINT,
+
+    PRIMARY KEY (event_date, hour, accountId, modelId, region)
+);
+
+CREATE INDEX IF NOT EXISTS ix_f_hourly_status_brin  ON f_hourly_status USING BRIN (event_date);
+CREATE INDEX IF NOT EXISTS ix_f_hourly_status_model ON f_hourly_status (modelId);
+
+-- ----------------------------------------------------------------------------
 -- f_daily_cost — daily Bedrock spend, broken out by accountId × service.
 -- Source: AWS Cost Explorer GetCostAndUsage from the central account, grouped
 -- by LINKED_ACCOUNT + SERVICE. The CE API reports each Bedrock model as its

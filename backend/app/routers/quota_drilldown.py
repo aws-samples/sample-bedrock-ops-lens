@@ -160,10 +160,16 @@ async def quota_drilldown(
           (event_date::timestamp + (hour || ' hours')::interval) AS ts,
           total_requests::float / 60.0                            AS rpm,
           -- Quota-accurate TPM: cache-read input tokens don't count toward
-          -- the TPM rate-limit quota, so subtract them (clamp at 0).
-          (GREATEST(COALESCE(total_input_tokens,0) - COALESCE(total_cache_read_input_tokens,0), 0)
-           + COALESCE(total_output_tokens, 0))::float / 60.0       AS tpm,
-          GREATEST(COALESCE(total_input_tokens,0) - COALESCE(total_cache_read_input_tokens,0), 0)::float / 60.0 AS input_tpm,
+          -- the TPM rate-limit quota, so subtract them (clamp at 0). When
+          -- cache-read is NULL (pre-migration rows CloudWatch retention has
+          -- aged out — un-backfillable), return NULL so the chart shows a gap
+          -- instead of a falsely-inflated spike, and Python excludes it from
+          -- the peak/avg.
+          (CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
+                ELSE GREATEST(COALESCE(total_input_tokens,0) - total_cache_read_input_tokens, 0)
+                     + COALESCE(total_output_tokens, 0) END)::float / 60.0  AS tpm,
+          (CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
+                ELSE GREATEST(COALESCE(total_input_tokens,0) - total_cache_read_input_tokens, 0) END)::float / 60.0 AS input_tpm,
           COALESCE(total_output_tokens, 0)::float / 60.0           AS output_tpm,
           COALESCE(status_429_count, 0)::float    / 60.0           AS error_rpm
         FROM f_hourly_peak
@@ -240,31 +246,39 @@ async def quota_drilldown(
     peak_rpm_at: datetime | None = None
     sum_rpm = 0.0
     n = 0
+    n_tpm = 0  # count only rows with a known cache split (non-NULL tpm)
     for r in rows:
         ts = r["ts"]
         if ts is not None and ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        tpm = float(r["tpm"] or 0)
+        # tpm/input_tpm are NULL for pre-migration rows whose cache-read is
+        # un-backfillable. Keep them as None in the series so the chart draws
+        # a gap (not a false 0 or inflated spike) and exclude them from
+        # peak/avg so historical rows can't corrupt the quota-accurate numbers.
+        tpm = None if r["tpm"] is None else float(r["tpm"])
+        input_tpm = None if r["input_tpm"] is None else float(r["input_tpm"])
         rpm = float(r["rpm"] or 0)
         series.append({
             "ts": ts.isoformat() if ts else None,
             "tpm": tpm,
             "rpm": rpm,
-            "input_tpm": float(r["input_tpm"] or 0),
+            "input_tpm": input_tpm,
             "output_tpm": float(r["output_tpm"] or 0),
             "error_rpm": float(r["error_rpm"] or 0),
         })
-        sum_tpm += tpm
         sum_rpm += rpm
         n += 1
-        if tpm > peak_tpm:
-            peak_tpm = tpm
-            peak_tpm_at = ts
+        if tpm is not None:
+            sum_tpm += tpm
+            n_tpm += 1
+            if tpm > peak_tpm:
+                peak_tpm = tpm
+                peak_tpm_at = ts
         if rpm > peak_rpm:
             peak_rpm = rpm
             peak_rpm_at = ts
 
-    avg_tpm = (sum_tpm / n) if n else 0.0
+    avg_tpm = (sum_tpm / n_tpm) if n_tpm else 0.0
     avg_rpm = (sum_rpm / n) if n else 0.0
     util_tpm = (peak_tpm / tpm_limit * 100.0) if tpm_limit else None
     util_rpm = (peak_rpm / rpm_limit * 100.0) if rpm_limit else None

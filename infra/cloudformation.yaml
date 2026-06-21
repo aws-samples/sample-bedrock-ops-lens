@@ -325,8 +325,8 @@ Resources:
       TargetId: !Ref DbCluster
       TargetType: AWS::RDS::DBCluster
 
-  # NOTE: SecretsManager rotation was attempted earlier (cfn-guard
-  # SECRETSMANAGER_ROTATION_ENABLED_CHECK) but the AWS-hosted
+  # NOTE: SecretsManager rotation was attempted earlier (to satisfy the
+  # SECRETSMANAGER_ROTATION_ENABLED_CHECK config rule) but the AWS-hosted
   # PostgreSQLSingleUser rotation Lambda generates random passwords with
   # default punctuation, ignoring the secret's ExcludePunctuation hint, and
   # also race-conditions with Aurora cluster creation when used in a fresh

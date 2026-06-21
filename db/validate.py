@@ -181,6 +181,36 @@ def _(cur):
     return (n == 0, f"{n} rows with zero/null failed_requests in error table")
 
 
+@check("f_hourly_errors: per-code columns sum to failed_requests (honest CW mapping)")
+def _(cur):
+    cur.execute(
+        """
+        SELECT COUNT(*) FROM f_hourly_errors
+        WHERE (COALESCE(status_400_count,0) + COALESCE(status_403_count,0)
+             + COALESCE(status_429_count,0) + COALESCE(status_500_count,0)
+             + COALESCE(status_503_count,0)) <> failed_requests
+        """
+    )
+    n = cur.fetchone()[0]
+    return (n == 0, f"{n} rows where 429+4xx+5xx != failed_requests")
+
+
+@check("f_hourly_status: per-code counts sum to total_requests")
+def _(cur):
+    cur.execute(
+        """
+        SELECT COUNT(*) FROM f_hourly_status
+        WHERE (COALESCE(status_200_count,0) + COALESCE(status_400_count,0)
+             + COALESCE(status_403_count,0) + COALESCE(status_404_count,0)
+             + COALESCE(status_408_count,0) + COALESCE(status_424_count,0)
+             + COALESCE(status_429_count,0) + COALESCE(status_500_count,0)
+             + COALESCE(status_503_count,0)) <> total_requests
+        """
+    )
+    n = cur.fetchone()[0]
+    return (n == 0, f"{n} rows where sum of status codes != total_requests")
+
+
 # ---------------------------------------------------------------------------
 # Latency
 # ---------------------------------------------------------------------------

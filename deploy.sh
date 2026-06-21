@@ -218,11 +218,11 @@ aws cloudformation validate-template --template-body file://infra/edge-bootstrap
 aws cloudformation validate-template --template-url "$MAIN_TEMPLATE_URL" --region "$REGION" >/dev/null
 echo "    all three templates valid"
 
-# Pre-deploy security gate. cfn-guard catches common AWS-side flagged
-# patterns: Lambda Function URL with AuthType=NONE, Lambda::Permission
-# with Principal=*, S3 buckets without BlockPublicAccess, default
-# encryption, IAM policies with Action+Resource both "*". If any rule
-# fails, deploy aborts.
+# Pre-deploy security gate. cfn-guard catches the patterns that have
+# previously tripped Palisade: Lambda Function URL with AuthType=NONE,
+# Lambda::Permission with Principal=*, S3 buckets without
+# BlockPublicAccess, default-encryption, IAM policies with
+# Action+Resource both "*". If any rule fails, deploy aborts.
 echo "[2b/6] cfn-guard security policy..."
 if [[ ! -r infra/policy-guard.rules ]]; then
     echo "    infra/policy-guard.rules not present; skipping cfn-guard pre-deploy gate."
