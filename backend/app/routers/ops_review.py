@@ -104,7 +104,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
               AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
             AS peak_rpm_observed,
-          (SELECT MAX(total_input_tokens + total_output_tokens) FROM f_hourly_peak h
+          (SELECT MAX(GREATEST((total_input_tokens - COALESCE(total_cache_read_input_tokens,0)) + total_output_tokens, 0)) FROM f_hourly_peak h
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
               AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
             AS peak_tpm_observed
@@ -191,7 +191,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         SELECT accountId, modelId, region,
           (SUM(total_input_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_input,
           (SUM(total_output_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_output,
-          (SELECT MAX(total_input_tokens + total_output_tokens) FROM f_hourly_peak h
+          (SELECT MAX(GREATEST((total_input_tokens - COALESCE(total_cache_read_input_tokens,0)) + total_output_tokens, 0)) FROM f_hourly_peak h
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
               AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
             AS peak_tpm_observed,

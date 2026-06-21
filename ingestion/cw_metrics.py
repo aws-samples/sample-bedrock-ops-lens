@@ -172,6 +172,7 @@ def _build_hourly_queries(models: list[tuple[str, str | None]]) -> tuple[list[di
             continue
         seen_models.add(mid)
         for metric_name in ("Invocations", "InputTokenCount", "OutputTokenCount",
+                            "CacheReadInputTokenCount",
                             "InvocationClientErrors", "InvocationServerErrors"):
             qid = _safe_id("h", counter)
             queries.append({
@@ -315,11 +316,12 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
     hourly_buckets: dict[tuple[date, int, str], dict[str, float]] = defaultdict(dict)
     for qid, (metric, mid) in idx_map.items():
         col_map = {
-            "Invocations":            "total_requests",
-            "InputTokenCount":        "total_input_tokens",
-            "OutputTokenCount":       "total_output_tokens",
-            "InvocationClientErrors": "client_errors_4xx",
-            "InvocationServerErrors": "server_errors_5xx",
+            "Invocations":              "total_requests",
+            "InputTokenCount":          "total_input_tokens",
+            "OutputTokenCount":         "total_output_tokens",
+            "CacheReadInputTokenCount": "total_cache_read_input_tokens",
+            "InvocationClientErrors":   "client_errors_4xx",
+            "InvocationServerErrors":   "server_errors_5xx",
         }
         col = col_map[metric]
         for ts, v in zip(raw.get(qid, {}).get("timestamps", []),
@@ -342,6 +344,7 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
                 total,
                 int(m.get("total_input_tokens", 0) or 0),
                 int(m.get("total_output_tokens", 0) or 0),
+                int(m.get("total_cache_read_input_tokens", 0) or 0),
                 c4xx,  # use client-errors as throttle proxy in peak table
             ))
         # Error rows: only within the rolling 7-day window AND only when
@@ -363,13 +366,15 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
             """
             INSERT INTO f_hourly_peak (
                 event_date, hour, accountId, modelId, region,
-                total_requests, total_input_tokens, total_output_tokens, status_429_count
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                total_requests, total_input_tokens, total_output_tokens,
+                total_cache_read_input_tokens, status_429_count
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             ON CONFLICT (event_date, hour, accountId, modelId, region)
             DO UPDATE SET
                 total_requests = EXCLUDED.total_requests,
                 total_input_tokens = EXCLUDED.total_input_tokens,
                 total_output_tokens = EXCLUDED.total_output_tokens,
+                total_cache_read_input_tokens = EXCLUDED.total_cache_read_input_tokens,
                 status_429_count = EXCLUDED.status_429_count
             """,
             hourly_rows,

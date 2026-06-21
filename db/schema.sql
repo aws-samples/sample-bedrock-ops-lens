@@ -137,6 +137,10 @@ CREATE TABLE IF NOT EXISTS f_hourly_peak (
     total_requests      BIGINT NOT NULL,
     total_input_tokens  BIGINT,
     total_output_tokens BIGINT,
+    -- Cache-read input tokens are pre-computed and do NOT count toward the
+    -- TPM rate-limit quota (CloudWatch EstimatedTPMQuotaUsage excludes them).
+    -- Stored here so Peak TPM can subtract them for quota-accurate numbers.
+    total_cache_read_input_tokens BIGINT,
     status_429_count    BIGINT,
 
     PRIMARY KEY (event_date, hour, accountId, modelId, region)

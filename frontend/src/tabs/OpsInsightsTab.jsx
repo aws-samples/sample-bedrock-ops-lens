@@ -285,7 +285,7 @@ export default function OpsInsightsTab({ filters, onInfo }) {
               { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
-              { id: 'p', header: 'Peak TPM',          cell: r => fmt(r.peak_tpm) },
+              { id: 'p', header: 'Peak TPM (quota)',  cell: r => fmt(r.peak_tpm) },
               { id: 'q', header: 'Applied TPM',       cell: r => fmt(r.effective_tpm) },
               { id: 'o', header: 'Effective (5×)',    cell: r => <Box color="text-status-error" fontWeight="bold">{fmtPct(r.overhead_pct)}</Box> },
             ]}

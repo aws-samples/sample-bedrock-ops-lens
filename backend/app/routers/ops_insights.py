@@ -124,7 +124,7 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
         f"""
         SELECT accountId, modelId, region,
           MAX(total_requests)::BIGINT       AS peak_requests_hour,
-          MAX(total_input_tokens)::BIGINT   AS peak_input_tpm,
+          MAX(GREATEST(total_input_tokens - COALESCE(total_cache_read_input_tokens,0), 0))::BIGINT AS peak_input_tpm,
           MAX(total_output_tokens)::BIGINT  AS peak_output_tpm
         FROM f_hourly_peak
         WHERE {w}
@@ -163,9 +163,9 @@ async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
         f"""
         WITH peaks AS (
           SELECT accountId, modelId, region,
-            MAX(total_input_tokens)  AS peak_input_tpm,
+            MAX(GREATEST(total_input_tokens - COALESCE(total_cache_read_input_tokens,0), 0))  AS peak_input_tpm,
             MAX(total_output_tokens) AS peak_output_tpm,
-            MAX(total_input_tokens + total_output_tokens) AS peak_combined_tpm
+            MAX(GREATEST((total_input_tokens - COALESCE(total_cache_read_input_tokens,0)) + total_output_tokens, 0)) AS peak_combined_tpm
           FROM f_hourly_peak h
           WHERE {w}
           GROUP BY accountId, modelId, region

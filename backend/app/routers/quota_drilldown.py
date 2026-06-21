@@ -159,9 +159,11 @@ async def quota_drilldown(
         SELECT
           (event_date::timestamp + (hour || ' hours')::interval) AS ts,
           total_requests::float / 60.0                            AS rpm,
-          (COALESCE(total_input_tokens,  0)
+          -- Quota-accurate TPM: cache-read input tokens don't count toward
+          -- the TPM rate-limit quota, so subtract them (clamp at 0).
+          (GREATEST(COALESCE(total_input_tokens,0) - COALESCE(total_cache_read_input_tokens,0), 0)
            + COALESCE(total_output_tokens, 0))::float / 60.0       AS tpm,
-          COALESCE(total_input_tokens, 0)::float  / 60.0           AS input_tpm,
+          GREATEST(COALESCE(total_input_tokens,0) - COALESCE(total_cache_read_input_tokens,0), 0)::float / 60.0 AS input_tpm,
           COALESCE(total_output_tokens, 0)::float / 60.0           AS output_tpm,
           COALESCE(status_429_count, 0)::float    / 60.0           AS error_rpm
         FROM f_hourly_peak

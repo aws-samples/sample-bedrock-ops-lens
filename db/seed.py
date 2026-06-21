@@ -238,14 +238,20 @@ def seed_hourly_peak(cur, today: date, rng: random.Random) -> int:
                         total = max(1, int(base))
                         in_tok = total * rng.randint(800, 3500)
                         out_tok = total * rng.randint(200, 1200)
+                        # High cache-read share so the quota-accurate Peak TPM
+                        # (which subtracts cache_read) is meaningfully lower
+                        # than raw input+output — exercises the fix in demo data.
+                        cache_read = int(in_tok * rng.uniform(0.3, 0.7))
                         s429 = int(total * rng.uniform(0.0, 0.03))
-                        rows.append((d, hour, acct, model, region, total, in_tok, out_tok, s429))
+                        rows.append((d, hour, acct, model, region, total,
+                                     in_tok, out_tok, cache_read, s429))
     cur.executemany(
         """
         INSERT INTO f_hourly_peak (
             event_date, hour, accountId, modelId, region,
-            total_requests, total_input_tokens, total_output_tokens, status_429_count
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            total_requests, total_input_tokens, total_output_tokens,
+            total_cache_read_input_tokens, status_429_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         rows,
     )

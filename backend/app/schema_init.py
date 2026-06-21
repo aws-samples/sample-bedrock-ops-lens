@@ -54,6 +54,23 @@ async def _apply(db_url: str, sql_files: list[str]) -> dict:
             print(f"[schema-init] applying {path} ({len(sql)} chars)")
             await conn.execute(sql)
             counts[path] = "ok"
+
+        # Idempotent migrations for existing deployments. schema.sql uses
+        # CREATE TABLE IF NOT EXISTS, so columns added to an already-created
+        # table are NOT picked up by re-running schema.sql — they need an
+        # explicit ADD COLUMN IF NOT EXISTS here.
+        migrations = [
+            # Peak-TPM quota accuracy: cache-read tokens don't count toward
+            # the TPM quota, so f_hourly_peak needs to store them separately
+            # so the Peak-TPM formula can subtract them.
+            "ALTER TABLE f_hourly_peak "
+            "ADD COLUMN IF NOT EXISTS total_cache_read_input_tokens BIGINT",
+        ]
+        for stmt in migrations:
+            print(f"[schema-init] migration: {stmt[:80]}")
+            await conn.execute(stmt)
+        counts["_migrations"] = str(len(migrations))
+
         # Sanity check — list user tables.
         rows = await conn.fetch(
             """
