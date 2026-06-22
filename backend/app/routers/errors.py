@@ -119,12 +119,23 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
 
     Degrades gracefully: never errors. Returns
       {
-        "logging_enabled": bool,   # true only if invocation logs have produced data
+        "state": "ok" | "no_logging" | "no_data" | "out_of_window",
+        "logging_enabled": bool,   # has the invocation-logs ingester ever run?
         "last_log_refresh": iso8601 | null,
+        "available_range": {"min": "YYYY-MM-DD", "max": "YYYY-MM-DD"} | null,
         "series": [ {ts, total, ok, s400, s403, s404, s408, s424, s429, s500, s503}, ... ]
       }
-    When logging_enabled is false, `series` is empty and the UI shows a note +
-    falls back to the CloudWatch 4xx/5xx aggregates from the other charts.
+
+    `state` tells the UI WHICH accurate message to show — these are distinct
+    situations the old `bool(series)` flag wrongly collapsed into one:
+      ok            — rows exist in the selected window; render the chart.
+      no_logging    — the invocation-logs ingester has never run (no
+                      last_invocation_logs_refresh marker AND table empty):
+                      logging likely not enabled / not wired.
+      no_data       — ingester has run but produced zero rows at all (logging
+                      on, but no per-request log records ingested yet).
+      out_of_window — rows DO exist, just not in the selected date range; tell
+                      the user to widen/shift the window (here's the range).
     """
     # Window + optional account/region/provider filters (f_hourly_status has no
     # traffic_type/tag columns, so only the dimensions it carries are applied).
@@ -163,14 +174,6 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
         *params,
     )
 
-    # logging_enabled: real data present in window AND the ingester has recorded
-    # at least one invocation-logs run. Either alone is enough to say "on", but
-    # we surface the refresh timestamp regardless for the freshness note.
-    refresh_row = await db.fetch(
-        "SELECT value FROM ingestion_meta WHERE key = 'last_invocation_logs_refresh'"
-    )
-    last_refresh = refresh_row[0]["value"] if refresh_row else None
-
     series = [
         {
             "ts": r["ts"].isoformat() if r["ts"] else None,
@@ -187,8 +190,45 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
         }
         for r in rows
     ]
+
+    # Distinguish the three "no chart" situations instead of always blaming
+    # "logging not enabled" (the old bug). Two extra cheap probes:
+    #   1. Has the invocation-logs ingester ever run? (meta marker)
+    #   2. Does f_hourly_status hold ANY rows, and over what date range?
+    refresh_row = await db.fetch(
+        "SELECT value FROM ingestion_meta WHERE key = 'last_invocation_logs_refresh'"
+    )
+    last_refresh = refresh_row[0]["value"] if refresh_row else None
+    ingester_has_run = last_refresh is not None
+
+    range_row = await db.fetch(
+        "SELECT MIN(event_date) AS mn, MAX(event_date) AS mx, COUNT(*) AS n FROM f_hourly_status"
+    )
+    total_rows = int(range_row[0]["n"] or 0) if range_row else 0
+    available_range = None
+    if total_rows > 0 and range_row[0]["mn"] is not None:
+        available_range = {
+            "min": range_row[0]["mn"].isoformat(),
+            "max": range_row[0]["mx"].isoformat(),
+        }
+
+    if series:
+        state = "ok"
+    elif total_rows > 0:
+        # Data exists in the table, just not in the selected window/filters.
+        state = "out_of_window"
+    elif ingester_has_run:
+        # Ingester ran but produced zero rows: logging is wired, but there are
+        # no per-request log records to attribute (e.g. logs not flowing yet).
+        state = "no_data"
+    else:
+        # No marker and no rows: the invocation-logs path has never run.
+        state = "no_logging"
+
     return {
-        "logging_enabled": bool(series),
+        "state": state,
+        "logging_enabled": ingester_has_run,
         "last_log_refresh": last_refresh,
+        "available_range": available_range,
         "series": series,
     }

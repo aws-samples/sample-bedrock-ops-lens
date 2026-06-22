@@ -51,7 +51,34 @@ export default function ErrorsTab({ filters, onInfo }) {
         data: rows.map(r => ({ x: new Date(r.ts), y: Number(r[s.key] || 0) })),
       }));
   }, [statusCodes.data, statusView]);
-  const loggingEnabled = statusCodes.data?.logging_enabled === true;
+
+  // Accurate per-state messaging — the backend tells us WHICH of the distinct
+  // "no chart" situations applies, instead of always blaming "logging off".
+  const statusState = statusCodes.data?.state;          // ok|no_logging|no_data|out_of_window
+  const hasChart = statusState === 'ok' && statusSeries.length > 0;
+  const availRange = statusCodes.data?.available_range;  // {min,max} | null
+  const statusNotice = useMemo(() => {
+    switch (statusState) {
+      case 'out_of_window':
+        return {
+          header: 'No status-code data in the selected date range',
+          body: availRange
+            ? `Per-code data exists for ${availRange.min} → ${availRange.max}, but not in the window you've selected. Adjust the date filter to that range to see the breakdown.`
+            : 'Per-code data exists, but not in the window you\'ve selected. Widen or shift the date filter to see it.',
+        };
+      case 'no_data':
+        return {
+          header: 'No per-code data ingested yet',
+          body: 'Bedrock model invocation logging is wired up, but no per-request log records have been ingested yet. New invocations will appear here after the next ingestion run.',
+        };
+      case 'no_logging':
+      default:
+        return {
+          header: 'Per-code breakdown unavailable',
+          body: 'Bedrock model invocation logging is not enabled for the monitored account(s), so a true per-status-code breakdown (403 / 404 / 408 / 424 / 429 …) can\'t be shown. CloudWatch metrics only expose all-4xx and all-5xx aggregates — those are in the “Error trend” chart below. To populate this chart, enable model invocation logging to S3 (see the deployment README) and re-run ingestion.',
+        };
+    }
+  }, [statusState, availRange]);
 
   const [drill, setDrill] = useState(null);   // {year, month, day} | null
   const [hourly, setHourly] = useState(null); // payload | null
@@ -124,7 +151,7 @@ export default function ErrorsTab({ filters, onInfo }) {
           title="Status Codes"
           actions={
             <SpaceBetween direction="horizontal" size="xs">
-              {loggingEnabled && (
+              {hasChart && (
                 <SegmentedControl
                   selectedId={statusView}
                   onChange={({ detail }) => setStatusView(detail.selectedId)}
@@ -141,14 +168,9 @@ export default function ErrorsTab({ filters, onInfo }) {
         />
       }>
         {statusCodes.loading ? <ChartLoading /> :
-          !loggingEnabled ? (
-            <Alert type="info" header="Per-code breakdown unavailable">
-              Bedrock model invocation logging is not enabled for the monitored
-              account(s), so a true per-status-code breakdown (403 / 404 / 408 /
-              424 / 429 …) can't be shown. CloudWatch metrics only expose
-              all-4xx and all-5xx aggregates — those are in the “Error trend”
-              chart below. To populate this chart, enable model invocation
-              logging to S3 (see the deployment README) and re-run ingestion.
+          !hasChart ? (
+            <Alert type="info" header={statusNotice.header}>
+              {statusNotice.body}
             </Alert>
           ) : (
             <BarChart
