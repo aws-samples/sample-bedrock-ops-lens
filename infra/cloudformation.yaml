@@ -26,6 +26,15 @@ Parameters:
     Type: String
     Default: BedrockOpsLens
     Description: Logical prefix for resource Name tags. Just a label.
+  CognitoDomainPrefix:
+    Type: String
+    Default: ''
+    Description: |
+      Cognito Hosted-UI domain prefix (globally unique per region; lowercase,
+      no cognito/aws/amazon substring, <=63 chars). deploy.sh derives this from
+      the account id + stack suffix so two stacks in the same account+region
+      (e.g. prod + staging) don't collide on "Domain already exists". Empty =
+      the template falls back to lens-<accountId> (single-stack deployments).
   AllowedEmailDomains:
     Type: String
     Description: |
@@ -56,6 +65,17 @@ Parameters:
       Configure under Bedrock console → Settings → Model invocation logging.
       If left empty, the invocation_logs ingester is skipped (volumetric data
       from CloudWatch Metrics still works; tag-attribution requires this).
+      deploy.sh auto-discovers this (or enables metadata-only logging on
+      consent) and passes it in.
+  BedrockLogsRegion:
+    Type: String
+    Default: ''
+    Description: |
+      Region where BedrockLogsBucket lives and where Bedrock invocation
+      logging is enabled. May differ from the deploy region (logging is a
+      per-region setting; it is commonly enabled in us-east-1). The
+      invocation_logs ingester reads logs from this region. Empty falls back
+      to the deploy region.
   IngesterScheduleHour:
     Type: Number
     Default: 5
@@ -81,6 +101,7 @@ Parameters:
 Conditions:
   AdminOnlySignUp:    !Equals [ !Ref CognitoSelfSignUp, 'disabled' ]
   HasBedrockLogsBkt:  !Not [ !Equals [ !Ref BedrockLogsBucket, '' ] ]
+  HasCognitoDomain:   !Not [ !Equals [ !Ref CognitoDomainPrefix, '' ] ]
 
 # =============================================================================
 # Resources
@@ -179,6 +200,25 @@ Resources:
   PrivateSubnet2Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable }
+
+  # S3 Gateway VPC Endpoint — gives private-subnet Lambdas a route to Amazon S3
+  # WITHOUT depending on the NAT gateway. This is essential for the SchemaInit
+  # custom resource: on stack-DELETE, CloudFormation tears down the NAT gateway
+  # and its route, but the SchemaInit Lambda must still PUT its success/failure
+  # signal to the CloudFormation response endpoint (a presigned *S3* URL). With
+  # only NAT egress, that callback raced NAT teardown and silently failed,
+  # hanging the whole stack delete on the custom resource's 1-hour timeout. A
+  # gateway endpoint is attached to the private route table (survives NAT
+  # teardown), is free, and keeps S3 traffic (incl. the CFN callback and the
+  # invocation-logs reads) on the AWS network. Gateway type → no ENIs, so it
+  # also doesn't add to the slow ENI cleanup on delete.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [ !Ref PrivateRouteTable ]
 
   # ===========================================================================
   # Security groups — wired with separate ingress rules to break circular refs.
@@ -727,10 +767,14 @@ Resources:
   UserPoolDomain:
     Type: AWS::Cognito::UserPoolDomain
     Properties:
-      # Cognito Hosted UI domain prefix is globally unique. Lowercase only,
-      # no "cognito"/"aws"/"amazon" substring, ≤63 chars. Account-id alone
-      # is plenty unique.
-      Domain: !Sub 'lens-${AWS::AccountId}'
+      # Cognito Hosted UI domain prefix must be unique per region and follow:
+      # lowercase only, no "cognito"/"aws"/"amazon" substring, ≤63 chars.
+      # It must include the stack suffix, NOT just the account id — otherwise a
+      # second stack in the SAME account+region (e.g. prod + staging) collides
+      # with "Domain already exists". CognitoDomainPrefix is derived in deploy.sh
+      # from the stack suffix (lowercased, sanitized) and passed in; it defaults
+      # to lens-<account> for a single-stack deploy.
+      Domain: !If [ HasCognitoDomain, !Ref CognitoDomainPrefix, !Sub 'lens-${AWS::AccountId}' ]
       UserPoolId: !Ref UserPool
 
   UserPoolClient:
@@ -842,6 +886,12 @@ Resources:
           MEMCACHED_HOST: !GetAtt CacheCluster.ConfigurationEndpoint.Address
           MEMCACHED_PORT: !GetAtt CacheCluster.ConfigurationEndpoint.Port
           BEDROCK_REGION: !Ref AWS::Region
+          # Whether a Bedrock invocation-logs bucket is wired to this stack.
+          # The /status-codes endpoint uses this to tell "logging configured
+          # but no per-code data ingested yet" apart from "logging not enabled
+          # at all" — so the Status Codes chart never wrongly tells a customer
+          # to enable logging that is in fact already enabled.
+          BEDROCK_LOGS_BUCKET: !Ref BedrockLogsBucket
 
   # ===========================================================================
   # Schema-init Lambda — runs once on stack-create, applies db/schema.sql +
@@ -1065,8 +1115,14 @@ Resources:
           # without a redeploy, set MONITORED_REGIONS_PRESET /
           # MONITORED_REGIONS_LIST on the Lambda directly.
           # Bedrock invocation-logs S3 bucket. When non-empty the ingester
-          # also runs the tag-attribution path. Empty = volumetric only.
+          # also runs the tag-attribution + per-status-code path. Empty =
+          # volumetric only.
           BEDROCK_LOGS_BUCKET: !Ref BedrockLogsBucket
+          # Region the logs bucket lives in (logging is per-region and is
+          # often enabled in us-east-1 even when the dashboard deploys
+          # elsewhere). The invocation_logs ingester reads from this region;
+          # empty falls back to BEDROCK_REGION (the deploy region).
+          BEDROCK_LOGS_REGION: !Ref BedrockLogsRegion
 
   # Daily schedule. Cron: at IngesterScheduleHour:00 UTC every day.
   IngesterSchedule:

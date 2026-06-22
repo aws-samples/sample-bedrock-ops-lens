@@ -201,6 +201,14 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
     last_refresh = refresh_row[0]["value"] if refresh_row else None
     ingester_has_run = last_refresh is not None
 
+    # Is a Bedrock invocation-logs bucket wired to this stack? deploy.sh sets
+    # this when it discovers existing logging or enables it on consent. If a
+    # bucket is configured, logging IS enabled — so we must never tell the user
+    # to "enable logging"; the gap is just that data hasn't been ingested into
+    # this window yet.
+    import os as _os
+    logs_bucket_configured = bool(_os.environ.get("BEDROCK_LOGS_BUCKET", "").strip())
+
     range_row = await db.fetch(
         "SELECT MIN(event_date) AS mn, MAX(event_date) AS mx, COUNT(*) AS n FROM f_hourly_status"
     )
@@ -212,22 +220,31 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
             "max": range_row[0]["mx"].isoformat(),
         }
 
+    # logging_enabled is true if EITHER the ingester has produced a refresh
+    # marker OR a logs bucket is wired to the stack (deploy.sh discovered or
+    # enabled logging). This is what drives "is logging on?" — independent of
+    # whether data has reached the selected window yet.
+    logging_enabled = ingester_has_run or logs_bucket_configured
+
     if series:
         state = "ok"
     elif total_rows > 0:
         # Data exists in the table, just not in the selected window/filters.
         state = "out_of_window"
-    elif ingester_has_run:
-        # Ingester ran but produced zero rows: logging is wired, but there are
-        # no per-request log records to attribute (e.g. logs not flowing yet).
+    elif logging_enabled:
+        # Logging IS enabled (bucket wired and/or ingester has run) but no
+        # per-code rows exist yet — e.g. logs haven't been ingested into this
+        # window, or no invocations have been logged yet. NEVER tell the user
+        # to "enable logging" here — it already is.
         state = "no_data"
     else:
-        # No marker and no rows: the invocation-logs path has never run.
+        # No bucket wired and the invocation-logs path has never run → logging
+        # is genuinely not set up.
         state = "no_logging"
 
     return {
         "state": state,
-        "logging_enabled": ingester_has_run,
+        "logging_enabled": logging_enabled,
         "last_log_refresh": last_refresh,
         "available_range": available_range,
         "series": series,

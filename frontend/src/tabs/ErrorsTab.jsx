@@ -68,14 +68,14 @@ export default function ErrorsTab({ filters, onInfo }) {
         };
       case 'no_data':
         return {
-          header: 'No per-code data ingested yet',
-          body: 'Bedrock model invocation logging is wired up, but no per-request log records have been ingested yet. New invocations will appear here after the next ingestion run.',
+          header: 'Logging enabled — no per-code data yet',
+          body: 'Bedrock model invocation logging IS enabled and wired to this dashboard, but no per-request records have been ingested for this window yet. New invocations will appear here after the next ingestion run (the ingester runs on a daily schedule).',
         };
       case 'no_logging':
       default:
         return {
           header: 'Per-code breakdown unavailable',
-          body: 'Bedrock model invocation logging is not enabled for the monitored account(s), so a true per-status-code breakdown (403 / 404 / 408 / 424 / 429 …) can\'t be shown. CloudWatch metrics only expose all-4xx and all-5xx aggregates — those are in the “Error trend” chart below. To populate this chart, enable model invocation logging to S3 (see the deployment README) and re-run ingestion.',
+          body: 'Bedrock model invocation logging is not enabled for the monitored account(s), so a true per-status-code breakdown (403 / 404 / 408 / 424 / 429 …) can\'t be shown. CloudWatch metrics only expose all-4xx and all-5xx aggregates — those are in the “Error trend” chart below. To populate this chart, enable model invocation logging to S3 (it can be configured to capture only token counts and metadata — not prompt or response text), then re-run ingestion. The deploy script can set this up for you.',
         };
     }
   }, [statusState, availRange]);

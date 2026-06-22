@@ -107,23 +107,161 @@ export ALLOWED_EMAIL_DOMAINS
 echo "    sign-up: ALLOWED_EMAIL_DOMAINS=$ALLOWED_EMAIL_DOMAINS"
 
 # -----------------------------------------------------------------------------
-# Bedrock model-invocation logs bucket — auto-discover.
-# If the operator already enabled Bedrock invocation logging in this account,
-# pre-fill the parameter so tag-attribution ingestion works out of the box.
-# Set BEDROCK_LOGS_BUCKET=- to opt out.
+# Bedrock model-invocation logs — discover or (with consent) enable.
+#
+# Bedrock invocation logging is a PER-REGION setting. The per-status-code
+# "Status Codes" chart and per-tag cost attribution are driven by these logs.
+# This dashboard only needs token counts + metadata + error codes from the
+# logs — never prompt or response text — so when we enable logging ourselves
+# we do it with ALL data modalities OFF (textDataDeliveryEnabled=false, etc.):
+# privacy/compliance-safe, no prompt/response content ever written to S3.
+#
+# Discovery order:
+#   1. Honor an explicit BEDROCK_LOGS_BUCKET env var (set to "-" to opt out).
+#   2. Otherwise probe get-model-invocation-logging-configuration across the
+#      deploy region + the common Bedrock regions (us-east-1/2, us-west-2),
+#      because logging is frequently enabled in us-east-1 even when the
+#      dashboard deploys elsewhere. First region with a bucket wins.
+#   3. If still nothing found, OFFER to enable it (interactive prompt; or
+#      ENABLE_INVOCATION_LOGGING=yes/no to decide non-interactively). Default
+#      when no answer is available: DO NOT enable (safest — most customers
+#      have nothing enabled and the deploy must still fully succeed).
+#
+# BEDROCK_LOGS_REGION records WHICH region the bucket lives in, so the
+# ingester reads logs from the right region (passed through to the stack).
 # -----------------------------------------------------------------------------
-if [[ -z "${BEDROCK_LOGS_BUCKET:-}" ]]; then
-    BEDROCK_LOGS_BUCKET="$(aws bedrock get-model-invocation-logging-configuration \
-        --region "$REGION" --query 'loggingConfig.s3Config.bucketName' --output text 2>/dev/null || true)"
-    if [[ "$BEDROCK_LOGS_BUCKET" == "None" || "$BEDROCK_LOGS_BUCKET" == "null" ]]; then
-        BEDROCK_LOGS_BUCKET=""
-    fi
-fi
-[[ "$BEDROCK_LOGS_BUCKET" == "-" ]] && BEDROCK_LOGS_BUCKET=""
-if [[ -n "$BEDROCK_LOGS_BUCKET" ]]; then
-    echo "    bedrock invocation logs: $BEDROCK_LOGS_BUCKET (tag-attribution ingester enabled)"
+BEDROCK_LOGS_REGION=""
+_probe_logging() {  # $1 = region; echoes bucket name (or empty)
+    local b
+    b="$(aws bedrock get-model-invocation-logging-configuration \
+        --region "$1" --query 'loggingConfig.s3Config.bucketName' --output text 2>/dev/null || true)"
+    [[ "$b" == "None" || "$b" == "null" ]] && b=""
+    echo "$b"
+}
+
+if [[ "${BEDROCK_LOGS_BUCKET:-}" == "-" ]]; then
+    BEDROCK_LOGS_BUCKET=""                       # explicit opt-out
+    echo "    bedrock invocation logs: opted out (BEDROCK_LOGS_BUCKET=-)"
+elif [[ -n "${BEDROCK_LOGS_BUCKET:-}" ]]; then
+    BEDROCK_LOGS_REGION="${BEDROCK_LOGS_REGION:-$REGION}"
+    echo "    bedrock invocation logs: $BEDROCK_LOGS_BUCKET (region $BEDROCK_LOGS_REGION, provided)"
 else
-    echo "    bedrock invocation logs: (none configured — tag-attribution ingester skipped)"
+    # Probe deploy region first, then the common Bedrock regions (dedup).
+    _seen=" "
+    for _r in "$REGION" us-east-1 us-east-2 us-west-2; do
+        [[ "$_seen" == *" $_r "* ]] && continue
+        _seen="$_seen$_r "
+        _b="$(_probe_logging "$_r")"
+        if [[ -n "$_b" ]]; then
+            BEDROCK_LOGS_BUCKET="$_b"; BEDROCK_LOGS_REGION="$_r"
+            echo "    bedrock invocation logs: found existing bucket '$_b' in $_r — reusing it"
+            break
+        fi
+    done
+
+    if [[ -z "$BEDROCK_LOGS_BUCKET" ]]; then
+        echo "    bedrock invocation logs: could not auto-discover a logging bucket"
+        echo "      (checked $REGION, us-east-1, us-east-2, us-west-2 in account $ACCOUNT_ID)"
+        echo "      This is normal if logging is off, enabled only in another region we"
+        echo "      didn't check, in a different account, or this principal lacks"
+        echo "      bedrock:GetModelInvocationLoggingConfiguration."
+
+        # Enable metadata-only invocation logging in $REGION (creates bucket,
+        # bucket policy, and turns logging on with ALL data modalities off).
+        _enable_metadata_only_logging() {
+            BEDROCK_LOGS_BUCKET="bedrock-ops-lens-invocation-logs-${ACCOUNT_ID}-${REGION}"
+            BEDROCK_LOGS_REGION="$REGION"
+            echo "    enabling metadata-only invocation logging → s3://$BEDROCK_LOGS_BUCKET"
+            if ! aws s3api head-bucket --bucket "$BEDROCK_LOGS_BUCKET" --region "$REGION" 2>/dev/null; then
+                if [[ "$REGION" == "us-east-1" ]]; then
+                    aws s3api create-bucket --bucket "$BEDROCK_LOGS_BUCKET" --region "$REGION" >/dev/null
+                else
+                    aws s3api create-bucket --bucket "$BEDROCK_LOGS_BUCKET" --region "$REGION" \
+                        --create-bucket-configuration LocationConstraint="$REGION" >/dev/null
+                fi
+                aws s3api put-public-access-block --bucket "$BEDROCK_LOGS_BUCKET" \
+                    --public-access-block-configuration \
+                    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true >/dev/null 2>&1 || true
+            fi
+            aws s3api put-bucket-policy --bucket "$BEDROCK_LOGS_BUCKET" --region "$REGION" --policy "$(cat <<JSON
+{ "Version":"2012-10-17","Statement":[{"Sid":"AmazonBedrockLogsWrite","Effect":"Allow",
+  "Principal":{"Service":"bedrock.amazonaws.com"},"Action":"s3:PutObject",
+  "Resource":"arn:${PARTITION:-aws}:s3:::${BEDROCK_LOGS_BUCKET}/AWSLogs/${ACCOUNT_ID}/BedrockModelInvocationLogs/*",
+  "Condition":{"StringEquals":{"aws:SourceAccount":"${ACCOUNT_ID}"},
+    "ArnLike":{"aws:SourceArn":"arn:${PARTITION:-aws}:bedrock:${REGION}:${ACCOUNT_ID}:*"}}}]}
+JSON
+)" >/dev/null
+            aws bedrock put-model-invocation-logging-configuration --region "$REGION" --logging-config "$(cat <<JSON
+{ "s3Config":{"bucketName":"${BEDROCK_LOGS_BUCKET}","keyPrefix":""},
+  "textDataDeliveryEnabled":false,"imageDataDeliveryEnabled":false,
+  "embeddingDataDeliveryEnabled":false,"videoDataDeliveryEnabled":false }
+JSON
+)" >/dev/null
+            echo "    ✓ logging enabled (metadata only — no prompt/response text captured)"
+        }
+
+        # Accept a bucket the operator already has (possibly in another
+        # account/region) and print the exact bucket policy they must add so
+        # the ingester role can READ it. The ingester-side IAM grant is in the
+        # CloudFormation template; the bucket-side grant can only be set by the
+        # bucket's owner, hence we print it for them.
+        _use_existing_bucket() {
+            local b="$1" r="$2"
+            BEDROCK_LOGS_BUCKET="$b"
+            BEDROCK_LOGS_REGION="${r:-$REGION}"
+            echo ""
+            echo "    Using existing bucket: s3://$BEDROCK_LOGS_BUCKET (region ${BEDROCK_LOGS_REGION})"
+            echo "    ┌── ACTION REQUIRED ─────────────────────────────────────────────┐"
+            echo "    │ If this bucket is in a DIFFERENT account from the dashboard,    │"
+            echo "    │ add a bucket policy statement granting THIS account's ingester  │"
+            echo "    │ role read access. Paste into the bucket's policy (bucket owner  │"
+            echo "    │ must do this — we can't set another account's bucket policy):   │"
+            echo "    └────────────────────────────────────────────────────────────────┘"
+            cat <<JSON
+    {
+      "Sid": "BedrockOpsLensIngesterRead",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:${PARTITION:-aws}:iam::${ACCOUNT_ID}:root" },
+      "Action": [ "s3:GetObject", "s3:ListBucket" ],
+      "Resource": [
+        "arn:${PARTITION:-aws}:s3:::${BEDROCK_LOGS_BUCKET}",
+        "arn:${PARTITION:-aws}:s3:::${BEDROCK_LOGS_BUCKET}/*"
+      ]
+    }
+JSON
+            echo "    (Scopes to this account; the ingester role's matching IAM grant is created by the stack.)"
+        }
+
+        # Choose the path. ENABLE_INVOCATION_LOGGING / BEDROCK_LOGS_BUCKET env
+        # vars decide non-interactively; otherwise prompt with a 3-way menu.
+        if [[ "${ENABLE_INVOCATION_LOGGING:-}" == "yes" ]]; then
+            _enable_metadata_only_logging
+        elif [[ "${ENABLE_INVOCATION_LOGGING:-}" == "no" ]]; then
+            echo "    bedrock invocation logs: (skipped via ENABLE_INVOCATION_LOGGING=no)"
+        elif [[ -t 0 ]]; then
+            echo ""
+            echo "    The 'Status Codes' (per-HTTP-code) chart and per-tag cost attribution"
+            echo "    need Bedrock model-invocation logging. Options:"
+            echo "      [1] Enable metadata-only logging in $REGION now"
+            echo "          (captures token counts / model / latency / error codes — NOT"
+            echo "           prompt or response text; per-region, all Bedrock usage in $REGION)"
+            echo "      [2] I already have an invocation-logs S3 bucket — enter it"
+            echo "          (works cross-account; we'll print the bucket policy to add)"
+            echo "      [3] Skip — dashboard runs on CloudWatch data; chart notes logging is off"
+            read -r -p "    Choose [1/2/3] (default 3): " _choice
+            case "$_choice" in
+                1) _enable_metadata_only_logging ;;
+                2) read -r -p "    Existing logs bucket name: " _eb
+                   read -r -p "    Bucket's region [$REGION]: " _er
+                   if [[ -n "$_eb" ]]; then _use_existing_bucket "$_eb" "${_er:-$REGION}"
+                   else echo "    (no bucket entered — skipping)"; fi ;;
+                *) echo "    bedrock invocation logs: (skipped — dashboard works on CloudWatch data)" ;;
+            esac
+        else
+            echo "    (non-interactive: skipping — set ENABLE_INVOCATION_LOGGING=yes, or"
+            echo "     BEDROCK_LOGS_BUCKET=<name> to use an existing bucket)"
+        fi
+    fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -153,6 +291,20 @@ fi
 # constraint). Main + ECR live in $REGION.
 EDGE_REGION="us-east-1"
 echo "    stacks:  $ECR_STACK ($REGION) + $MAIN_STACK ($REGION) + $EDGE_STACK ($EDGE_REGION)"
+
+# Cognito Hosted-UI domain prefix — must be unique per region. Including the
+# stack suffix prevents the "Domain already exists" collision when more than
+# one stack (e.g. prod + staging) is deployed in the same account+region.
+# Sanitize to Cognito's rules: lowercase, [a-z0-9-] only, <=63 chars, and no
+# 'aws'/'cognito'/'amazon' substring (our 'lens-' prefix avoids those).
+if [[ -n "$SUFFIX" ]]; then
+    _sfx="$(echo "$SUFFIX" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9-' '-' | sed 's/-\{1,\}/-/g; s/^-//; s/-$//')"
+    COGNITO_DOMAIN_PREFIX="lens-${ACCOUNT_ID}-${_sfx}"
+else
+    COGNITO_DOMAIN_PREFIX="lens-${ACCOUNT_ID}"
+fi
+COGNITO_DOMAIN_PREFIX="${COGNITO_DOMAIN_PREFIX:0:63}"
+echo "    cognito domain prefix: $COGNITO_DOMAIN_PREFIX"
 
 # -----------------------------------------------------------------------------
 # Destroy
@@ -356,6 +508,8 @@ cat > "$PARAMS_JSON" <<EOF
   {"ParameterKey":"AllowedEmailDomains","ParameterValue":"$ALLOWED_EMAIL_DOMAINS"},
   {"ParameterKey":"BackendImageUri","ParameterValue":"$ECR_URI:latest"},
   {"ParameterKey":"BedrockLogsBucket","ParameterValue":"$BEDROCK_LOGS_BUCKET"},
+  {"ParameterKey":"BedrockLogsRegion","ParameterValue":"$BEDROCK_LOGS_REGION"},
+  {"ParameterKey":"CognitoDomainPrefix","ParameterValue":"$COGNITO_DOMAIN_PREFIX"},
   {"ParameterKey":"StackNamePrefix","ParameterValue":"$MAIN_STACK"},
   {"ParameterKey":"EdgeShaVersionArn","ParameterValue":"$EDGE_SHA_VERSION_ARN"},
   {"ParameterKey":"WebAclArn","ParameterValue":"$WEB_ACL_ARN"}

@@ -121,20 +121,53 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
     # skip — running it without --bucket would just SystemExit(2).
     logs_bucket = os.environ.get("BEDROCK_LOGS_BUCKET", "").strip()
     if logs_bucket:
-        self_acct = os.environ.get("AWS_ACCOUNT_ID", "")
-        if not self_acct:
-            try:
-                import boto3  # type: ignore
-                self_acct = boto3.client("sts").get_caller_identity()["Account"]
-            except Exception:
-                self_acct = ""
-        region = os.environ.get("BEDROCK_REGION", "us-east-1")
+        # Account list: use the SAME source as cw_metrics (discover-org /
+        # explicit / single from config.yaml), not just the central account.
+        # The invocation-logs bucket is a single CENTRAL bucket whose keys are
+        # partitioned by account (AWSLogs/<accountId>/BedrockModelInvocationLogs/
+        # ...), and the ingester already loops over the account list reading
+        # each account's prefix. Passing the full org list means per-code data
+        # covers every account that delivers logs into the central bucket — the
+        # same coverage cw_metrics provides for volumetric data. (Accounts with
+        # no logs under their prefix simply contribute nothing — harmless.)
+        try:
+            from ingestion.accounts import discover_accounts as _disc
+        except ImportError:
+            from accounts import discover_accounts as _disc  # type: ignore
+
+        class _A:  # minimal args shim: no CLI overrides → falls back to config.yaml
+            accounts = None
+            accounts_config = None
+            discover_org = False
+        try:
+            _accts = [a.accountId for a in _disc(_A())]
+        except Exception:
+            _accts = []
+        if not _accts:
+            # Fall back to the running account so the module still does useful
+            # work even if org discovery is unavailable.
+            self_acct = os.environ.get("AWS_ACCOUNT_ID", "")
+            if not self_acct:
+                try:
+                    import boto3  # type: ignore
+                    self_acct = boto3.client("sts").get_caller_identity()["Account"]
+                except Exception:
+                    self_acct = ""
+            _accts = [self_acct] if self_acct else []
+        accounts_csv = ",".join(a for a in _accts if a)
+
+        # Logs are read from the region the bucket lives in. Bedrock invocation
+        # logging is per-region and is commonly enabled in us-east-1 even when
+        # the dashboard deploys elsewhere, so prefer BEDROCK_LOGS_REGION and
+        # fall back to the deploy region (BEDROCK_REGION).
+        logs_region = (os.environ.get("BEDROCK_LOGS_REGION", "").strip()
+                       or os.environ.get("BEDROCK_REGION", "us-east-1"))
         schedule.append((
             "invocation_logs", "ingestion.invocation_logs",
             ["invocation_logs", "--db-url", db_url, "--days", str(days),
              "--bucket", logs_bucket,
-             "--accounts", self_acct or "",
-             "--regions", region]
+             "--accounts", accounts_csv,
+             "--regions", logs_region]
         ))
 
     # quotas LAST: slowest module at org/multi-region scale (Service Quotas
