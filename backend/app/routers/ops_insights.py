@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from .. import db
+from ..burndown import output_burndown_rate
 from ..filters import FilterSet, build_where, parse_filters
 
 router = APIRouter()
@@ -120,22 +121,53 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
         params.append(PROVIDER_PREFIX[f.provider] + "%")
     w = " AND ".join(parts)
 
+    # Fetch per-hour rows and reduce in Python so the output-token burndown
+    # multiplier can be applied to each hour BEFORE the peak is taken (the rate
+    # is per-model, and the busiest quota-hour can differ from the busiest
+    # raw-token hour — so we cannot pre-sum then multiply). See app/burndown.py
+    # and the AWS quota-token-burndown doc.
     rows = await db.fetch(
         f"""
         SELECT accountId, modelId, region,
-          MAX(total_requests)::BIGINT       AS peak_requests_hour,
-          MAX(CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL ELSE GREATEST(total_input_tokens - total_cache_read_input_tokens, 0) END)::BIGINT AS peak_input_tpm,
-          MAX(total_output_tokens)::BIGINT  AS peak_output_tpm
+          total_requests,
+          CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
+               ELSE GREATEST(total_input_tokens - total_cache_read_input_tokens, 0) END AS input_quota_tokens,
+          total_output_tokens
         FROM f_hourly_peak
         WHERE {w}
-        GROUP BY accountId, modelId, region
-        HAVING MAX(total_requests) > 0
-        ORDER BY peak_requests_hour DESC
-        LIMIT 200
         """,
         *params,
     )
-    return db.rows_to_dicts(rows)
+
+    agg: dict = {}
+    for r in db.rows_to_dicts(rows):
+        mid = r.get("modelid") or r.get("modelId")
+        key = (r.get("accountid") or r.get("accountId"), mid, r["region"])
+        a = agg.get(key)
+        if a is None:
+            rate = output_burndown_rate(mid)
+            a = agg[key] = {
+                "accountId": key[0], "modelId": mid, "region": key[2],
+                "burndown_rate": rate,
+                "peak_requests_hour": 0,
+                "peak_input_tpm": 0,    # raw input (cache-read excluded)
+                "peak_output_tpm": 0,   # raw output, 1:1
+                "peak_quota_tpm": 0,    # (input) + output*rate, weighted per-hour
+            }
+        rate = a["burndown_rate"]
+        req = int(r["total_requests"] or 0)
+        out = int(r["total_output_tokens"] or 0)
+        inp = r["input_quota_tokens"]
+        a["peak_requests_hour"] = max(a["peak_requests_hour"], req)
+        a["peak_output_tpm"] = max(a["peak_output_tpm"], out)
+        if inp is not None:
+            inp = int(inp)
+            a["peak_input_tpm"] = max(a["peak_input_tpm"], inp)
+            a["peak_quota_tpm"] = max(a["peak_quota_tpm"], inp + out * rate)
+
+    out_rows = [a for a in agg.values() if a["peak_requests_hour"] > 0]
+    out_rows.sort(key=lambda a: a["peak_requests_hour"], reverse=True)
+    return out_rows[:200]
 
 
 # ---------------------------------------------------------------------------
@@ -143,13 +175,18 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
 # ---------------------------------------------------------------------------
 @router.get("/ops-burndown-risk")
 async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
-    """Joins f_hourly_peak (peak input + output TPM) with f_quotas (applied TPM)
-    to surface Claude-4 family deployments approaching their limit.
+    """Joins f_hourly_peak with f_quotas (applied TPM) to surface Claude
+    deployments approaching their TPM limit, with the per-model output-token
+    burndown multiplier applied (15x Opus 4.8 / 5x other Claude 3.7+ / 1x else)
+    so "Peak TPM (quota)" matches how CloudWatch burns down the quota.
 
-    Replaces the reference's hardcoded LIKE '%coffee%' codename filter with
-    the public 'claude-' family pattern."""
+    The multiplier is applied to output per-hour BEFORE the peak is taken
+    (see app/burndown.py), then joined to the applied quota. The Claude-family
+    filter matches both bare ids (`anthropic.claude-...`) and CRIS-prefixed ids
+    (`us.`/`eu.`/`apac.`/`global.` ... + `anthropic.claude-...`) — a bare-prefix
+    filter silently dropped all cross-region traffic, which is most of it."""
     parts = ["h.event_date BETWEEN $1::date AND $2::date",
-             "h.modelId LIKE 'anthropic.claude-%'"]
+             "h.modelId LIKE '%anthropic.claude-%'"]
     params: list = [f.start, f.end]
     if f.accounts:
         parts.append(f"h.accountId = ANY(${len(params)+1}::text[])")
@@ -159,37 +196,90 @@ async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
         params.append(f.region)
     w = " AND ".join(parts)
 
-    rows = await db.fetch(
+    # Per-hour rows; reduce in Python so the per-model rate is applied to each
+    # hour's output before the peak (the rate is per-model so it can't live in
+    # the SQL aggregate, and the busiest quota-hour differs from the busiest
+    # raw-token hour).
+    hourly = await db.fetch(
         f"""
-        WITH peaks AS (
-          SELECT accountId, modelId, region,
-            MAX(CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL ELSE GREATEST(total_input_tokens - total_cache_read_input_tokens, 0) END)  AS peak_input_tpm,
-            MAX(total_output_tokens) AS peak_output_tpm,
-            MAX(CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
-                     ELSE GREATEST((total_input_tokens - total_cache_read_input_tokens) + total_output_tokens, 0) END) AS peak_combined_tpm
-          FROM f_hourly_peak h
-          WHERE {w}
-          GROUP BY accountId, modelId, region
-        )
-        SELECT p.accountId, p.modelId, p.region,
-          p.peak_combined_tpm::BIGINT AS peak_tpm,
-          p.peak_output_tpm::BIGINT,
-          q.applied_value::BIGINT     AS effective_tpm,
-          ROUND((100.0 * p.peak_combined_tpm / NULLIF(q.applied_value, 0))::numeric, 2)
-            AS overhead_pct
-        FROM peaks p
-        LEFT JOIN f_quotas q
-          ON q.accountId = p.accountId
-         AND q.region = p.region
-         AND q.metric = 'TPM'
-         AND p.modelId LIKE '%' || q.model_name || '%'
-        WHERE q.applied_value IS NOT NULL
-        ORDER BY overhead_pct DESC NULLS LAST
-        LIMIT 200
+        SELECT h.accountId, h.modelId, h.region,
+          CASE WHEN h.total_cache_read_input_tokens IS NULL THEN NULL
+               ELSE GREATEST(h.total_input_tokens - h.total_cache_read_input_tokens, 0) END AS input_quota_tokens,
+          h.total_output_tokens
+        FROM f_hourly_peak h
+        WHERE {w}
         """,
         *params,
     )
-    return db.rows_to_dicts(rows)
+
+    peaks: dict = {}
+    for r in db.rows_to_dicts(hourly):
+        mid = r.get("modelid") or r.get("modelId")
+        key = (r.get("accountid") or r.get("accountId"), mid, r["region"])
+        inp = r["input_quota_tokens"]
+        if inp is None:
+            continue  # cache split unknown -> can't compute quota-accurate TPM
+        p = peaks.get(key)
+        if p is None:
+            p = peaks[key] = {
+                "accountId": key[0], "modelId": mid, "region": key[2],
+                "burndown_rate": output_burndown_rate(mid),
+                "peak_output_tpm": 0, "peak_quota_tpm": 0,
+            }
+        out = int(r["total_output_tokens"] or 0)
+        p["peak_output_tpm"] = max(p["peak_output_tpm"], out)
+        p["peak_quota_tpm"] = max(p["peak_quota_tpm"], int(inp) + out * p["burndown_rate"])
+
+    if not peaks:
+        return []
+
+    # Applied TPM quotas for the in-scope accounts/regions; fuzz-match the
+    # human model_name against the technical modelId (same heuristic as the
+    # quota drill-down).
+    from .quota_drilldown import _matches
+    qparts = ["metric = 'TPM'", "applied_value IS NOT NULL"]
+    qparams: list = []
+    accts = sorted({k[0] for k in peaks})
+    qparts.append(f"accountId = ANY(${len(qparams)+1}::text[])")
+    qparams.append(accts)
+    if f.region != "all":
+        qparts.append(f"region = ${len(qparams)+1}")
+        qparams.append(f.region)
+    quota_rows = db.rows_to_dicts(await db.fetch(
+        f"SELECT accountId, region, model_name, applied_value FROM f_quotas WHERE {' AND '.join(qparts)}",
+        *qparams,
+    ))
+
+    def _applied_tpm(acct, region, model_id):
+        best = None
+        for q in quota_rows:
+            if (q.get("accountid") or q.get("accountId")) != acct or q["region"] != region:
+                continue
+            if not _matches(q["model_name"], model_id):
+                continue
+            val = float(q["applied_value"])
+            if best is None or val > best:
+                best = val
+        return best
+
+    out_rows = []
+    for p in peaks.values():
+        applied = _applied_tpm(p["accountId"], p["region"], p["modelId"])
+        if applied is None:
+            continue
+        peak_quota_tpm = p["peak_quota_tpm"]
+        out_rows.append({
+            "accountId": p["accountId"],
+            "modelId": p["modelId"],
+            "region": p["region"],
+            "burndown_rate": p["burndown_rate"],
+            "peak_tpm": int(peak_quota_tpm),       # quota-weighted (matches CW burndown)
+            "peak_output_tpm": int(p["peak_output_tpm"]),
+            "effective_tpm": int(applied),         # applied TPM quota
+            "overhead_pct": round(100.0 * peak_quota_tpm / applied, 2) if applied else None,
+        })
+    out_rows.sort(key=lambda r: (r["overhead_pct"] is None, -(r["overhead_pct"] or 0)))
+    return out_rows[:200]
 
 
 # ---------------------------------------------------------------------------

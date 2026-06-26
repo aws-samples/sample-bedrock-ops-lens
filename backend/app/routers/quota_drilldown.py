@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Query
 
 from .. import db
+from ..burndown import output_burndown_rate
 
 router = APIRouter()
 
@@ -153,6 +154,13 @@ async def quota_drilldown(
     if not account_id.isdigit():
         raise HTTPException(400, "account_id must be 12 digits")
 
+    # Per-model output-token burndown multiplier (15x Opus 4.8 / 5x other
+    # Claude 3.7+ / 1x else). CloudWatch's EstimatedTPMQuotaUsage bakes this in,
+    # so the quota-accurate TPM must weight output tokens by it. Passed into the
+    # SQL as $5 so the weighting happens per-hour before the peak. See
+    # app/burndown.py.
+    rate = output_burndown_rate(model_id)
+
     # 1. Hourly time series — per-minute rates.
     rows = await db.fetch(
         """
@@ -160,14 +168,15 @@ async def quota_drilldown(
           (event_date::timestamp + (hour || ' hours')::interval) AS ts,
           total_requests::float / 60.0                            AS rpm,
           -- Quota-accurate TPM: cache-read input tokens don't count toward
-          -- the TPM rate-limit quota, so subtract them (clamp at 0). When
+          -- the TPM rate-limit quota, so subtract them (clamp at 0); output
+          -- tokens are weighted by the model's burndown multiplier ($5). When
           -- cache-read is NULL (pre-migration rows CloudWatch retention has
           -- aged out — un-backfillable), return NULL so the chart shows a gap
           -- instead of a falsely-inflated spike, and Python excludes it from
           -- the peak/avg.
           (CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
                 ELSE GREATEST(COALESCE(total_input_tokens,0) - total_cache_read_input_tokens, 0)
-                     + COALESCE(total_output_tokens, 0) END)::float / 60.0  AS tpm,
+                     + COALESCE(total_output_tokens, 0) * $5 END)::float / 60.0  AS tpm,
           (CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
                 ELSE GREATEST(COALESCE(total_input_tokens,0) - total_cache_read_input_tokens, 0) END)::float / 60.0 AS input_tpm,
           COALESCE(total_output_tokens, 0)::float / 60.0           AS output_tpm,
@@ -177,7 +186,7 @@ async def quota_drilldown(
           AND event_date >= current_date - $4::int
         ORDER BY ts
         """,
-        account_id, model_id, region, days,
+        account_id, model_id, region, days, rate,
     )
 
     # 2. Quota lookup — fuzz-match model_id against the human model_name.
@@ -302,6 +311,7 @@ async def quota_drilldown(
         "tpm_limit": tpm_limit,
         "rpm_limit": rpm_limit,
         "rpm_limit_derived": rpm_limit_derived,
+        "burndown_rate": rate,
         "matched_quota_traffic_type": matched_traffic,
         "kpis": {
             "peak_tpm":     peak_tpm,

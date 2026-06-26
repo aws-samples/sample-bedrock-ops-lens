@@ -87,10 +87,12 @@ BEDROCK CONCEPTS REFERENCE
   on-demand single-region inference, with automatic spillover across
   regions. Single-line code change for the calling client. Reference:
   https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html
-- Claude 4+ burndown: each output token counts 5x against TPM (instead of
-  1x). Bedrock reserves max_tokens × 5 × RPM up-front. Setting max_tokens
-  close to actual expected output (not the model maximum) materially helps.
-  Reference: https://docs.aws.amazon.com/bedrock/latest/userguide/quotas.html
+- Claude burndown: output tokens count more than 1x against TPM — 15x for
+  Claude Opus 4.8, 5x for other Claude 3.7+ (Sonnet/Opus/Haiku 3.7, 4, 4.x),
+  1x otherwise. Bedrock reserves max_tokens × rate × RPM up-front. Setting
+  max_tokens close to actual expected output (not the model maximum)
+  materially helps — and the gain is largest for Opus 4.8 (15x). Reference:
+  https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html
 - Prompt caching: cache_read_input_tokens > 0 means active. Reduces TTFT
   ~85% and cost ~90% on cached portions. Reference:
   https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html

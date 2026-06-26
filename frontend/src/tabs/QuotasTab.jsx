@@ -120,7 +120,13 @@ export default function QuotasTab({ filters, onInfo }) {
       const accountId = r.accountid || r.accountId;
       const modelId = r.modelid || r.modelId;
       const region = r.region;
-      const tpmHour = Number(r.peak_input_tpm || 0) + Number(r.peak_output_tpm || 0);
+      // Quota-accurate peak TPM: the backend already applied the per-model
+      // output-token burndown multiplier per-hour before taking the max
+      // (peak_quota_tpm). Fall back to the raw 1:1 sum only for older API
+      // responses that predate the field.
+      const tpmHour = r.peak_quota_tpm != null
+        ? Number(r.peak_quota_tpm)
+        : Number(r.peak_input_tpm || 0) + Number(r.peak_output_tpm || 0);
       const rpmHour = Number(r.peak_requests_hour || 0);
       const peakTpmMin = tpmHour / 60;
       const peakRpmMin = rpmHour / 60;
@@ -303,16 +309,17 @@ export default function QuotasTab({ filters, onInfo }) {
 
       {/* Burndown — moved from Engagement Signals */}
       {(burndown.data || []).length > 0 && (
-        <Container header={<SectionHeader title="Claude 4+ burndown risk" sectionId="burndown" onInfo={onInfo} />}>
+        <Container header={<SectionHeader title="Claude burndown risk" sectionId="burndown" onInfo={onInfo} />}>
           <PaginatedTable
             items={burndown.data || []}
             columnDefinitions={[
               { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
-              { id: 'p', header: 'Peak TPM',          cell: r => fmt(r.peak_tpm) },
+              { id: 'p', header: 'Peak TPM (quota)',  cell: r => fmt(r.peak_tpm) },
+              { id: 'b', header: 'Burndown', cell: r => r.burndown_rate != null ? `${r.burndown_rate}×` : '—' },
               { id: 'q', header: 'Applied TPM',       cell: r => fmt(r.effective_tpm) },
-              { id: 'o', header: 'Headroom %',        cell: r => <Box color="text-status-error" fontWeight="bold">{fmtPct(r.overhead_pct)}</Box> },
+              { id: 'o', header: 'Quota util %',      cell: r => <Box color="text-status-error" fontWeight="bold">{fmtPct(r.overhead_pct)}</Box> },
             ]}
             empty="No burndown risk."
           />

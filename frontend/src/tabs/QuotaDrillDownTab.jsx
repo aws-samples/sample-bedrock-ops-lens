@@ -299,7 +299,9 @@ export default function QuotaDrillDownTab({ onInfo }) {
       }>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, alignItems: 'stretch' }}>
           <MetricCard
-            title="Tokens per minute (TPM)"
+            title={data?.burndown_rate > 1
+              ? `Tokens per minute (TPM) — ${data.burndown_rate}× output burndown`
+              : "Tokens per minute (TPM)"}
             ariaLabel="Tokens per minute"
             series={tpmSeries}
             limit={data?.tpm_limit ?? null}
