@@ -243,6 +243,24 @@ async def _ensure_identity_table(conn: asyncpg.Connection) -> None:
     # Idempotent migration for tables created before group/user split.
     await conn.execute("ALTER TABLE f_daily_by_identity ADD COLUMN IF NOT EXISTS principal_group TEXT NOT NULL DEFAULT ''")
     await conn.execute("ALTER TABLE f_daily_by_identity ADD COLUMN IF NOT EXISTS principal_user  TEXT NOT NULL DEFAULT ''")
+    # Backfill rows written before the group/user split. Derivable from the
+    # stored ARN, so this is safe and idempotent (only touches empty values).
+    await conn.execute(r"""
+        UPDATE f_daily_by_identity SET
+          principal_group = CASE
+            WHEN split_part(split_part(principal_arn, ':', 6), '/', 1) = 'assumed-role'
+              THEN split_part(split_part(principal_arn, ':', 6), '/', 2)
+            ELSE COALESCE(NULLIF(split_part(split_part(principal_arn, ':', 6), '/', 2), ''),
+                          split_part(principal_arn, ':', 6))
+          END,
+          principal_user = CASE
+            WHEN split_part(split_part(principal_arn, ':', 6), '/', 1) = 'assumed-role'
+              THEN split_part(split_part(principal_arn, ':', 6), '/', 3)
+            ELSE COALESCE(NULLIF(split_part(split_part(principal_arn, ':', 6), '/', 2), ''),
+                          split_part(principal_arn, ':', 6))
+          END
+        WHERE principal_group = '' OR principal_user = ''
+    """)
 
 
 async def main() -> int:
