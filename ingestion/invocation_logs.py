@@ -151,10 +151,32 @@ def _http_status_from_log(entry: dict) -> int:
     )
 
 
-def _parse_log_entry(entry: dict) -> tuple[date, int, str, str, str, str, dict, int, int, int]:
+def _principal_label(arn: str) -> str:
+    """Human-readable label for an IAM principal ARN.
+
+    assumed-role/<role>/<session> → "<role>/<session>"  (session carries the
+    human login for SSO principals; role carries the workload/team).
+    user/<name>                   → "<name>"
+    anything else                 → last ARN segment.
+    """
+    if not arn:
+        return "unknown"
+    try:
+        tail = arn.split(":", 5)[5]          # e.g. assumed-role/X/Y or user/X
+    except IndexError:
+        return arn
+    parts = tail.split("/")
+    if parts[0] == "assumed-role" and len(parts) >= 3:
+        return f"{parts[1]}/{parts[2]}"
+    if parts[0] in ("user", "role") and len(parts) >= 2:
+        return parts[-1]
+    return tail
+
+
+def _parse_log_entry(entry: dict) -> tuple[date, int, str, str, str, str, dict, int, int, int, str]:
     """Returns (date, hour, accountId, modelId, region, operation,
               requestMetadata, total_in_tokens, total_out_tokens,
-              status_code) or None."""
+              status_code, principal_arn) or None."""
     ts = entry.get("timestamp")
     acct = entry.get("accountId", "")
     region = entry.get("region", "")
@@ -173,7 +195,8 @@ def _parse_log_entry(entry: dict) -> tuple[date, int, str, str, str, str, dict, 
     in_t = int((entry.get("input") or {}).get("inputTokenCount") or 0)
     out_t = int((entry.get("output") or {}).get("outputTokenCount") or 0)
     status = _http_status_from_log(entry)
-    return d, hr, acct, model_id, region, op, metadata, in_t, out_t, status
+    principal_arn = str((entry.get("identity") or {}).get("arn") or "")
+    return d, hr, acct, model_id, region, op, metadata, in_t, out_t, status, principal_arn
 
 
 async def _ensure_log_objects_table(conn: asyncpg.Connection) -> None:
@@ -185,6 +208,30 @@ async def _ensure_log_objects_table(conn: asyncpg.Connection) -> None:
             tag_count    BIGINT NOT NULL DEFAULT 0
         )
     """)
+
+
+async def _ensure_identity_table(conn: asyncpg.Connection) -> None:
+    """Create f_daily_by_identity if missing. Deliberately done here (not
+    only in schema.sql): the schema-init Lambda is a CFN custom resource
+    that does NOT re-run on an image-only redeploy, so existing stacks
+    pick the table up on the next ingest instead."""
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS f_daily_by_identity (
+            event_date          DATE NOT NULL,
+            accountId           TEXT NOT NULL,
+            modelId             TEXT NOT NULL,
+            region              TEXT NOT NULL,
+            principal_arn       TEXT NOT NULL,
+            principal_label     TEXT NOT NULL DEFAULT '',
+            total_requests      BIGINT NOT NULL DEFAULT 0,
+            failed_requests     BIGINT NOT NULL DEFAULT 0,
+            total_input_tokens  BIGINT NOT NULL DEFAULT 0,
+            total_output_tokens BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (event_date, accountId, modelId, region, principal_arn)
+        )
+    """)
+    await conn.execute("CREATE INDEX IF NOT EXISTS ix_f_daily_identity_arn   ON f_daily_by_identity (principal_arn, event_date)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS ix_f_daily_identity_label ON f_daily_by_identity (principal_label, event_date)")
 
 
 async def main() -> int:
@@ -203,6 +250,7 @@ async def main() -> int:
 
     conn = await asyncpg.connect(args.db_url)
     await _ensure_log_objects_table(conn)
+    await _ensure_identity_table(conn)
 
     total_logs = 0
     total_tagged_rows = 0
@@ -228,6 +276,14 @@ async def main() -> int:
                 # it feeds f_hourly_status and the dashboard's "Status Codes" chart.
                 status_buckets: dict[tuple, dict[int, int]] = defaultdict(
                     lambda: {c: 0 for c in STATUS_CODES})
+                # Per (date, account, model, region, principal_arn) → per-caller
+                # aggregates. This is what the "By User" tab reads: the IAM
+                # identity is captured automatically on every invocation
+                # (identity.arn) — no per-call tagging discipline needed.
+                identity_buckets: dict[tuple, dict] = defaultdict(lambda: {
+                    "total_requests": 0, "failed_requests": 0,
+                    "total_input_tokens": 0, "total_output_tokens": 0,
+                })
 
                 for key in pending:
                     obj_rows = 0
@@ -236,8 +292,16 @@ async def main() -> int:
                         parsed = _parse_log_entry(entry)
                         if not parsed:
                             continue
-                        d, hr, a, mid, r, op, metadata, in_t, out_t, status = parsed
+                        d, hr, a, mid, r, op, metadata, in_t, out_t, status, principal_arn = parsed
                         obj_rows += 1
+                        # Per-caller tally (skipped when the log has no identity).
+                        if principal_arn:
+                            ib = identity_buckets[(d, a, mid, r, principal_arn)]
+                            ib["total_requests"] += 1
+                            if status >= 400:
+                                ib["failed_requests"] += 1
+                            ib["total_input_tokens"] += in_t
+                            ib["total_output_tokens"] += out_t
                         # Real per-code hourly tally (one bump per request).
                         sb = status_buckets[(d, hr, a, mid, r)]
                         sb[status if status in sb else (
@@ -290,6 +354,35 @@ async def main() -> int:
                         rows,
                     )
                     total_tagged_rows += len(rows)
+
+                # Per-caller rows → f_daily_by_identity. Additive upsert,
+                # same semantics as f_daily_tagged.
+                if identity_buckets:
+                    id_rows = []
+                    for (d, a, mid, r, parn), m in identity_buckets.items():
+                        id_rows.append((
+                            d, a, mid, r, parn, _principal_label(parn),
+                            m["total_requests"], m["failed_requests"],
+                            m["total_input_tokens"], m["total_output_tokens"],
+                        ))
+                    await conn.executemany(
+                        """
+                        INSERT INTO f_daily_by_identity (
+                            event_date, accountId, modelId, region,
+                            principal_arn, principal_label,
+                            total_requests, failed_requests,
+                            total_input_tokens, total_output_tokens
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                        ON CONFLICT (event_date, accountId, modelId, region, principal_arn)
+                        DO UPDATE SET
+                            principal_label = EXCLUDED.principal_label,
+                            total_requests = f_daily_by_identity.total_requests + EXCLUDED.total_requests,
+                            failed_requests = f_daily_by_identity.failed_requests + EXCLUDED.failed_requests,
+                            total_input_tokens = f_daily_by_identity.total_input_tokens + EXCLUDED.total_input_tokens,
+                            total_output_tokens = f_daily_by_identity.total_output_tokens + EXCLUDED.total_output_tokens
+                        """,
+                        id_rows,
+                    )
 
                 # Real per-status-code hourly rows → f_hourly_status. Additive
                 # upsert so re-runs over overlapping windows accumulate correctly

@@ -131,6 +131,7 @@ echo "    sign-up: ALLOWED_EMAIL_DOMAINS=$ALLOWED_EMAIL_DOMAINS"
 # ingester reads logs from the right region (passed through to the stack).
 # -----------------------------------------------------------------------------
 BEDROCK_LOGS_REGION=""
+BEDROCK_LOGS_BUCKET="${BEDROCK_LOGS_BUCKET:-}"   # init under set -u (bugfix)
 _probe_logging() {  # $1 = region; echoes bucket name (or empty)
     local b
     b="$(aws bedrock get-model-invocation-logging-configuration \

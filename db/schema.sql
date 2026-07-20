@@ -120,6 +120,37 @@ CREATE INDEX IF NOT EXISTS ix_f_daily_tagged_model  ON f_daily_tagged (event_dat
 CREATE TABLE IF NOT EXISTS f_daily_tagged_default PARTITION OF f_daily_tagged DEFAULT;
 
 -- ----------------------------------------------------------------------------
+-- f_daily_by_identity — daily aggregates per IAM caller identity.
+--
+-- identity.arn is captured automatically by Bedrock on every invocation
+-- (no per-call tagging discipline needed), so this table answers "who is
+-- using what" even when teams don't use tagged inference profiles.
+-- principal_label is a display form: "<role>/<session>" for assumed roles
+-- (session carries the human login under SSO), "<name>" for IAM users.
+--
+-- Kept as a plain table (not partitioned): cardinality is bounded by
+-- principals × models × days, and the ingester also creates this table
+-- itself (_ensure_identity_table) for existing stacks — both DDLs MUST
+-- stay identical.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_daily_by_identity (
+    event_date          DATE NOT NULL,
+    accountId           TEXT NOT NULL,
+    modelId             TEXT NOT NULL,
+    region              TEXT NOT NULL,
+    principal_arn       TEXT NOT NULL,
+    principal_label     TEXT NOT NULL DEFAULT '',
+    total_requests      BIGINT NOT NULL DEFAULT 0,
+    failed_requests     BIGINT NOT NULL DEFAULT 0,
+    total_input_tokens  BIGINT NOT NULL DEFAULT 0,
+    total_output_tokens BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (event_date, accountId, modelId, region, principal_arn)
+);
+
+CREATE INDEX IF NOT EXISTS ix_f_daily_identity_arn   ON f_daily_by_identity (principal_arn, event_date);
+CREATE INDEX IF NOT EXISTS ix_f_daily_identity_label ON f_daily_by_identity (principal_label, event_date);
+
+-- ----------------------------------------------------------------------------
 -- f_hourly_peak — hourly aggregate at (account, model, region) for peak RPM/TPM.
 -- Used by Ops Insights for max-over-hour math. Smaller than full-dim hourly.
 -- ----------------------------------------------------------------------------

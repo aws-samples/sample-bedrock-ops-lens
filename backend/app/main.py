@@ -13,6 +13,7 @@ from .auth import install_auth
 from .config import settings
 from .db import close_pool, init_pool
 from .routers import (
+    by_user as by_user_router,
     cost as cost_router,
     errors as errors_router,
     extras as extras_router,
@@ -57,6 +58,7 @@ install_auth(app)   # registers AuthMiddleware + /api/auth/* endpoints when AUTH
 # Routers — every path is /api/...
 app.include_router(utility_router.router,    prefix="/api", tags=["utility"])
 app.include_router(overview_router.router,   prefix="/api", tags=["overview"])
+app.include_router(by_user_router.router,    prefix="/api", tags=["by-user"])
 app.include_router(errors_router.router,     prefix="/api", tags=["errors"])
 app.include_router(latency_router.router,    prefix="/api", tags=["latency"])
 app.include_router(peak_router.router,       prefix="/api", tags=["peak"])

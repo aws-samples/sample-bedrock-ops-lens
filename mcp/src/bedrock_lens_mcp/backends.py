@@ -16,6 +16,7 @@ class Backend(Protocol):
 
     def health(self) -> dict: ...
     def overview_summary(self, *, days: int) -> dict: ...
+    def by_user(self, *, days: int, top_n: int) -> dict: ...
     def cost_summary(self, *, days: int) -> dict: ...
     def cost_by_account(self, *, days: int) -> dict: ...
     def cost_by_model(self, *, days: int, top_n: int) -> dict: ...
@@ -43,6 +44,12 @@ class HttpBackend:
     # --- volumetric / overview ---
     def overview_summary(self, *, days: int) -> dict:
         return self.c.get("/summary", params={"days": days})
+
+    def by_user(self, *, days: int, top_n: int) -> dict:
+        return {
+            "summary": self.c.get("/by-user/summary", params={"days": days, "top_n": top_n}),
+            "by_model": self.c.get("/by-user/by-model", params={"days": days}),
+        }
 
     # --- cost ---
     def cost_summary(self, *, days: int) -> dict:
@@ -107,6 +114,17 @@ class DirectBackend:
 
     def overview_summary(self, *, days: int) -> dict:
         return direct_collector.overview_summary(days=days)
+
+    def by_user(self, *, days: int, top_n: int) -> dict:
+        return {
+            "window_days": days,
+            "_note": (
+                "Tier A: per-caller attribution needs the deployed pipeline — "
+                "it is built from Bedrock model invocation logs (identity.arn), "
+                "which CloudWatch metrics don't carry. Deploy the dashboard "
+                "(Tier B) or query the invocation-logs bucket directly."
+            ),
+        }
 
     def cost_summary(self, *, days: int) -> dict:
         return direct_collector.cost_summary(days=days)
