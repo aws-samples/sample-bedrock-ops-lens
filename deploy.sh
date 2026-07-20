@@ -565,7 +565,7 @@ else
         --parameters "file://$PARAMS_JSON" \
         --tags "Key=app,Value=bedrock-ops-lens" \
                "Key=stack,Value=$MAIN_STACK" \
-        --region "$REGION" 2>&1)"
+        --region "$REGION" 2>&1)" || true   # non-zero on "No updates" — must not kill the script (set -e)
     if echo "$UPDATE_OUT" | grep -q "No updates are to be performed"; then
         echo "    (no template diff — skipping wait)"
     else
