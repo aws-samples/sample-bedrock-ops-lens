@@ -35,9 +35,8 @@ from datetime import date, datetime, timedelta, timezone
 import asyncpg
 import boto3
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
 
-from .accounts import session_for, session_cache
+from .accounts import session_cache
 from .config import load_config
 
 DEFAULT_DB_URL = os.environ.get(
@@ -315,7 +314,7 @@ async def main() -> int:
     rows = _fetch_cost(ce, start, end_excl, services, only_accounts=only_accounts)
     print(f"      got {len(rows)} non-zero (date, account, service) rows")
 
-    print(f"[3/3] upserting into f_daily_cost...")
+    print("[3/3] upserting into f_daily_cost...")
     ut_rows = _fetch_cost_by_usage_type(ce, start, end_excl, services, only_accounts)
     print(f"      + {len(ut_rows)} usage-type rows (real billed line items)")
     conn = await asyncpg.connect(args.db_url)

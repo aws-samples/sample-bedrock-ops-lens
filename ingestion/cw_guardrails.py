@@ -25,7 +25,7 @@ import asyncio
 import os
 import sys
 from collections import defaultdict
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg

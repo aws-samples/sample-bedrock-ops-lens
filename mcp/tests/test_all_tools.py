@@ -53,6 +53,10 @@ def main() -> int:
         ("errors_summary",    lambda: backend.errors_summary(days=14)),
         ("latency_summary",   lambda: backend.latency_summary(days=14)),
         ("ops_review",        lambda: backend.ops_review_synthesize(days=14)),
+        ("by_user",           lambda: backend.by_user(days=14, top_n=10, group_by="group")),
+        ("agents",            lambda: backend.agents(days=14)),
+        ("compliance",        lambda: backend.compliance(days=14)),
+        ("governance",        lambda: backend.governance(days=14)),
     ]
 
     passed = 0

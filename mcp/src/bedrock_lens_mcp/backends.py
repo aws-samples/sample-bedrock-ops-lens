@@ -19,6 +19,7 @@ class Backend(Protocol):
     def by_user(self, *, days: int, top_n: int, group_by: str) -> dict: ...
     def agents(self, *, days: int) -> dict: ...
     def compliance(self, *, days: int) -> dict: ...
+    def governance(self, *, days: int) -> dict: ...
     def cost_summary(self, *, days: int) -> dict: ...
     def cost_by_account(self, *, days: int) -> dict: ...
     def cost_by_model(self, *, days: int, top_n: int) -> dict: ...
@@ -65,6 +66,9 @@ class HttpBackend:
             "by_policy": self.c.get("/compliance/summary", params={"days": days}),
             "by_guardrail": self.c.get("/compliance/by-guardrail", params={"days": days}),
         }
+
+    def governance(self, *, days: int) -> dict:
+        return self.c.get("/governance/reconciliation", params={"days": days})
 
     # --- cost ---
     def cost_summary(self, *, days: int) -> dict:
@@ -148,6 +152,10 @@ class DirectBackend:
     def compliance(self, *, days: int) -> dict:
         return {"window_days": days,
                 "_note": "Tier A: Guardrails metrics need the deployed pipeline."}
+
+    def governance(self, *, days: int) -> dict:
+        return {"window_days": days,
+                "_note": "Tier A: registry reconciliation needs the deployed pipeline."}
 
     def cost_summary(self, *, days: int) -> dict:
         return direct_collector.cost_summary(days=days)

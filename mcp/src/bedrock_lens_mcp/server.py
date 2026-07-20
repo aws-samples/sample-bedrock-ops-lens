@@ -118,6 +118,18 @@ async def compliance(days: int = 14) -> str:
 
 
 @mcp.tool()
+async def governance(days: int = 14) -> str:
+    """Reconciliation of OBSERVED LLM usage against the DECLARED application
+    registry (db/registry.yaml). Flags undeclared usage (shadow AI), model
+    drift, and declared-but-unused entries. Detective by default.
+
+    Args:
+        days: Lookback window. Default 14, max 30.
+    """
+    days = max(1, min(int(days), 30))
+    return _format(_backend.governance(days=days))
+
+@mcp.tool()
 async def cost_summary(days: int = 30) -> str:
     """Total Amazon Bedrock spend over the window, with daily breakdown.
 
