@@ -580,6 +580,19 @@ SPA_BUCKET="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" --re
 echo "    syncing frontend to s3://$SPA_BUCKET/"
 aws s3 sync "$ROOT/frontend/dist/" "s3://$SPA_BUCKET/" --delete --quiet
 
+# Invalidate CloudFront so the new SPA (hashed asset names + index.html)
+# is served immediately. Without this, users keep getting the cached
+# index.html pointing at the OLD bundle until the TTL expires.
+DASH_DOMAIN="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`DashboardUrl`].OutputValue' --output text | sed 's|https://||')"
+DIST_ID="$(aws cloudfront list-distributions \
+    --query "DistributionList.Items[?DomainName=='$DASH_DOMAIN'].Id" --output text 2>/dev/null || true)"
+if [[ -n "$DIST_ID" && "$DIST_ID" != "None" ]]; then
+    echo "    invalidating CloudFront cache ($DIST_ID)..."
+    aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*" \
+        --query 'Invalidation.Id' --output text >/dev/null || true
+fi
+
 # -----------------------------------------------------------------------------
 # Roll the Backend Lambda alias to the just-deployed image.
 #
