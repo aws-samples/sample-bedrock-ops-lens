@@ -65,10 +65,11 @@ export default function GovernanceTab({ filters, onInfo }) {
               sortingDisabled
             />
             <Box color="text-status-inactive" fontSize="body-s" padding={{ top: 's' }}>
-              Référentiel: db/registry.yaml (versionné git). La même
-              déclaration génère la policy IAM d'enforcement
-              (GET /api/governance/policy/&#123;app_id&#125;) : contrôle
-              préventif et détectif depuis une source unique.
+              Référentiel: db/registry.yaml (versionné git). Gouvernance
+              détective par défaut: on observe et on flagge, aucun blocage
+              a priori. Pour les cas classés à risque élevé (IA Act),
+              l'enforcement IAM est généré en opt-in depuis la même
+              déclaration (GET /api/governance/policy/&#123;app_id&#125;).
             </Box>
           </>
         )}

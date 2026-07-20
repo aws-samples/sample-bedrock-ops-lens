@@ -17,7 +17,7 @@ import asyncpg
 import yaml
 from fastapi import APIRouter, Depends
 
-from ..db import fetch_all
+from .. import db
 from ..filters import FilterSet, parse_filters
 
 router = APIRouter()
@@ -44,7 +44,7 @@ async def _observed(f: FilterSet) -> list[dict]:
     """Observed usage grouped by (app identity, model). Tolerant to the
     table not existing yet (pre-first-ingest stacks)."""
     try:
-        return await fetch_all(
+        rows = await db.fetch(
             """
             SELECT COALESCE(principal_group, principal_arn) AS app,
                    modelId,
@@ -56,6 +56,7 @@ async def _observed(f: FilterSet) -> list[dict]:
             """,
             f.start, f.end,
         )
+        return db.rows_to_dicts(rows)
     except asyncpg.exceptions.UndefinedTableError:
         return []
     except Exception:
@@ -83,11 +84,13 @@ async def governance_registry():
 
 @router.get("/governance/policy/{app_id}")
 async def governance_policy(app_id: str):
-    """Render the IAM identity policy enforcing a registry entry's
-    allowed_models. The registry is not just a detective referential:
-    the same declaration drives PREVENTIVE control (IAM/SCP). In a
-    GitOps flow: PR on registry.yaml = the (minimal) human control,
-    merge = automated provisioning of this policy on the app role."""
+    """OPT-IN enforcement rendering. The governance model is detective by
+    default (observe + flag, no a-priori blocking, minimal human control)
+    to avoid making the registry an access bottleneck. For entries the
+    org classifies as high-risk (AI Act), this endpoint renders the IAM
+    identity policy (+ SCP statement example) enforcing allowed_models —
+    proportionality: freedom by default, enforcement where risk justifies
+    it."""
     entry = next((e for e in _load_registry() if str(e.get("id")) == app_id), None)
     if entry is None:
         return {"error": f"app '{app_id}' not in registry"}
