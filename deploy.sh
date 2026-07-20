@@ -626,14 +626,27 @@ NEW_VERSION="$(aws lambda publish-version \
     --region "$REGION" \
     --query Version --output text 2>/dev/null || true)"
 if [[ -n "$NEW_VERSION" && "$NEW_VERSION" != "None" ]]; then
-    aws lambda update-alias \
-        --function-name "$BACKEND_FN" \
-        --name live \
-        --function-version "$NEW_VERSION" \
-        --routing-config '{}' \
-        --region "$REGION" \
-        --query 'AliasArn' --output text >/dev/null
-    echo "      → alias 'live' now points at version $NEW_VERSION"
+    # UpdateAlias fails transiently with "Invalid alias configuration for
+    # Provisioned Concurrency" while the PC allocation from a previous flip
+    # is still re-warming. Retry with backoff instead of dying.
+    for attempt in 1 2 3 4 5; do
+        if aws lambda update-alias \
+            --function-name "$BACKEND_FN" \
+            --name live \
+            --function-version "$NEW_VERSION" \
+            --routing-config '{}' \
+            --region "$REGION" \
+            --query 'AliasArn' --output text >/dev/null 2>/tmp/alias-err.txt; then
+            echo "      → alias 'live' now points at version $NEW_VERSION"
+            break
+        fi
+        if [[ $attempt -eq 5 ]]; then
+            echo "      ! alias update failed after 5 attempts:"; cat /tmp/alias-err.txt
+            exit 1
+        fi
+        echo "      alias busy (PC re-warm?), retry $attempt/5 in 30s..."
+        sleep 30
+    done
     echo "      (provisioned concurrency takes ~30s to re-warm on the new version)"
 else
     echo "    (no version change; alias 'live' unchanged)"

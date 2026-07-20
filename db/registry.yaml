@@ -1,6 +1,6 @@
 # Declarative AI application registry (governance reference).
 #
-# This file is the "référentiel déclaratif" the observability data is
+# This file is the declarative referential the observability data is
 # reconciled against — the same role as an AI Act registry: each entry is
 # an application/team that DECLARED its LLM usage, with allowed models
 # and a risk classification. Versioned in git so changes are auditable.
@@ -13,18 +13,18 @@
 
 applications:
   - id: bol-demo-team-data
-    name: "Team Data — Extraction de contrats"
+    name: "Team Data - Contract entity extraction"
     owner: "data-lead@example.com"
-    use_case: "Extraction d'entites depuis contrats fournisseurs"
+    use_case: "Entity extraction from supplier contracts"
     ai_act_risk: limited
     status: approved
     allowed_models:
       - "*claude-haiku-4-5*"
 
   - id: bol-demo-team-ml
-    name: "Team ML — Assistant interne"
+    name: "Team ML - Internal assistant"
     owner: "ml-lead@example.com"
-    use_case: "Q&A documentation interne"
+    use_case: "Q&A over internal documentation"
     ai_act_risk: minimal
     status: approved
     allowed_models:
@@ -33,9 +33,9 @@ applications:
 
   # Declared but never used — the "qualifier pour qualifier" case.
   - id: legacy-poc-summarizer
-    name: "POC Resumes reunions (2025)"
+    name: "POC Meeting summarizer (2025)"
     owner: "innovation@example.com"
-    use_case: "Resume automatique de comptes-rendus"
+    use_case: "Automatic meeting minutes summarization"
     ai_act_risk: minimal
     status: declared
     allowed_models:

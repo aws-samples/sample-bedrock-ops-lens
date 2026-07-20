@@ -8,10 +8,10 @@ import { ChartLoading, SectionHeader } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 
 const STATUS_META = {
-  undeclared:      { type: 'error',   label: 'Non déclaré (shadow AI)' },
-  model_drift:     { type: 'warning', label: 'Dérive modèle' },
-  declared_unused: { type: 'pending', label: 'Déclaré, non utilisé' },
-  compliant:       { type: 'success', label: 'Conforme' },
+  undeclared:      { type: 'error',   label: 'Undeclared (shadow AI)' },
+  model_drift:     { type: 'warning', label: 'Model drift' },
+  declared_unused: { type: 'pending', label: 'Declared, unused' },
+  compliant:       { type: 'success', label: 'Compliant' },
 };
 
 function Kpi({ label, value }) {
@@ -33,43 +33,43 @@ export default function GovernanceTab({ filters, onInfo }) {
       <Container header={<SectionHeader title="Registry reconciliation" sectionId="gov-kpi" onInfo={onInfo} />}>
         {recon.loading ? <ChartLoading /> : (
           <ColumnLayout columns={5} variant="text-grid">
-            <Kpi label="Apps déclarées" value={s.declared_apps ?? '—'} />
-            <Kpi label="Apps observées" value={s.observed_apps ?? '—'} />
-            <Kpi label="Usage non déclaré" value={s.undeclared ?? '—'} />
-            <Kpi label="Dérives modèle" value={s.model_drift ?? '—'} />
-            <Kpi label="Déclarées inutilisées" value={s.declared_unused ?? '—'} />
+            <Kpi label="Declared apps" value={s.declared_apps ?? '—'} />
+            <Kpi label="Observed apps" value={s.observed_apps ?? '—'} />
+            <Kpi label="Undeclared usage" value={s.undeclared ?? '—'} />
+            <Kpi label="Model drift" value={s.model_drift ?? '—'} />
+            <Kpi label="Declared unused" value={s.declared_unused ?? '—'} />
           </ColumnLayout>
         )}
       </Container>
 
-      <Container header={<SectionHeader title="Observé vs Déclaré" sectionId="gov-table" onInfo={onInfo} />}>
+      <Container header={<SectionHeader title="Observed vs Declared" sectionId="gov-table" onInfo={onInfo} />}>
         {recon.loading ? <ChartLoading /> : (
           <>
             <PaginatedTable
               items={rows}
               columnDefinitions={[
                 {
-                  id: 'status', header: 'Statut',
+                  id: 'status', header: 'Status',
                   cell: r => {
                     const m = STATUS_META[r.status] || { type: 'info', label: r.status };
                     return <StatusIndicator type={m.type}>{m.label}</StatusIndicator>;
                   },
                 },
-                { id: 'app',   header: 'App / identité', cell: r => r.app },
-                { id: 'name',  header: 'Déclaration',    cell: r => r.declared_name || '—' },
-                { id: 'model', header: 'Modèle observé', cell: r => r.modelId || '—' },
-                { id: 'risk',  header: 'Risque IA Act',  cell: r => r.ai_act_risk || '—' },
+                { id: 'app',   header: 'App / identity', cell: r => r.app },
+                { id: 'name',  header: 'Declaration',    cell: r => r.declared_name || '—' },
+                { id: 'model', header: 'Observed model', cell: r => r.modelId || '—' },
+                { id: 'risk',  header: 'AI Act risk',  cell: r => r.ai_act_risk || '—' },
                 { id: 'inv',   header: 'Invocations',    cell: r => r.invocations || 0 },
               ]}
-              empty="Aucune donnée de réconciliation"
+              empty="No reconciliation data"
               sortingDisabled
             />
             <Box color="text-status-inactive" fontSize="body-s" padding={{ top: 's' }}>
-              Référentiel: db/registry.yaml (versionné git). Gouvernance
-              détective par défaut: on observe et on flagge, aucun blocage
-              a priori. Pour les cas classés à risque élevé (IA Act),
-              l'enforcement IAM est généré en opt-in depuis la même
-              déclaration (GET /api/governance/policy/&#123;app_id&#125;).
+              Referential: db/registry.yaml (git-versioned). Detective
+              governance by default: observe and flag, no a-priori
+              blocking. For entries classified as high risk (EU AI Act),
+              IAM enforcement is rendered opt-in from the same declaration
+              (GET /api/governance/policy/&#123;app_id&#125;).
             </Box>
           </>
         )}
