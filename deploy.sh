@@ -617,6 +617,7 @@ if [[ -n "$NEW_VERSION" && "$NEW_VERSION" != "None" ]]; then
         --function-name "$BACKEND_FN" \
         --name live \
         --function-version "$NEW_VERSION" \
+        --routing-config '{}' \
         --region "$REGION" \
         --query 'AliasArn' --output text >/dev/null
     echo "      → alias 'live' now points at version $NEW_VERSION"
