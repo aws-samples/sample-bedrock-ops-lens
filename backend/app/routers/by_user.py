@@ -20,28 +20,43 @@ from ..filters import FilterSet, build_where, parse_filters
 router = APIRouter()
 
 
+GROUP_BY_COL = {
+    "principal": "principal_arn",      # full identity (role/session)
+    "group":     "principal_group",    # role = team / app / workload
+    "user":      "principal_user",     # session = individual caller
+}
+
+
 @router.get("/by-user/summary")
 async def by_user_summary(
     f: FilterSet = Depends(parse_filters),
     top_n: int = Query(25, ge=1, le=200),
+    group_by: str = Query("principal", pattern="^(principal|group|user)$"),
 ):
-    """Top principals by requests in the window, with token totals and the
-    number of distinct models each principal used."""
+    """Top callers by requests in the window.
+
+    group_by axes:
+      principal — full identity (default; role/session)
+      group     — the assumed role: team / app / workload level
+      user      — the session name: individual caller (SSO login)
+    """
+    col = GROUP_BY_COL[group_by]
     w = build_where(f, has_traffic_type=False)
     rows = await db.fetch(
         f"""
         SELECT
-          principal_arn,
+          {col}                                      AS caller,
           MAX(principal_label)                       AS principal_label,
           SUM(total_requests)::BIGINT                AS total_requests,
           SUM(failed_requests)::BIGINT               AS failed_requests,
           SUM(total_input_tokens)::BIGINT            AS input_tokens,
           SUM(total_output_tokens)::BIGINT           AS output_tokens,
           COUNT(DISTINCT modelId)::BIGINT            AS distinct_models,
-          COUNT(DISTINCT accountId)::BIGINT          AS distinct_accounts
+          COUNT(DISTINCT accountId)::BIGINT          AS distinct_accounts,
+          COUNT(DISTINCT principal_arn)::BIGINT      AS distinct_principals
         FROM f_daily_by_identity
         WHERE {w.sql}
-        GROUP BY principal_arn
+        GROUP BY {col}
         ORDER BY total_requests DESC
         LIMIT {int(top_n)}
         """,

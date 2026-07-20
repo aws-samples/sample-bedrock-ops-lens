@@ -16,7 +16,7 @@ class Backend(Protocol):
 
     def health(self) -> dict: ...
     def overview_summary(self, *, days: int) -> dict: ...
-    def by_user(self, *, days: int, top_n: int) -> dict: ...
+    def by_user(self, *, days: int, top_n: int, group_by: str) -> dict: ...
     def cost_summary(self, *, days: int) -> dict: ...
     def cost_by_account(self, *, days: int) -> dict: ...
     def cost_by_model(self, *, days: int, top_n: int) -> dict: ...
@@ -45,9 +45,9 @@ class HttpBackend:
     def overview_summary(self, *, days: int) -> dict:
         return self.c.get("/summary", params={"days": days})
 
-    def by_user(self, *, days: int, top_n: int) -> dict:
+    def by_user(self, *, days: int, top_n: int, group_by: str = "group") -> dict:
         return {
-            "summary": self.c.get("/by-user/summary", params={"days": days, "top_n": top_n}),
+            "summary": self.c.get("/by-user/summary", params={"days": days, "top_n": top_n, "group_by": group_by}),
             "by_model": self.c.get("/by-user/by-model", params={"days": days}),
         }
 
@@ -115,7 +115,7 @@ class DirectBackend:
     def overview_summary(self, *, days: int) -> dict:
         return direct_collector.overview_summary(days=days)
 
-    def by_user(self, *, days: int, top_n: int) -> dict:
+    def by_user(self, *, days: int, top_n: int, group_by: str = "group") -> dict:
         return {
             "window_days": days,
             "_note": (

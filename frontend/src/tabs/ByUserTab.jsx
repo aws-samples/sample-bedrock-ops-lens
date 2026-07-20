@@ -1,9 +1,9 @@
 // By User tab — per IAM caller identity attribution.
 // Data comes from Bedrock invocation logs (identity.arn), captured
 // automatically on every call: no tagging discipline required.
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
-  Container, SpaceBetween, BarChart, Box,
+  Container, SpaceBetween, BarChart, Box, SegmentedControl,
 } from '@cloudscape-design/components';
 import { useApi, fmt } from '../api.js';
 import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
@@ -23,23 +23,40 @@ function labelShort(label, max = 42) {
 }
 
 export default function ByUserTab({ filters, onInfo }) {
-  const summary = useApi('/by-user/summary', filters, [JSON.stringify(filters)]);
+  // Axis: 'group' = role (app / team / workload), 'user' = session
+  // (individual, SSO login), 'principal' = full role/session identity.
+  const [axis, setAxis] = useState('group');
+  const summaryParams = useMemo(() => ({ ...filters, group_by: axis }), [filters, axis]);
+  const summary = useApi('/by-user/summary', summaryParams, [JSON.stringify(summaryParams)]);
   const byModel = useApi('/by-user/by-model', filters, [JSON.stringify(filters)]);
 
   const chartSeries = useMemo(() => {
     const data = (summary.data || []).slice(0, 10);
     return [
-      { title: 'Requests', type: 'bar', data: data.map(r => ({ x: labelShort(r.principal_label || r.principal_arn), y: Number(r.total_requests || 0) })) },
+      { title: 'Requests', type: 'bar', data: data.map(r => ({ x: labelShort(r.caller || r.principal_label), y: Number(r.total_requests || 0) })) },
     ];
   }, [summary.data]);
+
+  const axisLabel = axis === 'group' ? 'App / team (role)' : axis === 'user' ? 'User (session)' : 'Principal';
 
   return (
     <SpaceBetween size="l">
       <Container header={
         <SectionHeader
-          title="Top callers by requests"
+          title={`Top callers by requests — ${axisLabel}`}
           sectionId="by-user-chart"
           onInfo={onInfo}
+          actions={
+            <SegmentedControl
+              selectedId={axis}
+              onChange={({ detail }) => setAxis(detail.selectedId)}
+              options={[
+                { id: 'group',     text: 'App / Group' },
+                { id: 'user',      text: 'User' },
+                { id: 'principal', text: 'Principal' },
+              ]}
+            />
+          }
         />
       }>
         {summary.loading ? <ChartLoading height={300} /> :
@@ -67,13 +84,13 @@ export default function ByUserTab({ filters, onInfo }) {
           <PaginatedTable
             items={summary.data || []}
             columnDefinitions={[
-              { id: 'label', header: 'Caller',          cell: r => r.principal_label || r.principal_arn },
+              { id: 'label', header: 'Caller',          cell: r => r.caller || r.principal_label },
               { id: 'req',   header: 'Requests',        cell: r => fmt(r.total_requests) },
               { id: 'fail',  header: 'Failed',          cell: r => fmt(r.failed_requests) },
               { id: 'in',    header: 'Input tokens',    cell: r => fmt(r.input_tokens) },
               { id: 'out',   header: 'Output tokens',   cell: r => fmt(r.output_tokens) },
               { id: 'nm',    header: 'Models',          cell: r => fmt(r.distinct_models) },
-              { id: 'arn',   header: 'Principal ARN',   cell: r => r.principal_arn },
+              { id: 'np',    header: 'Principals',      cell: r => fmt(r.distinct_principals) },
             ]}
             empty="No caller-identity data"
             sortingDisabled

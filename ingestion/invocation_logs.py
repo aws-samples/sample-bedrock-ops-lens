@@ -151,26 +151,32 @@ def _http_status_from_log(entry: dict) -> int:
     )
 
 
-def _principal_label(arn: str) -> str:
-    """Human-readable label for an IAM principal ARN.
+def _principal_parts(arn: str) -> tuple[str, str, str]:
+    """(label, group_name, user_name) for an IAM principal ARN.
 
-    assumed-role/<role>/<session> → "<role>/<session>"  (session carries the
-    human login for SSO principals; role carries the workload/team).
-    user/<name>                   → "<name>"
-    anything else                 → last ARN segment.
+    assumed-role/<role>/<session> → ("<role>/<session>", role, session)
+      role  = the workload / team / app (e.g. an app's service role, an SSO
+              permission-set role) → "group" axis
+      session = the individual caller (SSO login, tool session) → "user" axis
+    user/<name>                   → ("<name>", "<name>", "<name>")
+    anything else                 → (tail, tail, tail)
     """
     if not arn:
-        return "unknown"
+        return ("unknown", "unknown", "unknown")
     try:
-        tail = arn.split(":", 5)[5]          # e.g. assumed-role/X/Y or user/X
+        tail = arn.split(":", 5)[5]
     except IndexError:
-        return arn
+        return (arn, arn, arn)
     parts = tail.split("/")
     if parts[0] == "assumed-role" and len(parts) >= 3:
-        return f"{parts[1]}/{parts[2]}"
+        return (f"{parts[1]}/{parts[2]}", parts[1], parts[2])
     if parts[0] in ("user", "role") and len(parts) >= 2:
-        return parts[-1]
-    return tail
+        return (parts[-1], parts[-1], parts[-1])
+    return (tail, tail, tail)
+
+
+def _principal_label(arn: str) -> str:
+    return _principal_parts(arn)[0]
 
 
 def _parse_log_entry(entry: dict) -> tuple[date, int, str, str, str, str, dict, int, int, int, str]:
@@ -223,6 +229,8 @@ async def _ensure_identity_table(conn: asyncpg.Connection) -> None:
             region              TEXT NOT NULL,
             principal_arn       TEXT NOT NULL,
             principal_label     TEXT NOT NULL DEFAULT '',
+            principal_group     TEXT NOT NULL DEFAULT '',
+            principal_user      TEXT NOT NULL DEFAULT '',
             total_requests      BIGINT NOT NULL DEFAULT 0,
             failed_requests     BIGINT NOT NULL DEFAULT 0,
             total_input_tokens  BIGINT NOT NULL DEFAULT 0,
@@ -232,6 +240,9 @@ async def _ensure_identity_table(conn: asyncpg.Connection) -> None:
     """)
     await conn.execute("CREATE INDEX IF NOT EXISTS ix_f_daily_identity_arn   ON f_daily_by_identity (principal_arn, event_date)")
     await conn.execute("CREATE INDEX IF NOT EXISTS ix_f_daily_identity_label ON f_daily_by_identity (principal_label, event_date)")
+    # Idempotent migration for tables created before group/user split.
+    await conn.execute("ALTER TABLE f_daily_by_identity ADD COLUMN IF NOT EXISTS principal_group TEXT NOT NULL DEFAULT ''")
+    await conn.execute("ALTER TABLE f_daily_by_identity ADD COLUMN IF NOT EXISTS principal_user  TEXT NOT NULL DEFAULT ''")
 
 
 async def main() -> int:
@@ -360,8 +371,9 @@ async def main() -> int:
                 if identity_buckets:
                     id_rows = []
                     for (d, a, mid, r, parn), m in identity_buckets.items():
+                        lbl, grp, usr = _principal_parts(parn)
                         id_rows.append((
-                            d, a, mid, r, parn, _principal_label(parn),
+                            d, a, mid, r, parn, lbl, grp, usr,
                             m["total_requests"], m["failed_requests"],
                             m["total_input_tokens"], m["total_output_tokens"],
                         ))
@@ -370,12 +382,15 @@ async def main() -> int:
                         INSERT INTO f_daily_by_identity (
                             event_date, accountId, modelId, region,
                             principal_arn, principal_label,
+                            principal_group, principal_user,
                             total_requests, failed_requests,
                             total_input_tokens, total_output_tokens
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                         ON CONFLICT (event_date, accountId, modelId, region, principal_arn)
                         DO UPDATE SET
                             principal_label = EXCLUDED.principal_label,
+                            principal_group = EXCLUDED.principal_group,
+                            principal_user  = EXCLUDED.principal_user,
                             total_requests = f_daily_by_identity.total_requests + EXCLUDED.total_requests,
                             failed_requests = f_daily_by_identity.failed_requests + EXCLUDED.failed_requests,
                             total_input_tokens = f_daily_by_identity.total_input_tokens + EXCLUDED.total_input_tokens,

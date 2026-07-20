@@ -72,19 +72,22 @@ async def overview_summary(days: int = 14) -> str:
 
 
 @mcp.tool()
-async def by_user(days: int = 14, top_n: int = 25) -> str:
+async def by_user(days: int = 14, top_n: int = 25, group_by: str = "group") -> str:
     """Who is calling Bedrock: per IAM caller identity (identity.arn from
-    invocation logs). Returns top callers with requests/tokens and the
-    caller × model split. Captured automatically on every invocation —
-    works even when teams don't tag their requests.
+    invocation logs). Captured automatically on every invocation — works
+    even when teams don't tag their requests.
 
     Args:
         days: Lookback window. Default 14, max 30.
         top_n: Max callers returned. Default 25.
+        group_by: 'group' (role = app/team/workload), 'user' (session =
+            individual caller, SSO login), or 'principal' (full identity).
     """
     days = max(1, min(int(days), 30))
     top_n = max(1, min(int(top_n), 200))
-    return _format(_backend.by_user(days=days, top_n=top_n))
+    if group_by not in ("group", "user", "principal"):
+        group_by = "group"
+    return _format(_backend.by_user(days=days, top_n=top_n, group_by=group_by))
 
 
 @mcp.tool()

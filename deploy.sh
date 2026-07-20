@@ -597,6 +597,16 @@ aws s3 sync "$ROOT/frontend/dist/" "s3://$SPA_BUCKET/" --delete --quiet
 # -----------------------------------------------------------------------------
 BACKEND_FN="${MAIN_STACK}-backend"
 echo "    publishing new Backend Lambda version + rolling 'live' alias..."
+# Same staleness problem as the ingester below: CFN resolved ":latest" to a
+# digest at create time and won't re-pull on a code-only redeploy. Refresh
+# $LATEST explicitly BEFORE publish-version, otherwise the published version
+# freezes the OLD image.
+aws lambda update-function-code \
+    --function-name "$BACKEND_FN" \
+    --image-uri "$ECR_URI:latest" \
+    --region "$REGION" \
+    --query 'CodeSha256' --output text >/dev/null 2>&1 || true
+aws lambda wait function-updated --function-name "$BACKEND_FN" --region "$REGION" 2>/dev/null || true
 NEW_VERSION="$(aws lambda publish-version \
     --function-name "$BACKEND_FN" \
     --description "Auto-published by deploy.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)" \

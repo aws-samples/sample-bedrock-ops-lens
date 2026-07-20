@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS f_daily_by_identity (
     region              TEXT NOT NULL,
     principal_arn       TEXT NOT NULL,
     principal_label     TEXT NOT NULL DEFAULT '',
+    principal_group     TEXT NOT NULL DEFAULT '',   -- role = team / app / workload
+    principal_user      TEXT NOT NULL DEFAULT '',   -- session = individual (SSO login)
     total_requests      BIGINT NOT NULL DEFAULT 0,
     failed_requests     BIGINT NOT NULL DEFAULT 0,
     total_input_tokens  BIGINT NOT NULL DEFAULT 0,
