@@ -24,8 +24,10 @@ router = APIRouter()
 
 _REGISTRY_PATHS = [
     Path(os.environ.get("REGISTRY_PATH", "")),
-    Path("/app/db/registry.yaml"),
-    Path(__file__).resolve().parents[3] / "db" / "registry.yaml",
+    Path("/var/task/db/registry.yaml"),   # Lambda image layout
+    Path("/app/db/registry.yaml"),        # generic container layout
+    Path(__file__).resolve().parents[3] / "db" / "registry.yaml",  # local dev
+    Path(__file__).resolve().parents[2] / "db" / "registry.yaml",  # image layout fallback
 ]
 
 
@@ -46,10 +48,10 @@ async def _observed(f: FilterSet) -> list[dict]:
     try:
         rows = await db.fetch(
             """
-            SELECT COALESCE(principal_group, principal_arn) AS app,
+            SELECT COALESCE(NULLIF(principal_group, ''), principal_arn) AS app,
                    modelId,
-                   SUM(invocations)::BIGINT   AS invocations,
-                   SUM(input_tokens + output_tokens)::BIGINT AS tokens
+                   SUM(total_requests)::BIGINT AS invocations,
+                   SUM(total_input_tokens + total_output_tokens)::BIGINT AS tokens
             FROM f_daily_by_identity
             WHERE event_date BETWEEN $1::date AND $2::date
             GROUP BY 1, 2
@@ -58,8 +60,6 @@ async def _observed(f: FilterSet) -> list[dict]:
         )
         return db.rows_to_dicts(rows)
     except asyncpg.exceptions.UndefinedTableError:
-        return []
-    except Exception:
         return []
 
 
