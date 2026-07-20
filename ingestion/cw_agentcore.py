@@ -50,15 +50,6 @@ LATENCY_RE = re.compile(r"latency|duration|time", re.IGNORECASE)
 COUNT_STATS = ["Sum"]
 LATENCY_STATS = ["Average", "p50", "p99"]
 
-# Dimensions that identify the resource, in priority order per type.
-RESOURCE_DIM_CANDIDATES = [
-    ("runtime", ["AgentRuntimeId", "AgentRuntimeArn", "RuntimeId", "AgentId"]),
-    ("gateway", ["GatewayId", "GatewayIdentifier", "Resource"]),
-    ("memory",  ["MemoryId"]),
-    ("tool",    ["Name", "ToolName", "TargetType"]),
-]
-
-
 def _cw_client(region: str, session: boto3.Session | None = None):
     s = session or boto3._get_default_session()
     return s.client("cloudwatch", region_name=region,
@@ -87,13 +78,23 @@ async def _ensure_agentcore_table(conn: asyncpg.Connection) -> None:
 
 
 def _classify(dims: dict) -> tuple[str, str]:
-    """(resource_type, resource_id) from a metric's dimension set."""
-    for rtype, keys in RESOURCE_DIM_CANDIDATES:
-        for k in keys:
-            if k in dims:
-                return rtype, dims[k]
+    """(resource_type, resource_id) from a metric's dimension set.
+
+    ARN values identify the resource directly — dimension NAMES vary
+    (Resource/Service/Name all may carry the ARN), so classify by value.
+    """
+    for v in dims.values():
+        for marker, rtype in ((":runtime/", "runtime"),
+                              (":gateway/", "gateway"),
+                              (":memory/", "memory")):
+            if marker in v:
+                return rtype, v.split(marker, 1)[1]
+    if dims.get("TargetType"):
+        return "tool", dims.get("Name", dims["TargetType"])
+    for k in ("Operation", "AggregateOperation", "ItemType"):
+        if k in dims:
+            return "operation", dims[k]
     if dims:
-        # Unknown dimension set — keep it visible rather than dropping it.
         k = sorted(dims.keys())[0]
         return "other", f"{k}={dims[k]}"
     return "account", "__all__"
@@ -136,6 +137,13 @@ def _get_metric_data(cw, queries: list[dict], start: datetime, end: datetime) ->
 async def _ingest_target(conn: asyncpg.Connection, account: str, region: str,
                           session, start: datetime, end: datetime) -> int:
     cw = _cw_client(region, session)
+    # Wipe-and-reload the window for this (account, region): the REPLACE
+    # semantics re-read the whole window anyway, and this self-heals rows
+    # whose classification changed between versions (same precedent as
+    # cw_metrics' f_hourly_errors full reload).
+    await conn.execute(
+        "DELETE FROM f_daily_agentcore WHERE accountId=$1 AND region=$2 AND event_date >= $3",
+        account, region, start.date())
     rows_total = 0
     for namespace in NAMESPACES:
         combos = _discover(cw, namespace)

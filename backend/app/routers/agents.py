@@ -32,13 +32,13 @@ async def agents_summary(f: FilterSet = Depends(parse_filters)):
         f"""
         SELECT resource_type, resource_id,
           SUM(value) FILTER (WHERE metric_name = 'Invocations'   AND stat = 'sum')::BIGINT AS invocations,
-          SUM(value) FILTER (WHERE metric_name = 'SessionCount'  AND stat = 'sum')::BIGINT AS sessions,
-          SUM(value) FILTER (WHERE metric_name IN ('SystemErrors','UserErrors','TotalErrors') AND stat = 'sum')::BIGINT AS errors,
+          SUM(value) FILTER (WHERE metric_name IN ('SessionCount','ActiveSessionCount') AND stat = 'sum')::BIGINT AS sessions,
+          SUM(value) FILTER (WHERE metric_name IN ('SystemErrors','UserErrors','TotalErrors','Errors') AND stat = 'sum')::BIGINT AS errors,
           SUM(value) FILTER (WHERE metric_name = 'Throttles'     AND stat = 'sum')::BIGINT AS throttles,
-          MAX(value) FILTER (WHERE metric_name = 'Latency'       AND stat = 'p99') AS p99_latency_ms,
-          AVG(value) FILTER (WHERE metric_name = 'Latency'       AND stat = 'average') AS avg_latency_ms
+          MAX(value) FILTER (WHERE metric_name IN ('Latency','Duration') AND stat = 'p99') AS p99_latency_ms,
+          AVG(value) FILTER (WHERE metric_name IN ('Latency','Duration') AND stat = 'average') AS avg_latency_ms
         FROM f_daily_agentcore
-        WHERE {w.sql} AND resource_type IN ('runtime', 'account', 'other')
+        WHERE {w.sql} AND resource_type IN ('runtime', 'account')
         GROUP BY resource_type, resource_id
         ORDER BY invocations DESC NULLS LAST
         """,
