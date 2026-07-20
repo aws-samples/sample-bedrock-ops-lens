@@ -35,6 +35,8 @@ import CostTab from './tabs/CostTab.jsx';
 import ModelLifecycleTab from './tabs/ModelLifecycleTab.jsx';
 import ModelInsightsTab from './tabs/ModelInsightsTab.jsx';
 import ByUserTab from './tabs/ByUserTab.jsx';
+import AgentsTab from './tabs/AgentsTab.jsx';
+import ComplianceTab from './tabs/ComplianceTab.jsx';
 import SettingsView from './views/SettingsView.jsx';
 
 /* --- Theme management ------------------------------------------------- */
@@ -406,6 +408,8 @@ const NAV_ITEMS_DASHBOARD = [
     },
     navItem('Health & Errors',     '#/errors',     'bug'),
     navItem('By User',             '#/by-user',    'user-profile'),
+    navItem('Agents & MCP',        '#/agents',     'gen-ai'),
+    navItem('Compliance',          '#/compliance', 'security'),
     // `status-pending` is the closest Cloudscape glyph to a stopwatch /
     // timer — fits "Latency" semantically. The originally proposed
     // `caret-up-down` doesn't exist in Cloudscape's icon library and
@@ -644,6 +648,8 @@ function AppShell() {
                 {viewBody('cost',       <CostTab         filters={filters} onInfo={onInfo} />)}
                 {viewBody('errors',     <ErrorsTab       filters={filters} onInfo={onInfo} />)}
                 {viewBody('by-user',    <ByUserTab       filters={filters} onInfo={onInfo} />)}
+                {viewBody('agents',     <AgentsTab       filters={filters} onInfo={onInfo} />)}
+                {viewBody('compliance', <ComplianceTab   filters={filters} onInfo={onInfo} />)}
                 {viewBody('latency',    <LatencyTab      filters={filters} onInfo={onInfo} />)}
                 {viewBody('ops',        <OpsInsightsTab     filters={filters} onInfo={onInfo} />)}
                 {viewBody('insights',   <ModelInsightsTab   filters={filters} onInfo={onInfo} />)}

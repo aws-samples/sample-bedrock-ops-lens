@@ -17,6 +17,8 @@ class Backend(Protocol):
     def health(self) -> dict: ...
     def overview_summary(self, *, days: int) -> dict: ...
     def by_user(self, *, days: int, top_n: int, group_by: str) -> dict: ...
+    def agents(self, *, days: int) -> dict: ...
+    def compliance(self, *, days: int) -> dict: ...
     def cost_summary(self, *, days: int) -> dict: ...
     def cost_by_account(self, *, days: int) -> dict: ...
     def cost_by_model(self, *, days: int, top_n: int) -> dict: ...
@@ -49,6 +51,19 @@ class HttpBackend:
         return {
             "summary": self.c.get("/by-user/summary", params={"days": days, "top_n": top_n, "group_by": group_by}),
             "by_model": self.c.get("/by-user/by-model", params={"days": days}),
+        }
+
+    def agents(self, *, days: int) -> dict:
+        return {
+            "agents": self.c.get("/agents/summary", params={"days": days}),
+            "gateway_tools": self.c.get("/agents/gateway-tools", params={"days": days}),
+        }
+
+    def compliance(self, *, days: int) -> dict:
+        return {
+            "totals": self.c.get("/compliance/totals", params={"days": days}),
+            "by_policy": self.c.get("/compliance/summary", params={"days": days}),
+            "by_guardrail": self.c.get("/compliance/by-guardrail", params={"days": days}),
         }
 
     # --- cost ---
@@ -125,6 +140,14 @@ class DirectBackend:
                 "(Tier B) or query the invocation-logs bucket directly."
             ),
         }
+
+    def agents(self, *, days: int) -> dict:
+        return {"window_days": days,
+                "_note": "Tier A: AgentCore metrics need the deployed pipeline (CloudWatch history + Aurora)."}
+
+    def compliance(self, *, days: int) -> dict:
+        return {"window_days": days,
+                "_note": "Tier A: Guardrails metrics need the deployed pipeline."}
 
     def cost_summary(self, *, days: int) -> dict:
         return direct_collector.cost_summary(days=days)

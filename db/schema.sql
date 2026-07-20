@@ -153,6 +153,52 @@ CREATE INDEX IF NOT EXISTS ix_f_daily_identity_arn   ON f_daily_by_identity (pri
 CREATE INDEX IF NOT EXISTS ix_f_daily_identity_label ON f_daily_by_identity (principal_label, event_date);
 
 -- ----------------------------------------------------------------------------
+-- f_daily_guardrails — Guardrails intervention metrics (Compliance tab).
+-- Source: CloudWatch namespace AWS/Bedrock/Guardrails (cw_guardrails.py).
+-- '__all__' = grain without that dimension (PolicyType is only published
+-- for InvocationsIntervened/TextUnitCount). REPLACE semantics.
+-- Ingester also self-creates this table (_ensure_guardrails_table) —
+-- both DDLs MUST stay identical.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_daily_guardrails (
+    event_date        DATE NOT NULL,
+    accountId         TEXT NOT NULL,
+    region            TEXT NOT NULL,
+    guardrail_arn     TEXT NOT NULL,
+    guardrail_version TEXT NOT NULL DEFAULT '',
+    policy_type       TEXT NOT NULL DEFAULT '__all__',
+    content_source    TEXT NOT NULL DEFAULT '__all__',
+    invocations       BIGINT NOT NULL DEFAULT 0,
+    intervened        BIGINT NOT NULL DEFAULT 0,
+    text_units        BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (event_date, accountId, region, guardrail_arn,
+                 guardrail_version, policy_type, content_source)
+);
+
+-- ----------------------------------------------------------------------------
+-- f_daily_agentcore — AgentCore observability metrics (Agents & MCP tab).
+-- Source: CloudWatch namespaces AWS/Bedrock-AgentCore + bedrock-agentcore
+-- (cw_agentcore.py). Generic metric-per-row: the AgentCore metric set moves
+-- fast; avoids an ALTER per new metric. REPLACE semantics.
+-- Ingester also self-creates this table (_ensure_agentcore_table).
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_daily_agentcore (
+    event_date      DATE NOT NULL,
+    accountId       TEXT NOT NULL,
+    region          TEXT NOT NULL,
+    namespace       TEXT NOT NULL,
+    resource_type   TEXT NOT NULL,
+    resource_id     TEXT NOT NULL,
+    metric_name     TEXT NOT NULL,
+    stat            TEXT NOT NULL,
+    value           DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (event_date, accountId, region, namespace,
+                 resource_type, resource_id, metric_name, stat)
+);
+
+CREATE INDEX IF NOT EXISTS ix_f_daily_agentcore_res ON f_daily_agentcore (resource_type, resource_id, event_date);
+
+-- ----------------------------------------------------------------------------
 -- f_hourly_peak — hourly aggregate at (account, model, region) for peak RPM/TPM.
 -- Used by Ops Insights for max-over-hour math. Smaller than full-dim hourly.
 -- ----------------------------------------------------------------------------

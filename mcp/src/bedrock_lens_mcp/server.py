@@ -91,6 +91,33 @@ async def by_user(days: int = 14, top_n: int = 25, group_by: str = "group") -> s
 
 
 @mcp.tool()
+async def agents(days: int = 14) -> str:
+    """AgentCore agents & MCP tools observability: per-agent invocations,
+    sessions, errors, latency, and per-tool Gateway call counts.
+    Only covers agents on AgentCore (Runtime/Gateway); agents calling
+    Bedrock directly appear in by_user instead.
+
+    Args:
+        days: Lookback window. Default 14, max 30.
+    """
+    days = max(1, min(int(days), 30))
+    return _format(_backend.agents(days=days))
+
+
+@mcp.tool()
+async def compliance(days: int = 14) -> str:
+    """Guardrails compliance: interventions by policy type (PII, denied
+    topics, content filters, grounding), per-guardrail counts, and
+    intervention rate.
+
+    Args:
+        days: Lookback window. Default 14, max 30.
+    """
+    days = max(1, min(int(days), 30))
+    return _format(_backend.compliance(days=days))
+
+
+@mcp.tool()
 async def cost_summary(days: int = 30) -> str:
     """Total Amazon Bedrock spend over the window, with daily breakdown.
 
