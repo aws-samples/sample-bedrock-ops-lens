@@ -66,6 +66,28 @@ async def agents_gateway_tools(f: FilterSet = Depends(parse_filters)):
     )
 
 
+@router.get("/agents/real-cost")
+async def agents_real_cost(f: FilterSet = Depends(parse_filters)):
+    """REAL billed dollars for AgentCore, by usage-type line item (Cost
+    Explorer, not an estimation). Account-level: a per-agent split of real
+    dollars requires cost allocation tags activated at the management
+    account (billing-side, not dashboard-side)."""
+    return await _safe_fetch(
+        """
+        SELECT usage_type,
+               SUM(total_cost)::DOUBLE PRECISION AS total_cost,
+               SUM(usage_qty)::DOUBLE PRECISION  AS usage_qty
+        FROM f_daily_cost_usage_type
+        WHERE event_date BETWEEN $1::date AND $2::date
+          AND service = 'Amazon Bedrock AgentCore'
+        GROUP BY usage_type
+        HAVING SUM(total_cost) > 0
+        ORDER BY total_cost DESC
+        """,
+        f.start, f.end,
+    )
+
+
 @router.get("/agents/metrics-inventory")
 async def agents_metrics_inventory(f: FilterSet = Depends(parse_filters)):
     """Diagnostic: which AgentCore metrics/namespaces were discovered.

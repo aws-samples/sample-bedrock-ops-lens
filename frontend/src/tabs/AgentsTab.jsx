@@ -9,9 +9,15 @@ import PaginatedTable from '../components/PaginatedTable.jsx';
 export default function AgentsTab({ filters, onInfo }) {
   const summary = useApi('/agents/summary', filters, [JSON.stringify(filters)]);
   const tools = useApi('/agents/gateway-tools', filters, [JSON.stringify(filters)]);
+  const realCost = useApi('/agents/real-cost', filters, [JSON.stringify(filters)]);
 
   const emptyAgents = !summary.loading && (summary.data || []).length === 0;
   const emptyTools = !tools.loading && (tools.data || []).length === 0;
+
+  function usageTypeShort(u) {
+    // "USE1-Runtime:Consumption-based:vCPU" → "Runtime vCPU"
+    return (u || '').replace(/^[A-Z0-9]+-/, '').replace(/:Consumption-based/, '').replace(/:/g, ' ');
+  }
 
   return (
     <SpaceBetween size="l">
@@ -38,6 +44,33 @@ export default function AgentsTab({ filters, onInfo }) {
             empty="No agent activity"
             sortingDisabled
           />
+        )}
+      </Container>
+
+      <Container header={<SectionHeader title="Billed cost (Cost Explorer, real)" sectionId="agents-cost" onInfo={onInfo} />}>
+        {realCost.loading ? <ChartLoading /> : (realCost.data || []).length === 0 ? (
+          <Box textAlign="center" color="text-status-inactive" padding="l">
+            No billed AgentCore cost in this window (Cost Explorer has a
+            24-48h lag).
+          </Box>
+        ) : (
+          <>
+            <PaginatedTable
+              items={realCost.data || []}
+              columnDefinitions={[
+                { id: 'ut',  header: 'Billed line item', cell: r => usageTypeShort(r.usage_type) },
+                { id: 'c',   header: 'Cost (USD)',       cell: r => '$' + Number(r.total_cost || 0).toFixed(2) },
+                { id: 'q',   header: 'Usage qty',        cell: r => Number(r.usage_qty || 0).toFixed(2) },
+              ]}
+              empty="No billed cost"
+              sortingDisabled
+            />
+            <Box color="text-status-inactive" fontSize="body-s" padding={{ top: 's' }}>
+              Real billed dollars from Cost Explorer, at account level. A
+              per-agent split of real dollars requires cost allocation tags
+              activated at the management (payer) account.
+            </Box>
+          </>
         )}
       </Container>
 

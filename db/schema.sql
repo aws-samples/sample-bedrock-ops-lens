@@ -199,6 +199,22 @@ CREATE TABLE IF NOT EXISTS f_daily_agentcore (
 CREATE INDEX IF NOT EXISTS ix_f_daily_agentcore_res ON f_daily_agentcore (resource_type, resource_id, event_date);
 
 -- ----------------------------------------------------------------------------
+-- f_daily_cost_usage_type — REAL billed dollars per usage-type line item
+-- (Cost Explorer, second grouping pass in ingestion/cost.py). Motivation:
+-- composite services (AgentCore) hide the Runtime/Memory/Browser split at
+-- the SERVICE level. No estimation — these are billed line items.
+-- Ingester self-creates this table too.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_daily_cost_usage_type (
+    event_date  DATE NOT NULL,
+    service     TEXT NOT NULL,
+    usage_type  TEXT NOT NULL,
+    total_cost  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    usage_qty   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (event_date, service, usage_type)
+);
+
+-- ----------------------------------------------------------------------------
 -- f_hourly_peak — hourly aggregate at (account, model, region) for peak RPM/TPM.
 -- Used by Ops Insights for max-over-hour math. Smaller than full-dim hourly.
 -- ----------------------------------------------------------------------------

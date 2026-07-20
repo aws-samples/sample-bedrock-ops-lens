@@ -185,6 +185,81 @@ def _fetch_cost(
     return rows
 
 
+def _fetch_cost_by_usage_type(
+    ce,
+    start: date,
+    end: date,
+    service_filter: list[str],
+    only_accounts: list[str] | None = None,
+) -> list[dict]:
+    """Second pass: real billed dollars per (account, service, USAGE_TYPE).
+
+    Motivation: for composite services like Amazon Bedrock AgentCore, the
+    SERVICE-level number hides the split (Runtime vCPU vs Memory vs
+    BrowserTool vs Evaluations...). The usage type IS the billed line item
+    — no estimation, straight from Cost Explorer.
+    """
+    if not service_filter:
+        return []
+    flt = {"Dimensions": {"Key": "SERVICE", "Values": service_filter,
+                          "MatchOptions": ["EQUALS"]}}
+    if only_accounts:
+        flt = {"And": [flt, {"Dimensions": {"Key": "LINKED_ACCOUNT",
+                                             "Values": only_accounts,
+                                             "MatchOptions": ["EQUALS"]}}]}
+    rows: list[dict] = []
+    next_token = None
+    while True:
+        kwargs = dict(
+            TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+            Granularity="DAILY",
+            Metrics=["UnblendedCost", "UsageQuantity"],
+            GroupBy=[
+                {"Type": "DIMENSION", "Key": "SERVICE"},
+                {"Type": "DIMENSION", "Key": "USAGE_TYPE"},
+            ],
+            Filter=flt,
+        )
+        if next_token:
+            kwargs["NextPageToken"] = next_token
+        resp = ce.get_cost_and_usage(**kwargs)
+        for period in resp.get("ResultsByTime", []) or []:
+            d = date.fromisoformat(period["TimePeriod"]["Start"])
+            for grp in period.get("Groups", []) or []:
+                keys = grp.get("Keys", []) or []
+                if len(keys) < 2:
+                    continue
+                svc, usage_type = keys[0], keys[1]
+                m = grp.get("Metrics") or {}
+                amt = float((m.get("UnblendedCost") or {}).get("Amount") or 0)
+                qty = float((m.get("UsageQuantity") or {}).get("Amount") or 0)
+                if amt <= 0:
+                    continue
+                rows.append({
+                    "event_date": d, "service": svc, "usage_type": usage_type,
+                    "total_cost": amt, "usage_qty": qty,
+                })
+        next_token = resp.get("NextPageToken")
+        if not next_token:
+            break
+    return rows
+
+
+async def _ensure_usage_type_table(conn: asyncpg.Connection) -> None:
+    """Self-created (schema-init custom resource doesn't re-run on
+    image-only redeploys)."""
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS f_daily_cost_usage_type (
+            event_date  DATE NOT NULL,
+            service     TEXT NOT NULL,
+            usage_type  TEXT NOT NULL,
+            total_cost  DOUBLE PRECISION NOT NULL DEFAULT 0,
+            usage_qty   DOUBLE PRECISION NOT NULL DEFAULT 0,
+            PRIMARY KEY (event_date, service, usage_type)
+        )
+    """)
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(
         description="Ingest Bedrock spend from AWS Cost Explorer into f_daily_cost.",
@@ -241,8 +316,24 @@ async def main() -> int:
     print(f"      got {len(rows)} non-zero (date, account, service) rows")
 
     print(f"[3/3] upserting into f_daily_cost...")
+    ut_rows = _fetch_cost_by_usage_type(ce, start, end_excl, services, only_accounts)
+    print(f"      + {len(ut_rows)} usage-type rows (real billed line items)")
     conn = await asyncpg.connect(args.db_url)
     try:
+        await _ensure_usage_type_table(conn)
+        if ut_rows:
+            await conn.executemany(
+                """
+                INSERT INTO f_daily_cost_usage_type
+                    (event_date, service, usage_type, total_cost, usage_qty)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (event_date, service, usage_type) DO UPDATE SET
+                    total_cost = EXCLUDED.total_cost,
+                    usage_qty  = EXCLUDED.usage_qty
+                """,
+                [(r["event_date"], r["service"], r["usage_type"],
+                  r["total_cost"], r["usage_qty"]) for r in ut_rows],
+            )
         await conn.executemany(
             """
             INSERT INTO f_daily_cost
