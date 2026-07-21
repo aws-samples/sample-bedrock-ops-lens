@@ -4,6 +4,8 @@ A Bedrock observability dashboard you can deploy in your own AWS account, plus a
 
 ![Architecture](images/architecture.png)
 
+![Dashboard demo](images/demo.gif)
+
 
 ## What it does
 
