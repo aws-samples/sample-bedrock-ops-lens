@@ -17,9 +17,7 @@ Endpoints:
 """
 from __future__ import annotations
 
-import json
 from datetime import date, timedelta
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, Query
 
@@ -91,6 +89,181 @@ async def account_type_split(f: FilterSet = Depends(parse_filters)):
         LIMIT 8
         """,
         *w.params,
+    )
+    return db.rows_to_dicts(rows)
+
+
+# ---------------------------------------------------------------------------
+# /api/request-shape — avg input/output tokens per request + in:out ratio.
+# Core capacity-planning concept from the internal wiki (§2 Request Shape):
+# TPM = RPM x (input + output tokens per request). Different use cases have
+# distinct shapes (chatbot ~10:1 in:out, summarization high-in/low-out,
+# generation low-in/high-out), and knowing the shape is critical for quota
+# sizing. Computed from f_daily aggregates — no new metric needed.
+# ---------------------------------------------------------------------------
+@router.get("/request-shape")
+async def request_shape(f: FilterSet = Depends(parse_filters)):
+    w = build_where(f)
+    rows = await db.fetch(
+        f"""
+        SELECT modelId,
+          SUM(total_requests)::BIGINT      AS total_requests,
+          SUM(total_input_tokens)::BIGINT  AS input_tokens,
+          SUM(total_output_tokens)::BIGINT AS output_tokens,
+          -- avg per request (guard divide-by-zero)
+          (SUM(total_input_tokens)::float  / NULLIF(SUM(total_requests),0)) AS avg_input_per_req,
+          (SUM(total_output_tokens)::float / NULLIF(SUM(total_requests),0)) AS avg_output_per_req,
+          -- input:output ratio (how "read-heavy" the workload is)
+          (SUM(total_input_tokens)::float  / NULLIF(SUM(total_output_tokens),0)) AS in_out_ratio
+        FROM f_daily
+        WHERE {w.sql}
+        GROUP BY modelId
+        HAVING SUM(total_requests) > 0
+        ORDER BY total_requests DESC
+        """,
+        *w.params,
+    )
+    out = db.rows_to_dicts(rows)
+    for r in out:
+        for k in ("avg_input_per_req", "avg_output_per_req", "in_out_ratio"):
+            if r.get(k) is not None:
+                r[k] = round(float(r[k]), 1)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# /api/multimodal-tokens (gap F) — text vs speech token split + image count.
+# Only meaningful for multimodal models; text-only fleets return zeros/empty.
+# ---------------------------------------------------------------------------
+@router.get("/multimodal-tokens")
+async def multimodal_tokens(f: FilterSet = Depends(parse_filters)):
+    w = build_where(f)
+    rows = await db.fetch(
+        f"""
+        SELECT modelId,
+          COALESCE(SUM(total_input_text_tokens),0)::BIGINT   AS input_text,
+          COALESCE(SUM(total_input_speech_tokens),0)::BIGINT AS input_speech,
+          COALESCE(SUM(total_output_text_tokens),0)::BIGINT  AS output_text,
+          COALESCE(SUM(total_output_speech_tokens),0)::BIGINT AS output_speech,
+          COALESCE(SUM(total_output_image_count),0)::BIGINT  AS output_images
+        FROM f_daily
+        WHERE {w.sql}
+        GROUP BY modelId
+        HAVING COALESCE(SUM(total_input_speech_tokens),0)
+             + COALESCE(SUM(total_output_speech_tokens),0)
+             + COALESCE(SUM(total_output_image_count),0) > 0
+        ORDER BY (COALESCE(SUM(total_input_speech_tokens),0)
+                + COALESCE(SUM(total_output_speech_tokens),0)) DESC
+        """,
+        *w.params,
+    )
+    return db.rows_to_dicts(rows)
+
+
+# ---------------------------------------------------------------------------
+# /api/identity-usage (gap G) — per-principal (identity.arn) usage. From
+# invocation logs; empty when logging disabled.
+# ---------------------------------------------------------------------------
+@router.get("/identity-usage")
+async def identity_usage(f: FilterSet = Depends(parse_filters)):
+    # f_identity_usage carries endpoint but not traffic_type/tags; build a
+    # scoped WHERE by hand (date + account + region + endpoint).
+    parts = ["event_date BETWEEN $1::date AND $2::date"]
+    params: list = [f.start, f.end]
+    if f.accounts:
+        parts.append(f"accountId = ANY(${len(params)+1}::text[])")
+        params.append(list(f.accounts))
+    if f.region != "all":
+        parts.append(f"region = ${len(params)+1}")
+        params.append(f.region)
+    if f.endpoint != "all":
+        parts.append(f"endpoint = ${len(params)+1}")
+        params.append(f.endpoint)
+    where = " AND ".join(parts)
+    rows = await db.fetch(
+        f"""
+        SELECT identity_arn,
+          SUM(total_requests)::BIGINT      AS total_requests,
+          SUM(total_input_tokens)::BIGINT  AS input_tokens,
+          SUM(total_output_tokens)::BIGINT AS output_tokens,
+          SUM(failed_requests)::BIGINT     AS failed_requests,
+          COUNT(DISTINCT modelId)::BIGINT  AS models_used
+        FROM f_identity_usage
+        WHERE {where}
+        GROUP BY identity_arn
+        ORDER BY total_requests DESC
+        LIMIT 200
+        """,
+        *params,
+    )
+    return db.rows_to_dicts(rows)
+
+
+# ---------------------------------------------------------------------------
+# /api/mantle-token-percentiles (gap A) — per-inference p50/p90/p99 token
+# distribution. Mantle-only (its sole per-request distribution signal).
+# ---------------------------------------------------------------------------
+@router.get("/mantle-token-percentiles")
+async def mantle_token_percentiles(f: FilterSet = Depends(parse_filters)):
+    parts = ["event_date BETWEEN $1::date AND $2::date"]
+    params: list = [f.start, f.end]
+    if f.accounts:
+        parts.append(f"accountId = ANY(${len(params)+1}::text[])")
+        params.append(list(f.accounts))
+    if f.region != "all":
+        parts.append(f"region = ${len(params)+1}")
+        params.append(f.region)
+    where = " AND ".join(parts)
+    # Percentiles can't be re-aggregated, so report the MAX across days per
+    # model (worst-case p50/p90/p99) — an honest upper bound for capacity.
+    rows = await db.fetch(
+        f"""
+        SELECT modelId,
+          MAX(p50_input_tokens)  AS p50_input,
+          MAX(p90_input_tokens)  AS p90_input,
+          MAX(p99_input_tokens)  AS p99_input,
+          MAX(p50_output_tokens) AS p50_output,
+          MAX(p90_output_tokens) AS p90_output,
+          MAX(p99_output_tokens) AS p99_output
+        FROM f_mantle_token_pctl
+        WHERE {where}
+        GROUP BY modelId
+        ORDER BY MAX(p99_output_tokens) DESC NULLS LAST
+        """,
+        *params,
+    )
+    return db.rows_to_dicts(rows)
+
+
+# ---------------------------------------------------------------------------
+# /api/mantle-projects (gap B) — native per-project chargeback rollup.
+# ---------------------------------------------------------------------------
+@router.get("/mantle-projects")
+async def mantle_projects(f: FilterSet = Depends(parse_filters)):
+    parts = ["event_date BETWEEN $1::date AND $2::date"]
+    params: list = [f.start, f.end]
+    if f.accounts:
+        parts.append(f"accountId = ANY(${len(params)+1}::text[])")
+        params.append(list(f.accounts))
+    if f.region != "all":
+        parts.append(f"region = ${len(params)+1}")
+        params.append(f.region)
+    where = " AND ".join(parts)
+    rows = await db.fetch(
+        f"""
+        SELECT project,
+          SUM(total_requests)::BIGINT      AS total_requests,
+          SUM(client_errors_4xx)::BIGINT   AS client_errors_4xx,
+          SUM(total_input_tokens)::BIGINT  AS input_tokens,
+          SUM(total_output_tokens)::BIGINT AS output_tokens,
+          COUNT(DISTINCT modelId) FILTER (WHERE modelId <> '__all__')::BIGINT AS models_used
+        FROM f_mantle_project
+        WHERE {where}
+        GROUP BY project
+        ORDER BY total_requests DESC
+        LIMIT 200
+        """,
+        *params,
     )
     return db.rows_to_dicts(rows)
 
@@ -221,14 +394,54 @@ async def list_quotas(f: FilterSet = Depends(parse_filters)):
     ]
 
 
-_LIFECYCLE_PATH = Path(__file__).parent.parent / "ops_review" / "model_lifecycle_dates.json"
+async def _load_lifecycle() -> dict:
+    """Model lifecycle dates — 100% LIVE from the Bedrock API.
 
+    Sourced from dim_model_lifecycle, which the model_lifecycle ingester
+    refreshes from bedrock:ListFoundationModels (native legacyTime /
+    endOfLifeTime / publicExtendedAccessTime fields). NO hardcoded JSON, no
+    doc scrape — the dates come straight from AWS and update themselves.
 
-def _load_lifecycle() -> dict:
-    if not _LIFECYCLE_PATH.exists():
-        return {"models": {}, "_updated": None, "_source": None}
-    with _LIFECYCLE_PATH.open() as fh:
-        return json.load(fh)
+    Returns the same shape the callers expect:
+        {"models": { "<bare-modelId>": {legacy_date, eol_date,
+                                         extended_access_date} },
+         "_updated": <ISO of last ingester refresh>, "_source": "..."}
+    Keyed by BARE modelId (CRIS prefixes stripped) so callers can match either
+    form. Takes the earliest date across regions (most conservative).
+    """
+    rows = await db.fetch(
+        """
+        SELECT modelId,
+               MIN(legacy_time)                 AS legacy_time,
+               MIN(public_extended_access_time) AS extended_time,
+               MIN(end_of_life_time)            AS eol_time,
+               MAX(refreshed_at)                AS refreshed_at
+        FROM dim_model_lifecycle
+        GROUP BY modelId
+        """
+    )
+    models: dict = {}
+    last_refresh = None
+    for r in rows:
+        mid = r["modelid"] if "modelid" in r else r["modelId"]
+        # Strip CRIS/geo prefixes to the bare id callers match on.
+        bare = mid
+        for pfx in ("us.", "eu.", "apac.", "jp.", "au.", "ca.", "amer.", "global."):
+            if bare.startswith(pfx):
+                bare = bare[len(pfx):]
+                break
+        models[bare] = {
+            "legacy_date": r["legacy_time"].date().isoformat() if r["legacy_time"] else None,
+            "eol_date": r["eol_time"].date().isoformat() if r["eol_time"] else None,
+            "extended_access_date": r["extended_time"].date().isoformat() if r["extended_time"] else None,
+        }
+        if r["refreshed_at"] and (last_refresh is None or r["refreshed_at"] > last_refresh):
+            last_refresh = r["refreshed_at"]
+    return {
+        "models": models,
+        "_updated": last_refresh.isoformat() if last_refresh else None,
+        "_source": "bedrock:ListFoundationModels (live)",
+    }
 
 
 @router.get("/lifecycle-status")
@@ -239,7 +452,7 @@ async def lifecycle_status(f: FilterSet = Depends(parse_filters)):
       warning  = legacy (LEGACY status reached),
       info     = legacy date approaching within 90 days.
     """
-    lifecycle = _load_lifecycle()
+    lifecycle = await _load_lifecycle()
     models = lifecycle.get("models", {}) or {}
 
     w = build_where(f)

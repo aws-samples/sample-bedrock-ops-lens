@@ -55,6 +55,14 @@ DAILY_METRICS = {
     "OutputTokenCount":         ("total_output_tokens",            "Sum"),
     "CacheReadInputTokenCount": ("total_cache_read_input_tokens",  "Sum"),
     "CacheWriteInputTokenCount":("total_cache_write_input_tokens", "Sum"),
+    # Multimodal token breakdown (gap F) — text vs speech splits + image count.
+    "InputTextTokenCount":      ("total_input_text_tokens",        "Sum"),
+    "InputSpeechTokenCount":    ("total_input_speech_tokens",      "Sum"),
+    "OutputTextTokenCount":     ("total_output_text_tokens",       "Sum"),
+    "OutputSpeechTokenCount":   ("total_output_speech_tokens",     "Sum"),
+    "OutputImageCount":         ("total_output_image_count",       "Sum"),
+    # Legacy-model invocations (gap E) — ties to the Lifecycle tab.
+    "LegacyModelInvocations":   ("legacy_invocations",             "Sum"),
 }
 
 LATENCY_METRICS = [
@@ -176,7 +184,8 @@ def _build_hourly_queries(models: list[tuple[str, str | None]]) -> tuple[list[di
             continue
         seen_models.add(mid)
         for metric_name in ("Invocations", "InputTokenCount", "OutputTokenCount",
-                            "CacheReadInputTokenCount",
+                            "CacheReadInputTokenCount", "CacheWriteInputTokenCount",
+                            "EstimatedTPMQuotaUsage",
                             "InvocationClientErrors", "InvocationServerErrors",
                             "InvocationThrottles"):
             qid = _safe_id("h", counter)
@@ -280,6 +289,7 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         daily_rows.append((
             d, account, mid, region,
             "__none__", "__none__", "__none__", "__none__",  # operation/traffic/tier/profile
+            "runtime",                      # endpoint: AWS/Bedrock = bedrock-runtime
             total,                          # total_requests
             max(0, total - c4xx - c5xx),    # successful
             c4xx + c5xx,                    # failed
@@ -289,6 +299,12 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
             int(m.get("total_cache_write_input_tokens", 0) or 0),
             non_throttle_4xx, 0, c429,      # status_400 (non-throttle 4xx), 403=0, status_429 (real)
             c5xx, 0,                        # status_500 = ALL 5xx (aggregate); 503=0
+            int(m.get("total_input_text_tokens", 0) or 0),
+            int(m.get("total_input_speech_tokens", 0) or 0),
+            int(m.get("total_output_text_tokens", 0) or 0),
+            int(m.get("total_output_speech_tokens", 0) or 0),
+            int(m.get("total_output_image_count", 0) or 0),
+            int(m.get("legacy_invocations", 0) or 0),
         ))
 
     if daily_rows:
@@ -296,15 +312,18 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
             """
             INSERT INTO f_daily (
                 event_date, accountId, modelId, region, operation, traffic_type,
-                service_tier, inference_profile_prefix,
+                service_tier, inference_profile_prefix, endpoint,
                 total_requests, successful_requests, failed_requests,
                 total_input_tokens, total_output_tokens,
                 total_cache_read_input_tokens, total_cache_write_input_tokens,
                 status_400_count, status_403_count, status_429_count,
-                status_500_count, status_503_count
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+                status_500_count, status_503_count,
+                total_input_text_tokens, total_input_speech_tokens,
+                total_output_text_tokens, total_output_speech_tokens,
+                total_output_image_count, legacy_invocations
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
             ON CONFLICT (event_date, accountId, modelId, region, operation,
-                         traffic_type, service_tier, inference_profile_prefix)
+                         traffic_type, service_tier, inference_profile_prefix, endpoint)
             DO UPDATE SET
                 total_requests = EXCLUDED.total_requests,
                 successful_requests = EXCLUDED.successful_requests,
@@ -317,7 +336,13 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
                 status_403_count = EXCLUDED.status_403_count,
                 status_429_count = EXCLUDED.status_429_count,
                 status_500_count = EXCLUDED.status_500_count,
-                status_503_count = EXCLUDED.status_503_count
+                status_503_count = EXCLUDED.status_503_count,
+                total_input_text_tokens = EXCLUDED.total_input_text_tokens,
+                total_input_speech_tokens = EXCLUDED.total_input_speech_tokens,
+                total_output_text_tokens = EXCLUDED.total_output_text_tokens,
+                total_output_speech_tokens = EXCLUDED.total_output_speech_tokens,
+                total_output_image_count = EXCLUDED.total_output_image_count,
+                legacy_invocations = EXCLUDED.legacy_invocations
             """,
             daily_rows,
         )
@@ -337,6 +362,8 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
             "InputTokenCount":          "total_input_tokens",
             "OutputTokenCount":         "total_output_tokens",
             "CacheReadInputTokenCount": "total_cache_read_input_tokens",
+            "CacheWriteInputTokenCount":"total_cache_write_input_tokens",
+            "EstimatedTPMQuotaUsage":   "estimated_tpm_quota_usage",
             "InvocationClientErrors":   "client_errors_4xx",
             "InvocationServerErrors":   "server_errors_5xx",
             "InvocationThrottles":      "throttles_429",
@@ -360,11 +387,13 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         non_throttle_4xx = max(0, c4xx - c429)
         if total > 0:
             hourly_rows.append((
-                d, hr, account, mid, region,
+                d, hr, account, mid, region, "runtime",
                 total,
                 int(m.get("total_input_tokens", 0) or 0),
                 int(m.get("total_output_tokens", 0) or 0),
                 int(m.get("total_cache_read_input_tokens", 0) or 0),
+                int(m.get("total_cache_write_input_tokens", 0) or 0),
+                int(m.get("estimated_tpm_quota_usage", 0) or 0),
                 c429,  # real throttle count (InvocationThrottles) in peak table
             ))
         # Error rows: only within the rolling 7-day window AND only when
@@ -375,7 +404,7 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
             # status_400 = remaining non-throttle 4xx aggregate, status_500 = all
             # 5xx aggregate. 403/503 stay 0 — CloudWatch can't distinguish them.
             err_rows.append((
-                d, hr, account, mid, region,
+                d, hr, account, mid, region, "runtime",
                 total, failed,
                 non_throttle_4xx, 0, c429, c5xx, 0,
             ))
@@ -384,28 +413,32 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         await conn.executemany(
             """
             INSERT INTO f_hourly_peak (
-                event_date, hour, accountId, modelId, region,
+                event_date, hour, accountId, modelId, region, endpoint,
                 total_requests, total_input_tokens, total_output_tokens,
-                total_cache_read_input_tokens, status_429_count
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-            ON CONFLICT (event_date, hour, accountId, modelId, region)
+                total_cache_read_input_tokens, total_cache_write_input_tokens,
+                estimated_tpm_quota_usage, status_429_count
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ON CONFLICT (event_date, hour, accountId, modelId, region, endpoint)
             DO UPDATE SET
                 total_requests = EXCLUDED.total_requests,
                 total_input_tokens = EXCLUDED.total_input_tokens,
                 total_output_tokens = EXCLUDED.total_output_tokens,
                 total_cache_read_input_tokens = EXCLUDED.total_cache_read_input_tokens,
+                total_cache_write_input_tokens = EXCLUDED.total_cache_write_input_tokens,
+                estimated_tpm_quota_usage = EXCLUDED.estimated_tpm_quota_usage,
                 status_429_count = EXCLUDED.status_429_count
             """,
             hourly_rows,
         )
         counts["f_hourly_peak"] = len(hourly_rows)
 
-    # f_hourly_errors: rolling 7-day window, full wipe + reload (small table,
-    # ~85K rows max in the reference, much smaller for single-account customers).
+    # f_hourly_errors: rolling 7-day window, full wipe + reload for the
+    # `runtime` endpoint slice (Mantle ingester clears its own slice).
     await conn.execute(
         """
         DELETE FROM f_hourly_errors
         WHERE accountId = $1 AND region = $2 AND event_date >= $3
+          AND endpoint = 'runtime'
         """,
         account, region, err_window_start,
     )
@@ -413,12 +446,12 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         await conn.executemany(
             """
             INSERT INTO f_hourly_errors (
-                event_date, hour, accountId, modelId, region,
+                event_date, hour, accountId, modelId, region, endpoint,
                 total_requests, failed_requests,
                 status_400_count, status_403_count, status_429_count,
                 status_500_count, status_503_count
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-            ON CONFLICT (event_date, hour, accountId, modelId, region)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ON CONFLICT (event_date, hour, accountId, modelId, region, endpoint)
             DO UPDATE SET
                 total_requests = EXCLUDED.total_requests,
                 failed_requests = EXCLUDED.failed_requests,
@@ -448,7 +481,7 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         if not m.get("sample_count"):
             continue
         lat_rows.append((
-            d, mid, "__none__", region,
+            d, mid, "__none__", region, "runtime",
             int(m.get("sample_count", 0)),
             m.get("avg_e2e"),  m.get("p50_e2e"),  m.get("p90_e2e"),  m.get("p99_e2e"),
             m.get("avg_ttft"), m.get("p50_ttft"), m.get("p90_ttft"), m.get("p99_ttft"),
@@ -458,11 +491,11 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         await conn.executemany(
             """
             INSERT INTO f_latency_daily (
-                event_date, modelId, traffic_type, region, sample_count,
+                event_date, modelId, traffic_type, region, endpoint, sample_count,
                 avg_e2e, p50_e2e, p90_e2e, p99_e2e,
                 avg_ttft, p50_ttft, p90_ttft, p99_ttft
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-            ON CONFLICT (event_date, modelId, traffic_type, region)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            ON CONFLICT (event_date, modelId, traffic_type, region, endpoint)
             DO UPDATE SET
                 sample_count = EXCLUDED.sample_count,
                 avg_e2e = EXCLUDED.avg_e2e, p50_e2e = EXCLUDED.p50_e2e,

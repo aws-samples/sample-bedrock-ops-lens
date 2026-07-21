@@ -151,10 +151,16 @@ def _http_status_from_log(entry: dict) -> int:
     )
 
 
-def _parse_log_entry(entry: dict) -> tuple[date, int, str, str, str, str, dict, int, int, int]:
+def _parse_log_entry(entry: dict) -> tuple[date, int, str, str, str, str, dict, int, int, int, float | None]:
     """Returns (date, hour, accountId, modelId, region, operation,
               requestMetadata, total_in_tokens, total_out_tokens,
-              status_code) or None."""
+              status_code, latency_ms) or None.
+
+    latency_ms is read from output.outputBodyJson.metrics.latencyMs when
+    present (Bedrock invocation logs), else None. The dashboard's Latency
+    tab uses this for the bedrock-mantle path because Mantle does not
+    publish latency to CloudWatch.
+    """
     ts = entry.get("timestamp")
     acct = entry.get("accountId", "")
     region = entry.get("region", "")
@@ -173,7 +179,20 @@ def _parse_log_entry(entry: dict) -> tuple[date, int, str, str, str, str, dict, 
     in_t = int((entry.get("input") or {}).get("inputTokenCount") or 0)
     out_t = int((entry.get("output") or {}).get("outputTokenCount") or 0)
     status = _http_status_from_log(entry)
-    return d, hr, acct, model_id, region, op, metadata, in_t, out_t, status
+    # Latency: nested under output.outputBodyJson.metrics.latencyMs in
+    # Bedrock invocation logs. Defensive deep-get to handle older logs
+    # that don't include the metrics block.
+    latency_ms: float | None = None
+    output_block = entry.get("output") or {}
+    body_json = output_block.get("outputBodyJson") or {}
+    metrics_block = body_json.get("metrics") or {}
+    raw_lat = metrics_block.get("latencyMs")
+    if raw_lat is not None:
+        try:
+            latency_ms = float(raw_lat)
+        except (TypeError, ValueError):
+            latency_ms = None
+    return d, hr, acct, model_id, region, op, metadata, in_t, out_t, status, latency_ms
 
 
 async def _ensure_log_objects_table(conn: asyncpg.Connection) -> None:
@@ -229,6 +248,18 @@ async def main() -> int:
                 status_buckets: dict[tuple, dict[int, int]] = defaultdict(
                     lambda: {c: 0 for c in STATUS_CODES})
 
+                # Latency samples per (date, model, region, endpoint). The
+                # bedrock-mantle endpoint does not publish latency to CW —
+                # f_latency_daily for endpoint='mantle' comes from here.
+                latency_samples: dict[tuple, list[float]] = defaultdict(list)
+
+                # Per-principal (identity.arn) usage → f_identity_usage (gap G):
+                # "who is calling Bedrock" at the IAM-principal level. Keyed by
+                # (date, account, region, arn, model, endpoint).
+                identity_buckets: dict[tuple, dict[str, int]] = defaultdict(
+                    lambda: {"total_requests": 0, "total_input_tokens": 0,
+                             "total_output_tokens": 0, "failed_requests": 0})
+
                 for key in pending:
                     obj_rows = 0
                     obj_tag_rows = 0
@@ -236,10 +267,25 @@ async def main() -> int:
                         parsed = _parse_log_entry(entry)
                         if not parsed:
                             continue
-                        d, hr, a, mid, r, op, metadata, in_t, out_t, status = parsed
+                        d, hr, a, mid, r, op, metadata, in_t, out_t, status, latency_ms = parsed
+                        # Endpoint detection: invocation logs from the
+                        # bedrock-mantle endpoint surface either an explicit
+                        # endpoint field or an operation name carrying the
+                        # Mantle API hint (Responses / ChatCompletions /
+                        # Messages). Default to 'runtime' for everything else.
+                        ep_hint = (entry.get("endpoint") or "").lower()
+                        if "mantle" in ep_hint:
+                            endpoint = "mantle"
+                        elif any(s in op for s in ("Responses", "ChatCompletions", "Messages")):
+                            endpoint = "mantle"
+                        else:
+                            endpoint = "runtime"
                         obj_rows += 1
-                        # Real per-code hourly tally (one bump per request).
-                        sb = status_buckets[(d, hr, a, mid, r)]
+                        # Real per-code hourly tally (one bump per request),
+                        # keyed by endpoint too so the Status Codes chart can
+                        # slice runtime vs mantle (both may appear in the same
+                        # invocation-log stream).
+                        sb = status_buckets[(d, hr, a, mid, r, endpoint)]
                         sb[status if status in sb else (
                             400 if 400 <= status < 500 else
                             500 if 500 <= status < 600 else 200)] += 1
@@ -258,6 +304,19 @@ async def main() -> int:
                             b["total_input_tokens"] += in_t
                             b["total_output_tokens"] += out_t
                             obj_tag_rows += 1
+                        # Per-principal attribution (gap G). identity.arn is the
+                        # IAM principal that made the call; truncate to keep the
+                        # key bounded. '__unknown__' when the log omits it.
+                        arn = ((entry.get("identity") or {}).get("arn") or "__unknown__")[:512]
+                        ib = identity_buckets[(d, a, r, arn, mid, endpoint)]
+                        ib["total_requests"] += 1
+                        ib["total_input_tokens"] += in_t
+                        ib["total_output_tokens"] += out_t
+                        if status >= 400:
+                            ib["failed_requests"] += 1
+                        # Record per-request latency for the endpoint slice.
+                        if latency_ms is not None and latency_ms >= 0:
+                            latency_samples[(d, mid, r, endpoint)].append(latency_ms)
                     new_keys.append((key, obj_rows, obj_tag_rows))
                     total_logs += obj_rows
 
@@ -297,12 +356,12 @@ async def main() -> int:
                 # least one request.
                 if status_buckets:
                     status_rows = []
-                    for (d, hr, a, mid, r), sc in status_buckets.items():
+                    for (d, hr, a, mid, r, endpoint), sc in status_buckets.items():
                         total = sum(sc.values())
                         if total <= 0:
                             continue
                         status_rows.append((
-                            d, hr, a, mid, r, total,
+                            d, hr, a, mid, r, endpoint, total,
                             sc[200], sc[400], sc[403], sc[404], sc[408],
                             sc[424], sc[429], sc[500], sc[503],
                         ))
@@ -310,13 +369,13 @@ async def main() -> int:
                         await conn.executemany(
                             """
                             INSERT INTO f_hourly_status (
-                                event_date, hour, accountId, modelId, region,
+                                event_date, hour, accountId, modelId, region, endpoint,
                                 total_requests,
                                 status_200_count, status_400_count, status_403_count,
                                 status_404_count, status_408_count, status_424_count,
                                 status_429_count, status_500_count, status_503_count
-                            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-                            ON CONFLICT (event_date, hour, accountId, modelId, region)
+                            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                            ON CONFLICT (event_date, hour, accountId, modelId, region, endpoint)
                             DO UPDATE SET
                                 total_requests   = f_hourly_status.total_requests   + EXCLUDED.total_requests,
                                 status_200_count = COALESCE(f_hourly_status.status_200_count,0) + EXCLUDED.status_200_count,
@@ -332,6 +391,33 @@ async def main() -> int:
                             status_rows,
                         )
 
+                # Per-principal usage → f_identity_usage (gap G). Additive
+                # upsert like the other invocation-log tables.
+                if identity_buckets:
+                    id_rows = [
+                        (d, a, r, arn, mid, ep,
+                         v["total_requests"], v["total_input_tokens"],
+                         v["total_output_tokens"], v["failed_requests"])
+                        for (d, a, r, arn, mid, ep), v in identity_buckets.items()
+                        if v["total_requests"] > 0
+                    ]
+                    if id_rows:
+                        await conn.executemany(
+                            """
+                            INSERT INTO f_identity_usage (
+                                event_date, accountId, region, identity_arn, modelId, endpoint,
+                                total_requests, total_input_tokens, total_output_tokens, failed_requests
+                            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                            ON CONFLICT (event_date, accountId, region, identity_arn, modelId, endpoint)
+                            DO UPDATE SET
+                                total_requests = COALESCE(f_identity_usage.total_requests,0) + EXCLUDED.total_requests,
+                                total_input_tokens = COALESCE(f_identity_usage.total_input_tokens,0) + EXCLUDED.total_input_tokens,
+                                total_output_tokens = COALESCE(f_identity_usage.total_output_tokens,0) + EXCLUDED.total_output_tokens,
+                                failed_requests = COALESCE(f_identity_usage.failed_requests,0) + EXCLUDED.failed_requests
+                            """,
+                            id_rows,
+                        )
+
         if new_keys:
             await conn.executemany(
                 "INSERT INTO ingestion_log_objects (s3_key, row_count, tag_count) "
@@ -339,9 +425,65 @@ async def main() -> int:
                 new_keys,
             )
 
-        # Keep f_hourly_status to a rolling 7-day window (matches f_hourly_errors).
+        # Retain f_hourly_status for 90 days — the dashboard's date-range picker
+        # allows windows up to 90 days, so a shorter retention would silently cap
+        # the Status Codes chart (a 7-day cap made every wider filter show the
+        # same last-7-days regardless of selection). Keep in sync with the
+        # picker's max range in frontend/src/App.jsx (isValidRange: 90 days).
         await conn.execute(
-            "DELETE FROM f_hourly_status WHERE event_date < current_date - INTERVAL '7 days'")
+            "DELETE FROM f_hourly_status WHERE event_date < current_date - INTERVAL '90 days'")
+        # Same 90-day retention for per-principal usage (gap G).
+        await conn.execute(
+            "DELETE FROM f_identity_usage WHERE event_date < current_date - INTERVAL '90 days'")
+
+        # f_latency_daily: derive percentiles per (date, model, region, endpoint).
+        # Source for the bedrock-mantle endpoint (CW publishes no latency
+        # for Mantle); merges with the runtime endpoint where CW already
+        # populates this table. We DELETE the slice we own (mantle only,
+        # within the window) before inserting so re-runs don't double-count.
+        if latency_samples:
+            import statistics
+            await conn.execute(
+                """
+                DELETE FROM f_latency_daily
+                WHERE endpoint = 'mantle' AND event_date >= $1
+                """,
+                start.date(),
+            )
+            lat_rows = []
+            for (d, mid, r, ep), samples in latency_samples.items():
+                if not samples or ep != "mantle":
+                    continue
+                samples.sort()
+                n = len(samples)
+                avg = sum(samples) / n
+                # Nearest-rank percentile — fine for the dashboard's needs.
+                def _pct(p):
+                    idx = max(0, min(n - 1, int(round(p * (n - 1)))))
+                    return samples[idx]
+                lat_rows.append((
+                    d, mid, "__none__", r, ep,
+                    n,
+                    avg, _pct(0.50), _pct(0.90), _pct(0.99),
+                    None, None, None, None,   # ttft not in invocation logs
+                ))
+            if lat_rows:
+                await conn.executemany(
+                    """
+                    INSERT INTO f_latency_daily (
+                        event_date, modelId, traffic_type, region, endpoint, sample_count,
+                        avg_e2e, p50_e2e, p90_e2e, p99_e2e,
+                        avg_ttft, p50_ttft, p90_ttft, p99_ttft
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    ON CONFLICT (event_date, modelId, traffic_type, region, endpoint)
+                    DO UPDATE SET
+                        sample_count = EXCLUDED.sample_count,
+                        avg_e2e = EXCLUDED.avg_e2e, p50_e2e = EXCLUDED.p50_e2e,
+                        p90_e2e = EXCLUDED.p90_e2e, p99_e2e = EXCLUDED.p99_e2e
+                    """,
+                    lat_rows,
+                )
+                print(f"  wrote {len(lat_rows)} latency rows from invocation logs (endpoint='mantle')")
 
         # Refresh dim_tags from f_daily_tagged
         await conn.execute("DELETE FROM dim_tags")

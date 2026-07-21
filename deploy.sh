@@ -509,6 +509,8 @@ cat > "$PARAMS_JSON" <<EOF
   {"ParameterKey":"BackendImageUri","ParameterValue":"$ECR_URI:latest"},
   {"ParameterKey":"BedrockLogsBucket","ParameterValue":"$BEDROCK_LOGS_BUCKET"},
   {"ParameterKey":"BedrockLogsRegion","ParameterValue":"$BEDROCK_LOGS_REGION"},
+  {"ParameterKey":"ProxyEventsBucket","ParameterValue":"${PROXY_EVENTS_BUCKET:-}"},
+  {"ParameterKey":"ProxyEventsRegions","ParameterValue":"${PROXY_EVENTS_REGIONS:-}"},
   {"ParameterKey":"CognitoDomainPrefix","ParameterValue":"$COGNITO_DOMAIN_PREFIX"},
   {"ParameterKey":"StackNamePrefix","ParameterValue":"$MAIN_STACK"},
   {"ParameterKey":"EdgeShaVersionArn","ParameterValue":"$EDGE_SHA_VERSION_ARN"},

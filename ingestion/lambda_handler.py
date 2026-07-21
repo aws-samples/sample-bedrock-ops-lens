@@ -110,6 +110,11 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
          ["model_lifecycle", "--db-url", db_url]),
         ("cw_metrics",      "ingestion.cw_metrics",
          ["cw_metrics",      "--db-url", db_url, "--days", str(days)]),
+        # AWS/BedrockMantle namespace (the bedrock-mantle endpoint, launched
+        # 2026-06-01). Returns empty in regions / accounts without Mantle
+        # traffic — does not fail. Same days/auth as cw_metrics.
+        ("cw_mantle_metrics", "ingestion.cw_mantle_metrics",
+         ["cw_mantle_metrics", "--db-url", db_url, "--days", str(days)]),
         ("cost",            "ingestion.cost",
          ["cost",            "--db-url", db_url, "--days", str(max(days, 30))]),
     ]
@@ -170,6 +175,24 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
              "--regions", logs_region]
         ))
 
+    # proxy_events is opt-in: a GenAI proxy fronting Bedrock drops one
+    # metadata-only event per request into an S3 bucket we read cross-account
+    # (Task A — per-workload attribution when the proxy signs everything with
+    # one IAM role). Skip unless PROXY_EVENTS_BUCKET is set. Region list mirrors
+    # the deploy/logs region convention; the proxy partitions by region under
+    # proxy-events/<region>/... so we read every configured region.
+    proxy_bucket = os.environ.get("PROXY_EVENTS_BUCKET", "").strip()
+    if proxy_bucket:
+        proxy_regions = (os.environ.get("PROXY_EVENTS_REGIONS", "").strip()
+                         or os.environ.get("BEDROCK_LOGS_REGION", "").strip()
+                         or os.environ.get("BEDROCK_REGION", "us-east-1"))
+        schedule.append((
+            "proxy_events", "ingestion.proxy_events",
+            ["proxy_events", "--db-url", db_url, "--days", str(days),
+             "--bucket", proxy_bucket,
+             "--regions", proxy_regions]
+        ))
+
     # quotas LAST: slowest module at org/multi-region scale (Service Quotas
     # API rate-limits). Appended after invocation_logs so a long/timed-out
     # quotas pass can never starve the primary-data modules above. A partial
@@ -193,6 +216,74 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
     return {"runs": results}
 
 
+async def _purge_proxy() -> dict:
+    """Truncate proxy-derived tables + the object-dedup ledger so a fresh
+    ingest re-reads only what's currently in the proxy bucket. Used to clear
+    test/synthetic events; harmless if the tables are already empty."""
+    import asyncpg
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        try:
+            from app.config import _compose_database_url  # type: ignore
+        except ImportError:
+            from backend.app.config import _compose_database_url  # type: ignore
+        db_url = _compose_database_url() or ""
+    conn = await asyncpg.connect(db_url)
+    out = {}
+    try:
+        for tbl in ("f_request_events", "f_proxy_dim_hourly", "dim_proxy_dimensions",
+                    "proxy_events_objects"):
+            try:
+                await conn.execute(f"TRUNCATE {tbl}")
+                out[tbl] = "truncated"
+            except Exception as e:
+                out[tbl] = f"skip: {type(e).__name__}"
+    finally:
+        await conn.close()
+    _bump_cache_generation()
+    print(f"[purge_proxy] {out}")
+    return {"purged": out, "status": "ok"}
+
+
+async def _apply_migrations() -> dict:
+    """Apply db/migrations/*.sql (lexical order) to the live DB. Each migration
+    is idempotent, so re-running is safe. Lets an operator apply a new migration
+    to an existing stack without a full CFN update (which is what normally
+    triggers the schema-init custom resource)."""
+    import asyncpg
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        try:
+            from app.config import _compose_database_url  # type: ignore
+        except ImportError:
+            from backend.app.config import _compose_database_url  # type: ignore
+        db_url = _compose_database_url() or ""
+
+    task_root = os.environ.get("LAMBDA_TASK_ROOT", os.getcwd())
+    mig_dir = os.path.join(task_root, "db", "migrations")
+    if not os.path.isdir(mig_dir):
+        # Fall back to the repo layout when run outside Lambda.
+        mig_dir = os.path.join(os.path.dirname(__file__), "..", "db", "migrations")
+
+    out: dict = {}
+    conn = await asyncpg.connect(db_url)
+    try:
+        names = sorted(n for n in os.listdir(mig_dir) if n.endswith(".sql"))
+        for name in names:
+            with open(os.path.join(mig_dir, name)) as fh:
+                sql = fh.read()
+            try:
+                await conn.execute(sql)
+                out[name] = "ok"
+            except Exception as e:  # noqa: BLE001 — report per-file, keep going
+                out[name] = f"error: {type(e).__name__}: {e}"
+    finally:
+        await conn.close()
+    _bump_cache_generation()
+    print(f"[migrate] {out}")
+    return {"migrations": out, "status": "ok"}
+
+
 # ------------------------------------------------------------------ handler
 def handler(event, context):
     """Lambda entrypoint.
@@ -205,6 +296,21 @@ def handler(event, context):
     """
     if not isinstance(event, dict):
         event = {}
+
+    # Maintenance action: purge proxy-derived tables. Use ONLY to clear test/
+    # synthetic proxy events from a DB — real proxy data re-populates on the
+    # next ingest from whatever is in the customer's PROXY_EVENTS_BUCKET.
+    # Never runs unless explicitly requested via {"admin":"purge_proxy"}.
+    if event.get("admin") == "purge_proxy":
+        return asyncio.run(_purge_proxy())
+
+    # Maintenance action: apply db/migrations/*.sql to the live DB. Migrations
+    # normally run via the schema-init custom resource on stack create/update;
+    # this lets an operator apply a new idempotent migration to an existing
+    # stack without a full CFN update. Only runs on explicit {"admin":"migrate"}.
+    if event.get("admin") == "migrate":
+        return asyncio.run(_apply_migrations())
+
     only = event.get("only")
     if only and not isinstance(only, list):
         only = [str(only)]

@@ -46,7 +46,7 @@ flowchart TB
 | Tier | Use it when |
 |---|---|
 | A. MCP only | You want quick answers in your IDE, no infrastructure. Cannot do heavy historical or tag-attributed work because there is no database. |
-| C. Full dashboard | Finance, leadership, or anyone without AWS access needs the same insights. Includes the web UI and the MCP. |
+| B. Full dashboard | Finance, leadership, or anyone without AWS access needs the same insights. Includes the web UI and the MCP. |
 
 Tier A is light. The MCP runs on your laptop and calls AWS APIs live. Useful for quick lookups but cannot do heavy historical work or per-tag cost attribution because there is no database behind it.
 
@@ -257,8 +257,120 @@ For very large customers (500+ accounts) the pull architecture becomes the wrong
 | Capacity and Adoption | CRIS adoption, throttle rates, prompt caching opportunities, Claude 4 burndown risk |
 | Model Insights | Per-model deep dive: requests, tokens, cache hit rate, errors, accounts |
 | Model Lifecycle | Live ListFoundationModels joined with usage, timeline of legacy and EOL bands |
+| Workloads | Per-workload usage, throttle, and latency — **requires a GenAI proxy** (see below). Also per-IAM-principal callers (from invocation logs) and per-project Mantle chargeback |
 | Ops Review | LLM-synthesized executive brief covering the top 3 issues |
 | Settings | Auth identity, ingestion freshness, region and account scope, pinned tag keys |
+
+Every tab except **Workloads** populates automatically from CloudWatch, Cost
+Explorer, Service Quotas, and (optionally) model invocation logs — no
+application changes required. The Workloads tab is opt-in and needs the setup
+below.
+
+
+## Workloads: per-workload attribution (optional)
+
+The Workloads tab answers "which of my use-cases is driving Bedrock usage,
+throttling, and latency" — attribution the AWS-native metrics can't provide,
+because CloudWatch is keyed by model, not by your application's use-case.
+
+It works only if you front Bedrock with a **shared GenAI proxy / gateway**
+(LiteLLM, a Bedrock gateway, an internal SDK wrapper, etc.) that can tag each
+call with a `workload`. If your apps call Bedrock directly with no common layer,
+this tab stays empty (the rest of the dashboard is unaffected).
+
+**How it works:** your proxy drops **one metadata-only event per request** to an
+S3 bucket; the dashboard reads that bucket read-only (no inbound endpoint, never
+sits in your request path). No prompt or response text ever leaves your proxy.
+
+1. **Emit an event per request.** In your proxy, after each Bedrock call, append
+   one NDJSON line to S3 under this exact layout (`.jsonl` or `.jsonl.gz`):
+
+   ```
+   s3://<your-bucket>/proxy-events/<region>/<YYYY>/<MM>/<DD>/<HH>/*.jsonl
+   ```
+   ```json
+   {"ts":"2026-07-04T18:03:22Z",
+    "dimensions":{"workload":"flights-search","env":"prod","business_unit":"travel"},
+    "model":"anthropic.claude-opus-4-8","endpoint":"runtime","region":"us-east-1",
+    "input_tokens":812,"output_tokens":143,"cache_read_tokens":0,
+    "status":200,"throttled":false,"latency_ms":940,"request_id":"msg_..."}
+   ```
+   **`dimensions` is an arbitrary custom-attribute map** — attach whatever your
+   org slices by: `workload`, `env` (prod/dev), `business_unit`, `cost_center`,
+   `team`, feature flags, etc. The dashboard's Workloads tab lets you pivot by
+   any key you emit (the picker top-left) and computes tokens, throttle rate,
+   latency, **and per-value TPM quota utilization** for each. `workload` is just
+   the conventional default key; a bare top-level `"workload":"x"` is still
+   accepted for back-compat. `endpoint` is `runtime` or `mantle`. See
+   **`tools/reference-proxy/`** for a working, copy-paste starting point.
+
+2. **Grant the dashboard read access** — a bucket policy allowing the ingester
+   role `s3:GetObject` + `s3:ListBucket` on `.../proxy-events/*` (read-only,
+   cross-account supported).
+
+3. **Deploy pointing at the bucket:**
+   ```bash
+   export PROXY_EVENTS_BUCKET=your-genai-proxy-events
+   export PROXY_EVENTS_REGIONS=us-east-1,us-west-2   # regions your proxy partitions under
+   ./deploy.sh --yes
+   ```
+   Leave `PROXY_EVENTS_BUCKET` unset to disable the tab entirely. The daily
+   ingester reads new events into the per-dimension views; no synthetic data is
+   ever generated — the tab shows only what your proxy emits.
+
+**Transport note (S3 vs CloudWatch).** The event *shape* above (the `dimensions`
+map + token/status/latency fields) is transport-agnostic. Today the shipped
+emitter and ingester use **S3 NDJSON** — chosen for the simplest cross-account,
+read-only access and the cheapest way to carry arbitrary high-cardinality
+attributes (no per-metric cost). Two CloudWatch alternatives are pluggable
+future readers if a customer needs near-real-time or already centralizes on CW:
+- **CloudWatch Logs (structured JSON)** — same arbitrary fields, per-GB pricing
+  (no cardinality tax), Logs-Insights queryable; would add a cross-account
+  subscription/Insights ingestion path feeding the *same* `f_proxy_dim_hourly`
+  tables. Near-real-time.
+- **CloudWatch custom metrics (`PutMetricData` Dimensions)** — true 1-minute
+  granularity, but each unique dimension-value combination is a separately
+  billed custom metric, so it only suits a *small, fixed* set of dimensions
+  (e.g. `workload` alone), not open-ended attributes like `cost_center`.
+
+Either would reuse the entire data model, aggregation, quota math, and UI built
+for the S3 path — only the reader changes. Not implemented today; S3 is the
+supported transport.
+
+**Why the proxy path, given AWS-native cost attribution exists.** AWS ships
+several native attribution mechanisms
+([Bedrock cost management](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-management.html)):
+IAM principal attribution, Application inference profiles (runtime), and
+Projects / Workspaces (mantle). We use the native building blocks where they
+fit — per-request metadata tags feed the tag-filtered views, the identity ARN
+feeds "Top callers", and the Mantle Project dimension feeds per-project
+chargeback. But every *native* method outputs **billed dollars, aggregated per
+usage-type per day** to Cost Explorer / CUR 2.0 — none of them emit **throttle
+rate** or **TPM quota utilization**, and the profile/principal methods don't
+cover the `bedrock-mantle` endpoint. The Workloads (proxy) path is the only one
+that gives per-workload **usage** — tokens, throttle %, latency, and quota
+utilization — uniformly across both endpoints and at ~hourly (not 24–48h)
+freshness. So: use native attribution for **dollars by workload** (surfacing
+inference-profile / Project cost from Cost Explorer is a planned fast-follow);
+use the proxy path for **usage / throttle / quota by workload**. The proxy event
+`dimensions` map intentionally mirrors AWS's `requestMetadata` custom-attribute
+shape (`{team, tenant, cost_center, …}`), so it's an extension of the native
+pattern, not a fork.
+
+**No-proxy path for usage-by-attribute (AWS-native).** AWS's
+[request-level usage attribution](https://aws.amazon.com/about-aws/whats-new/2026/05/amazon-bedrock-request-level-usage-attribution/)
+lets you tag each `InvokeModel` / Converse call with arbitrary
+`requestMetadata` attributes (`team`, `project`, `environment`, …) and analyze
+**token usage** by those tags in model invocation logs. **This dashboard already
+ingests it** — the invocation-log ingester parses `requestMetadata` into
+`f_daily_tagged`, and the "Pinned tag keys" setting surfaces any tag as a
+top-bar filter. So a customer who already runs invocation logging gets
+usage-by-attribute with **zero proxy work**. Its limits (the reason the proxy
+path still exists): it's `bedrock-runtime` only (no Mantle invocation logs),
+requires invocation logging enabled, is daily-batch, and exposes token counts
+but **not throttle rate or TPM quota utilization** (throttled calls are often
+not logged; quota headroom isn't in the logs). The proxy path adds those three
+and covers Mantle. Same custom-attribute model, two complementary sources.
 
 
 ## Cost

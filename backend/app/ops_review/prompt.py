@@ -122,34 +122,10 @@ request shape, lifecycle alerts. If a section's array is empty, write a
 single bullet such as "Throttling: no hotspots detected in this window."
 
 ## Traffic flow diagram
-Provide a Mermaid `flowchart LR` describing how the fleet's main models
-flow from client to CRIS or OD to region(s). Include request volume on
-the destination NODE labels (e.g., `"Claude Sonnet 4\\n63K reqs"`). Wrap
-the diagram in a fenced code block tagged `mermaid`.
+Provide a Mermaid `flowchart LR` describing how this customer's main models flow from client to CRIS or OD to region(s). Use display_name (public model names). Include request volume on edges or node labels where available (e.g., "Claude Sonnet 4\\n63K reqs"). Wrap the diagram in a fenced code block tagged `mermaid`. Keep it less than or equal to 8 nodes. If you cannot identify enough data, omit this section silently.
+IMPORTANT mermaid rules: each node must have a UNIQUE ID (A, B, C... or descriptive like client, od1, model1). Never reuse the same label text on multiple nodes. Do NOT use edge labels (--|text|--) as they render as ghost nodes. Put volume info inside node labels instead. Keep it simple — no subgraphs.
 
-Constraints (these are HARD rules — diagrams violating them will be
-unreadable or fail to render):
-- ≤ 8 nodes total
-- Each node MUST have a unique node ID (`A`, `B`, `C` ... or descriptive
-  IDs like `client`, `od1`, `cris1`). Never reuse the same label text on
-  two different nodes.
-- Do NOT use edge labels (`A --|text|--> B`); they render as ghost nodes.
-  Put any label inside a node label instead.
-- Do NOT use subgraphs. Keep it flat.
-- Use `display_name` (public model name from the findings JSON) for the
-  human-readable label, never the raw model ID.
-
-If you cannot identify enough data to draw something meaningful, OMIT the
-entire `## Traffic flow diagram` section silently — do not output an empty
-diagram or placeholder text.
-
-Immediately after the mermaid code block (still inside the
-`## Traffic flow diagram` section), add 1-2 sentences interpreting the
-specific topology shown. Spell out abbreviations on first use ("OD
-(On-Demand)", "CRIS (Cross-Region Inference)"). State which path carries
-the bulk of traffic, whether there are single-region OD paths that would
-benefit from CRIS, and any obvious redundancy or single-region risk in
-the topology.
+Immediately AFTER the mermaid code block (still inside the `## Traffic flow diagram` section), add a 1-2 sentence interpretation of THIS customer's specific topology. Spell out any abbreviation used in the diagram on first use (e.g., "OD (On-Demand)", "CRIS (Cross-Region Inference Service)") so a reader unfamiliar with Bedrock terminology understands. State which path carries the bulk of traffic, whether the customer has single-region OD paths that would benefit from CRIS, and any obvious redundancy or risk visible in the topology. Keep it concrete - cite specific paths/regions from the diagram, no generic phrasing.
 
 DO NOT generate a Gantt chart for the lifecycle. The UI renders its own
 horizontal lifecycle timeline from the structured `lifecycle_alerts` data.

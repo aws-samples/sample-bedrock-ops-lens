@@ -11,7 +11,54 @@ const CACHE_MS = 60_000;
 // stay as repeated `?k=v&k=v` query params.
 const COMMA_JOIN_KEYS = new Set(['accounts']);
 
+// --- Cross-tab attribution redirect ----------------------------------------
+// When the PROXY attribution source is active AND the user has selected an
+// attribute value in the top bar, the CloudWatch-backed tabs can't filter by
+// that attribute (native metrics carry no attribute dimension). The proxy
+// stream can, so we transparently redirect the handful of native endpoints
+// that have a proxy-sourced sibling (/attribution/xtab/*) and inject the
+// dim_key + dim_value params. One central switch instead of editing every tab.
+//
+// App.jsx sets whether the PROXY attribution source is active. The actual
+// attribute selection travels in each request's own `tag_filter` param (the
+// same array the top-bar filter writes), so the redirect keys off the params —
+// no cross-render timing dependency on module state.
+// "Attribution active" = an attribution source (proxy OR invocation_logs) is
+// effective AND an attribute filter is selected. App.jsx computes this and calls
+// setAttributionContext({active}). The xtab/* endpoints pick the right source
+// table (f_proxy_dim_hourly vs f_daily_tagged) by effective_source.
+let _attributionActive = false;
+export function setAttributionContext(ctx) {
+  _attributionActive = !!(ctx && ctx.active);
+}
+export function isAttributionActive() { return _attributionActive; }
+
+// native path -> attribution-sourced sibling (xtab/* resolves source-aware)
+const XTAB_REDIRECT = {
+  '/summary': '/attribution/xtab/summary',
+  '/daily-trend': '/attribution/xtab/daily-trend',
+  '/requests-by-model': '/attribution/xtab/by-model',
+  '/latency-by-model': '/attribution/xtab/latency-by-model',
+  '/breakdown': '/attribution/xtab/breakdown',   // Overview's main request-volume chart
+  '/cost-summary': '/attribution/xtab/cost-summary',   // Total-spend KPI (Overview + Cost)
+  '/cost-by-model': '/attribution/xtab/cost-by-model', // cost stacked chart (Overview + Cost)
+};
+
 export function buildUrl(path, params = {}) {
+  // Redirect to the attribution-sourced sibling when an attribution source is
+  // active AND this request carries an attribute filter (tag_filter "key:value").
+  const tf = params && params.tag_filter;
+  if (_attributionActive && XTAB_REDIRECT[path] && Array.isArray(tf) && tf.length) {
+    const dimKey = String(tf[0]).split(':')[0];
+    const dimValues = tf.filter(s => String(s).startsWith(`${dimKey}:`))
+                        .map(s => String(s).slice(dimKey.length + 1));
+    const { tag_filter, ...rest } = params;   // drop tag_filter; use dim_* instead
+    return _buildUrl(XTAB_REDIRECT[path], { ...rest, dim_key: dimKey, dim_value: dimValues });
+  }
+  return _buildUrl(path, params);
+}
+
+function _buildUrl(path, params = {}) {
   const usp = new URLSearchParams();
   Object.entries(params).forEach(([k, v]) => {
     if (v === undefined || v === null || v === '' || v === 'all') return;
@@ -51,10 +98,25 @@ export async function api(path, params = {}, { signal, useCache = true } = {}) {
 export function clearCache() { cache.clear(); }
 
 // React hook — kept tiny; full state machine is overkill for this app.
+//
+// Auto-derive the dep from the resolved URL. Earlier this hook required
+// the caller to thread every relevant filter into the deps array
+// manually, which led to subtle "the data didn't change when I toggled X"
+// bugs (the URL changed but React reused the stale fetch promise because
+// X wasn't listed). The URL is the single source of truth — if it changes,
+// re-fetch. The optional `extraDeps` argument is preserved for callers
+// that genuinely want to force a refetch on something not encoded in the
+// URL (e.g. a manual refresh button).
 import { useEffect, useState } from 'react';
-export function useApi(path, params, deps = []) {
+export function useApi(path, params, extraDeps = []) {
   const [state, setState] = useState({ loading: true, data: null, error: null });
+  // Skip convention: a falsy `path` means "not ready yet, don't fetch" — the
+  // caller is waiting on a dependency (e.g. a required query param that hasn't
+  // resolved). Prevents firing a request with a missing required param, which
+  // the backend rejects with 422. Callers do: useApi(key ? '/x' : null, {...}).
+  const url = path ? buildUrl(path, params || {}) : null;
   useEffect(() => {
+    if (!path) { setState({ loading: true, data: null, error: null }); return; }
     let cancelled = false;
     const ctrl = new AbortController();
     setState(s => ({ ...s, loading: true, error: null }));
@@ -66,7 +128,7 @@ export function useApi(path, params, deps = []) {
       });
     return () => { cancelled = true; ctrl.abort(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
+  }, [url, ...extraDeps]);
   return state;
 }
 

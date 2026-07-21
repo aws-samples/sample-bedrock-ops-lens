@@ -1,0 +1,93 @@
+###############################################################################
+# Bedrock Ops Lens - cfn-guard rules
+# https://docs.aws.amazon.com/cfn-guard/
+#
+# Pre-deploy gate. deploy.sh runs `cfn-guard validate` against this file
+# before submitting any stack. Any rule that FAILs aborts the deploy.
+#
+# These rules encode the specific Palisade failure modes we have already
+# tripped over during this build:
+#
+#   1. Lambda Function URL with AuthType: NONE (publicly invokable URL
+#      with no IAM gate — exactly what AWS security tooling flags).
+#   2. Lambda::Permission with Principal: "*" (a related world-accessible
+#      pattern that triggers the same slat).
+#   3. S3 bucket without all four BlockPublicAccess flags.
+#   4. S3 bucket without default SSE.
+#   5. IAM inline policies pairing Action: "*" with Resource: "*".
+#
+# Re-validate locally with:
+#   cfn-guard validate -d infra/cloudformation.yaml -r infra/policy-guard.rules
+###############################################################################
+
+
+#
+# Rule 1. Lambda Function URL must not be world-accessible.
+# Palisade slat: palisade.udd.lambda.function.world_accessible
+#
+let lambda_urls = Resources.*[ Type == "AWS::Lambda::Url" ]
+
+rule lambda_function_url_must_have_iam_auth when %lambda_urls !empty {
+    %lambda_urls.Properties.AuthType == "AWS_IAM"
+}
+
+
+#
+# Rule 2. Lambda::Permission must not have Principal "*".
+# Same Palisade slat as rule 1: a resource-policy-based world allow.
+#
+# Guard's `!=` operator can't compare an unresolved Ref (e.g. !Ref
+# AWS::AccountId) against a literal string. We narrow the rule to the
+# specific anti-pattern: Principal as a literal string equal to "*".
+# Service principals like "cloudfront.amazonaws.com", account-id Refs,
+# and account-id literals all pass through.
+#
+let lambda_permissions = Resources.*[ Type == "AWS::Lambda::Permission" ]
+
+rule lambda_permission_must_not_be_world_open when %lambda_permissions !empty {
+    %lambda_permissions.Properties.Principal not in ["*"]
+}
+
+
+#
+# Rule 3. Every S3 bucket must block all forms of public access.
+#
+let s3_buckets = Resources.*[ Type == "AWS::S3::Bucket" ]
+
+rule s3_buckets_must_block_public_access when %s3_buckets !empty {
+    %s3_buckets.Properties.PublicAccessBlockConfiguration exists
+    %s3_buckets.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+    %s3_buckets.Properties.PublicAccessBlockConfiguration.BlockPublicPolicy == true
+    %s3_buckets.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
+    %s3_buckets.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+}
+
+
+#
+# Rule 4. Every S3 bucket must have default server-side encryption.
+#
+rule s3_buckets_must_have_default_encryption when %s3_buckets !empty {
+    %s3_buckets.Properties.BucketEncryption exists
+    %s3_buckets.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*]
+        .ServerSideEncryptionByDefault.SSEAlgorithm in ["AES256", "aws:kms"]
+}
+
+
+#
+# Rule 5. IAM inline policies must not pair Action: "*" with Resource: "*".
+# Catches over-privileged customer-managed policies before deploy.
+#
+let iam_role_with_inline_policies = Resources.*[
+    Type == "AWS::IAM::Role"
+    Properties.Policies exists
+]
+
+rule iam_inline_policies_must_be_scoped when %iam_role_with_inline_policies !empty {
+    %iam_role_with_inline_policies.Properties.Policies[*].PolicyDocument.Statement[*] {
+        when Effect == "Allow" {
+            when Action == "*" {
+                Resource != "*"
+            }
+        }
+    }
+}

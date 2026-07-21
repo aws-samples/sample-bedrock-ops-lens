@@ -17,14 +17,14 @@ import {
   AppLayout, ContentLayout, Header, Box, SpaceBetween,
   Select, Multiselect, ColumnLayout, TopNavigation,
   Badge, HelpPanel, DateRangePicker, Link, SideNavigation, Icon,
-  ExpandableSection, Spinner,
+  ExpandableSection, Spinner, Alert,
 } from '@cloudscape-design/components';
 import { applyMode, Mode } from '@cloudscape-design/global-styles';
-import { useApi, fmt } from './api.js';
+import { useApi, fmt, setAttributionContext } from './api.js';
 import SectionPanel from './components/SectionInfo.jsx';
 import { UserProvider, useUser } from './components/UserContext.jsx';
 import AuthApp from './views/AuthApp.jsx';
-import { useTagFilterFields } from './components/TagFilters.jsx';
+import { useAttributeFilterFields } from './components/AttributeFilters.jsx';
 import OverviewTab from './tabs/OverviewTab.jsx';
 import ErrorsTab from './tabs/ErrorsTab.jsx';
 import LatencyTab from './tabs/LatencyTab.jsx';
@@ -34,6 +34,7 @@ import QuotasTab from './tabs/QuotasTab.jsx';
 import CostTab from './tabs/CostTab.jsx';
 import ModelLifecycleTab from './tabs/ModelLifecycleTab.jsx';
 import ModelInsightsTab from './tabs/ModelInsightsTab.jsx';
+import WorkloadsTab from './tabs/WorkloadsTab.jsx';
 import SettingsView from './views/SettingsView.jsx';
 
 /* --- Theme management ------------------------------------------------- */
@@ -170,7 +171,7 @@ function dateRangeValueFromFilters(f) {
   const found = RELATIVE_PRESETS.find(p => p.amount === Number(f.days));
   return found
     ? { type: 'relative', amount: found.amount, unit: found.unit }
-    : { type: 'relative', amount: 14, unit: 'day' };
+    : { type: 'relative', amount: 7, unit: 'day' };
 }
 
 // One-line summary of the current filter state, shown in the collapsed
@@ -223,7 +224,7 @@ function FilterBar({ filters, setFilters, hideTraffic }) {
   // Tag-key dropdowns from the user's pinned-tag-keys preference.
   // Returned as an ARRAY (not a wrapper component) so each dropdown becomes
   // a direct child of <ColumnLayout> and lays out into the grid correctly.
-  const tagFilterFields = useTagFilterFields(filters, setFilters);
+  const tagFilterFields = useAttributeFilterFields(filters, setFilters);
 
   const accountsState = useApi('/accounts', {}, []);
   const accountOptions = (accountsState.data || []).map(a => {
@@ -245,7 +246,7 @@ function FilterBar({ filters, setFilters, hideTraffic }) {
   const onRangeChange = ({ detail }) => {
     const v = detail.value;
     if (!v) {
-      setFilters({ ...filters, days: 14, start: '', end: '' });
+      setFilters({ ...filters, days: 7, start: '', end: '' });
       return;
     }
     if (v.type === 'absolute') {
@@ -416,6 +417,19 @@ const NAV_ITEMS_DASHBOARD = [
   ]},
 ];
 
+// Dashboard nav with the Workloads item injected only when proxy
+// per-workload telemetry exists (Task A). Hidden entirely otherwise — same
+// principle as hiding empty Mantle sub-tabs: never show an empty view.
+function navItemsDashboard(workloadsAvail) {
+  if (!workloadsAvail) return NAV_ITEMS_DASHBOARD;
+  const [group] = NAV_ITEMS_DASHBOARD;
+  const items = [...group.items];
+  const opsIdx = items.findIndex(i => i.href === '#/ops');
+  const wl = navItem('Usage · Custom Attributes', '#/workloads', 'group-active');
+  items.splice(opsIdx >= 0 ? opsIdx + 1 : items.length, 0, wl);
+  return [{ ...group, items }];
+}
+
 const NAV_ADMIN_SECTION = (isAdmin) => isAdmin ? [
   { type: 'divider' },
   { type: 'section-group', title: 'Admin', items: [
@@ -444,13 +458,21 @@ const VIEW_FROM_HASH = (h) => (h || '').replace(/^#\/?/, '') || 'overview';
 /* --- Root ------------------------------------------------------------- */
 function AppShell() {
   const [filters, setFilters] = useState({
-    days: 14,
+    // 7-day default: the dashboard opens on the most recent week — the window
+    // most operators care about day-to-day. Widen via the time picker (up to
+    // 90 days) to reach historical / bursty bedrock-mantle usage.
+    days: 7,
     start: '',
     end: '',
     provider: 'all',
     region: 'all',
     traffic_type: 'all',
     accounts: [],
+    // Bedrock endpoint slice. 'all' sums runtime + mantle. Each tab can
+    // override locally via its EndpointSubTabs switcher; the global
+    // default stays 'all' so the FilterBar / KPI ribbon shows the
+    // consolidated picture.
+    endpoint: 'all',
   });
   const [activeView, setActiveView] = useState(() => VIEW_FROM_HASH(window.location.hash));
   const [theme, setTheme] = useTheme();
@@ -461,6 +483,33 @@ function AppShell() {
   // Lazy-mount visited views; keep them mounted for cache survival.
   const [visited, setVisited] = useState(() => new Set([activeView]));
   const { user, isAdmin, authEnabled } = useUser();
+
+  // Surface the "Usage · Custom Attributes" view when EITHER attribution source
+  // is active — proxy dimensions OR invocation-log tags. effective_source is
+  // 'off' only when neither has data and no admin override, in which case the
+  // nav item is hidden (same principle as hiding empty Mantle sub-tabs).
+  const attrCfg = useApi('/attribution/config', {}, []).data;
+  const workloadsAvail = attrCfg ? attrCfg.effective_source !== 'off' : false;
+
+  // Cross-tab redirect: when an attribution source is active (proxy OR
+  // invocation_logs) and the user selected attribute value(s) in the top bar,
+  // redirect CW-backed endpoints to their attribution-sourced siblings (see
+  // api.js). CW metrics carry no attribute dimension, so the re-slice has to
+  // come from the source table (f_proxy_dim_hourly or f_daily_tagged); the
+  // xtab/* endpoints pick the right one by effective_source. The top-bar filter
+  // writes "key:value" strings into filters.tag_filter; we pin the single
+  // active key (an attribute filter targets one dimension key at a time).
+  useEffect(() => {
+    const source = attrCfg?.effective_source;
+    const tf = filters.tag_filter || [];
+    if ((source === 'proxy' || source === 'invocation_logs') && tf.length) {
+      const dimKey = tf[0].split(':')[0];
+      const dimValues = tf.filter(s => s.startsWith(`${dimKey}:`)).map(s => s.slice(dimKey.length + 1));
+      setAttributionContext({ active: true, dimKey, dimValues });
+    } else {
+      setAttributionContext({ active: false, dimKey: null, dimValues: [] });
+    }
+  }, [attrCfg, filters.tag_filter]);
 
   // Hash-based routing — sidebar links use `#/foo`, the app reads it on
   // mount and listens for hashchange.
@@ -590,7 +639,7 @@ function AppShell() {
           <SideNavigation
             activeHref={`#/${activeView}`}
             items={[
-              ...NAV_ITEMS_DASHBOARD,
+              ...navItemsDashboard(workloadsAvail),
               ...NAV_ADMIN_SECTION(isAdmin),
               ...NAV_FOOTER,
             ]}
@@ -613,7 +662,7 @@ function AppShell() {
           </HelpPanel>
         )}
         content={
-          isSettings ? <SettingsView /> : (
+          isSettings ? <SettingsView onInfo={onInfo} /> : (
             // No ContentLayout header — TopNavigation already labels the
             // app, and the page-level <h1> was a third "Bedrock Ops Lens"
             // duplicate. The Info link moved into TopNavigation utilities
@@ -637,12 +686,27 @@ function AppShell() {
                     hideTraffic={isOpsReview}
                   />
                 </ExpandableSection>
+                {/* Provenance banner: when a proxy attribute filter is active,
+                    the CW-backed tabs (Overview volume/KPIs, Latency) are
+                    re-served from the proxy event stream so they can honor the
+                    filter. Say so, so numbers aren't mistaken for native CW. */}
+                {attrCfg?.effective_source === 'proxy'
+                  && (filters.tag_filter || []).length > 0
+                  && ['overview', 'latency'].includes(activeView) && (
+                  <Alert type="info">
+                    Filtered to {(filters.tag_filter || []).join(', ')} — these
+                    views are sourced from your proxy event stream (not native
+                    CloudWatch) so they can break down by attribute. Clear the
+                    attribute filter for the full CloudWatch-based view.
+                  </Alert>
+                )}
                 {viewBody('overview',   <OverviewTab     filters={filters} onInfo={onInfo} />)}
                 {viewBody('quotas',     <QuotasTab       filters={filters} onInfo={onInfo} />)}
                 {viewBody('cost',       <CostTab         filters={filters} onInfo={onInfo} />)}
                 {viewBody('errors',     <ErrorsTab       filters={filters} onInfo={onInfo} />)}
                 {viewBody('latency',    <LatencyTab      filters={filters} onInfo={onInfo} />)}
                 {viewBody('ops',        <OpsInsightsTab     filters={filters} onInfo={onInfo} />)}
+                {viewBody('workloads',  <WorkloadsTab       filters={filters} onInfo={onInfo} />)}
                 {viewBody('insights',   <ModelInsightsTab   filters={filters} onInfo={onInfo} />)}
                 {viewBody('lifecycle',  <ModelLifecycleTab  filters={filters} onInfo={onInfo} />)}
                 {viewBody('ops-review', <OpsReviewTab       filters={filters} onInfo={onInfo} />)}

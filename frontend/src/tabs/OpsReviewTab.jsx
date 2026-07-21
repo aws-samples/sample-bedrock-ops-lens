@@ -144,10 +144,15 @@ export default function OpsReviewTab({ filters, onInfo }) {
 
   // Synthesis state
   const [narrative, setNarrative] = useState('');
-  const [renderedNarrative, setRenderedNarrative] = useState('');
   const [synthLoading, setSynthLoading] = useState(false);
   const [synthError, setSynthError] = useState('');
   const [cached, setCached] = useState(false);
+  // Live mount point for the rendered narrative. We attach sanitized DOM nodes
+  // directly (see effect below) instead of round-tripping through an HTML
+  // string + a second DOMPurify pass — that round-trip re-strips the mermaid
+  // <foreignObject> node labels (DOMPurify removes foreignObject xhtml content
+  // regardless of config), which blanked out the diagram's node text.
+  const narrativeRef = useRef(null);
 
   const generate = async (force = false) => {
     setSynthLoading(true);
@@ -174,30 +179,31 @@ export default function OpsReviewTab({ filters, onInfo }) {
   // reconciliation; renderMermaidIn re-sanitizes the SVG it splices in.
   useEffect(() => {
     let cancelled = false;
-    if (!narrative) { setRenderedNarrative(''); return; }
+    const mount = narrativeRef.current;
+    if (mount) mount.replaceChildren();
+    if (!narrative || !mount) return;
+    // Pass 1: sanitize the markdown→HTML with DOMPurify (RETURN_DOM_FRAGMENT so
+    // we work with nodes, never an HTML string). This handles the narrative
+    // prose. data-b64 carries the mermaid source (base64 — survives sanitize).
     const svgPolicy = {
-      ADD_TAGS: ['svg', 'g', 'path', 'rect', 'circle', 'line', 'polygon', 'polyline', 'text', 'tspan', 'defs', 'marker', 'foreignObject'],
-      ADD_ATTR: ['transform', 'd', 'viewBox', 'xmlns', 'fill', 'stroke', 'stroke-width', 'x', 'y', 'cx', 'cy', 'r', 'rx', 'ry', 'x1', 'y1', 'x2', 'y2', 'points', 'text-anchor', 'font-size', 'font-family', 'class', 'id', 'style', 'marker-end', 'marker-start', 'orient', 'refX', 'refY', 'markerWidth', 'markerHeight'],
+      ADD_TAGS: ['svg', 'g', 'path', 'rect', 'circle', 'line', 'polygon', 'polyline', 'text', 'tspan', 'defs', 'marker', 'foreignObject', 'details', 'summary'],
+      ADD_ATTR: ['data-source', 'data-b64', 'data-rendered', 'target', 'transform', 'd', 'viewBox', 'xmlns', 'fill', 'stroke', 'stroke-width', 'x', 'y', 'cx', 'cy', 'r', 'rx', 'ry', 'x1', 'y1', 'x2', 'y2', 'points', 'text-anchor', 'font-size', 'font-family', 'class', 'id', 'style', 'marker-end', 'marker-start', 'orient', 'refX', 'refY', 'markerWidth', 'markerHeight'],
     };
-    // Build the off-screen container exclusively via DOM APIs (createElement +
-    // appendChild) — never via an innerHTML/outerHTML write — so no
-    // user-controllable string ever reaches an HTML-parsing sink. DOMPurify
-    // returns a pre-parsed, sanitized DocumentFragment we attach as nodes.
-    const tmp = document.createElement('div');
     const frag = DOMPurify.sanitize(
       renderMarkdownToHtml(narrative),
       { ...svgPolicy, RETURN_DOM_FRAGMENT: true }
     );
+    // Stage in an off-screen container, run the mermaid post-pass (which renders
+    // + XSS-scrubs each diagram's SVG itself), THEN move the finished nodes into
+    // the live mount. We deliberately do NOT serialize + re-sanitize here: a
+    // second DOMPurify pass strips the mermaid <foreignObject> node labels
+    // (blanking the diagram). Everything mounted was already sanitized in pass 1
+    // (prose) or scrubbed by renderMermaidIn (SVG), so the DOM stays safe.
+    const tmp = document.createElement('div');
     tmp.appendChild(frag);
     renderMermaidIn(tmp).then(() => {
-      if (!cancelled) {
-        // Serialize by walking sanitized DOM nodes (no innerHTML read/write on
-        // user-controlled data); the consumer re-sanitizes before injection.
-        const serialized = Array.from(tmp.childNodes)
-          .map((n) => (n.nodeType === 1 ? n.outerHTML : n.textContent || ''))
-          .join('');
-        setRenderedNarrative(DOMPurify.sanitize(serialized, svgPolicy));
-      }
+      if (cancelled || !narrativeRef.current) return;
+      narrativeRef.current.replaceChildren(...Array.from(tmp.childNodes));
     });
     return () => { cancelled = true; };
   }, [narrative]);
@@ -261,32 +267,6 @@ export default function OpsReviewTab({ filters, onInfo }) {
     a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  const downloadLifecycleCsv = () => {
-    const cols = [
-      { label: 'Severity',          get: r => r.severity },
-      { label: 'Model ID',          get: r => r.modelId },
-      { label: 'Base model',        get: r => r.base_modelId },
-      { label: 'Legacy date',       get: r => r.legacy_date },
-      { label: 'Extended access',   get: r => r.extended_access_date || '' },
-      { label: 'EOL date',          get: r => r.eol_date },
-      { label: 'Account count',     get: r => r.account_count },
-      { label: 'Total requests',    get: r => r.total_requests },
-      { label: 'Regions',           get: r => (r.regions || []).join('|') },
-    ];
-    const esc = (v) => {
-      if (v === null || v === undefined) return '';
-      const s = String(v);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const header = cols.map(c => esc(c.label)).join(',');
-    const body = lc.map(r => cols.map(c => esc(c.get(r))).join(',')).join('\n');
-    const blob = new Blob([header + '\n' + body], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `bedrock-lifecycle-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
-
   return (
     <div className="ops-print-root">
       <SpaceBetween size="l">
@@ -327,7 +307,7 @@ export default function OpsReviewTab({ filters, onInfo }) {
                 ) : (
                   <span className="action-orange-wrap">
                     <Button variant="primary" iconName="gen-ai" loading={synthLoading} className="no-print action-orange-btn"
-                            onClick={() => generate(false)}>Generate AI report</Button>
+                            onClick={() => generate(false)}>Perform Ops review</Button>
                   </span>
                 )
               }
@@ -350,24 +330,18 @@ export default function OpsReviewTab({ filters, onInfo }) {
                   Generated by Claude Opus from the structured findings on this page.
                   Always cross-check the cited numbers against the tables below before sharing.
                 </Alert>
-                {/* Defense-in-depth: re-sanitize at the injection sink. The upstream
-                    pipeline already runs DOMPurify, but we sanitize again here so the
-                    dangerous sink itself is provably safe regardless of upstream changes. */}
-                <div
-                  className="ops-narrative"
-                  // eslint-disable-next-line react/no-danger
-                  dangerouslySetInnerHTML={{
-                    __html: DOMPurify.sanitize(
-                      renderedNarrative || renderMarkdownToHtml(narrative),
-                      { ADD_TAGS: ['svg', 'g', 'path', 'rect', 'circle', 'line', 'polygon', 'polyline', 'text', 'tspan', 'defs', 'marker', 'foreignObject'], ADD_ATTR: ['transform', 'd', 'viewBox', 'xmlns', 'fill', 'stroke', 'stroke-width', 'x', 'y', 'cx', 'cy', 'r', 'rx', 'ry', 'x1', 'y1', 'x2', 'y2', 'points', 'text-anchor', 'font-size', 'font-family', 'class', 'id', 'style', 'marker-end', 'marker-start', 'orient', 'refX', 'refY', 'markerWidth', 'markerHeight'] }
-                    ),
-                  }}
-                />
+                {/* The effect above sanitizes (DOMPurify pass 1) + mermaid-scrubs
+                    the content, then attaches the finished nodes here via the ref.
+                    We mount nodes directly rather than dangerouslySetInnerHTML with
+                    a re-sanitize, because a second DOMPurify pass strips the mermaid
+                    <foreignObject> node labels and blanks the diagram. Nothing
+                    unsanitized ever reaches this node. */}
+                <div className="ops-narrative" ref={narrativeRef} />
                 {cached ? <Box variant="small" color="text-body-secondary">(served from cache)</Box> : null}
               </SpaceBetween>
             ) : (
               <Box color="text-body-secondary">
-                Click <strong>Generate AI report</strong> above to synthesize the structured findings into a narrative review with recommendations and a Mermaid traffic-flow diagram. Requires Bedrock InvokeModel permission on the runtime credentials.
+                Click <strong>Perform Ops review</strong> above to synthesize the structured findings into a narrative review with recommendations and a Mermaid traffic-flow diagram. Requires Bedrock InvokeModel permission on the runtime credentials.
               </Box>
             )}
           </Container>
@@ -377,15 +351,14 @@ export default function OpsReviewTab({ filters, onInfo }) {
         {lc.length > 0 && (
           <div id="ops-section-lifecycle" className="ops-section-break">
             <Container header={
-              <SectionHeader title="Model lifecycle alerts" sectionId="ops-lifecycle" onInfo={onInfo}
-                actions={<Button iconName="download" className="no-print" onClick={downloadLifecycleCsv}>Download CSV</Button>}
-              />
+              <SectionHeader title="Model lifecycle alerts" sectionId="ops-lifecycle" onInfo={onInfo} />
             }>
               <SpaceBetween size="m">
                 <LifecycleTimeline alerts={lc} />
                 <PaginatedTable
                   items={lc}
                   trackBy="modelId"
+                  downloadFileName="ops-review-lifecycle-alerts.csv"
                   columnDefinitions={[
                     { id: 'sev', header: 'Severity', cell: r => <StatusIndicator type={severityType(r.severity)}>{r.severity}</StatusIndicator> },
                     { id: 'm',   header: 'Model',    cell: r => r.modelId },

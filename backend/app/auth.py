@@ -24,6 +24,7 @@ JWT verification:
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
 from typing import Any
 
@@ -149,6 +150,31 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 def current_user_id(request: Request) -> str:
     return getattr(request.state, "user", {}).get("sub", "default")
+
+
+# Cognito group that grants admin (Settings write access). Mirrors the
+# frontend UserContext check. In local dev (AUTH_ENABLED=false) there are no
+# groups, so is_admin() treats everyone as admin — same as the SPA.
+ADMIN_GROUP = "bedrock-lens-admins"
+
+
+def is_admin(request: Request) -> bool:
+    """True if the caller may change stack-wide settings.
+
+    Admin = member of the bedrock-lens-admins Cognito group, OR auth is
+    disabled (local dev), OR the caller is a SigV4 IAM principal (CLI/MCP
+    access to the Function URL is already account-scoped by the resource
+    policy, so treat it as trusted-operator)."""
+    if os.environ.get("AUTH_ENABLED", "false").lower() != "true":
+        return True
+    user = getattr(request.state, "user", {}) or {}
+    groups = user.get("groups", []) or []
+    if ADMIN_GROUP in groups:
+        return True
+    # SigV4 IAM callers get a synthetic 'bedrock-lens-iam' group (see above).
+    if "bedrock-lens-iam" in groups:
+        return True
+    return False
 
 
 def _extract_sigv4_caller(request: Request) -> dict | None:

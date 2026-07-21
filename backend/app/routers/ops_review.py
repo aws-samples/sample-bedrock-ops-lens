@@ -104,8 +104,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
               AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
             AS peak_rpm_observed,
-          (SELECT MAX(CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
-                           ELSE GREATEST((total_input_tokens - total_cache_read_input_tokens) + total_output_tokens, 0) END) FROM f_hourly_peak h
+          (SELECT MAX((total_input_tokens + COALESCE(total_cache_write_input_tokens,0)) + total_output_tokens) FROM f_hourly_peak h
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
               AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
             AS peak_tpm_observed
@@ -192,8 +191,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         SELECT accountId, modelId, region,
           (SUM(total_input_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_input,
           (SUM(total_output_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_output,
-          (SELECT MAX(CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
-                           ELSE GREATEST((total_input_tokens - total_cache_read_input_tokens) + total_output_tokens, 0) END) FROM f_hourly_peak h
+          (SELECT MAX((total_input_tokens + COALESCE(total_cache_write_input_tokens,0)) + total_output_tokens) FROM f_hourly_peak h
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
               AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
             AS peak_tpm_observed,
@@ -341,7 +339,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         })
 
     # ---- lifecycle_alerts ----
-    lifecycle = _load_lifecycle()
+    lifecycle = await _load_lifecycle()
     models_meta = lifecycle.get("models", {}) or {}
     today = date.today()
     fleet_models = await db.fetch(
@@ -517,6 +515,35 @@ def _strip_note_preamble(s: str) -> str:
     )
 
 
+_MERMAID_BLOCK = re.compile(r"(```mermaid\s*\n)([\s\S]*?)(```)", re.IGNORECASE)
+# A node definition: <id><open-bracket><label><close-bracket>. Covers the
+# common shapes [ ], ( ), { }. The label is anything up to the matching close
+# bracket that isn't itself a bracket.
+_MERMAID_NODE_LABEL = re.compile(r"(\b[A-Za-z0-9_]+)(\[|\(|\{)([^\[\]\(\)\{\}]+?)(\]|\)|\})")
+
+
+def _fix_mermaid_labels(s: str) -> str:
+    """Auto-quote Mermaid node labels that contain characters Mermaid can't
+    parse bare (`:` `%` `,` `<br/>` `/` etc.). Models routinely emit
+    `od1[OD: Nova Lite<br/>42-60%]`, which fails to render ("Diagram too large"
+    is a red herring — this is a parse error). Wrapping the label in double
+    quotes — `od1["OD: Nova Lite<br/>42-60%"]` — is the documented fix and is
+    model-independent (same output whichever LLM produced the diagram)."""
+    def _quote(m: "re.Match") -> str:
+        ident, ob, label, cb = m.groups()
+        lab = label.strip()
+        if lab.startswith('"') and lab.endswith('"'):
+            return m.group(0)                      # already quoted — leave it
+        if not re.search(r'[:%,()<>/#;]|<br', lab):
+            return m.group(0)                      # plain label — no need to quote
+        lab = lab.replace('"', "'")                # inner double-quotes -> single
+        return f'{ident}{ob}"{lab}"{cb}'
+    def _fix_block(bm: "re.Match") -> str:
+        head, body, tail = bm.groups()
+        return head + _MERMAID_NODE_LABEL.sub(_quote, body) + tail
+    return _MERMAID_BLOCK.sub(_fix_block, s)
+
+
 def _strip_lifecycle_gantt(s: str) -> str:
     """Even with the prompt rule in place, models occasionally emit a
     `## Lifecycle timeline ... ```mermaid gantt ... ```` block. The UI
@@ -542,54 +569,157 @@ async def ops_review_synthesize(
         cached = _NARRATIVE_CACHE[cache_key]
         return {**cached, "cached": True}
 
-    try:
-        import boto3  # local import keeps the dep optional for non-Bedrock paths
-        from botocore.config import Config as _BotoConfig
-        from botocore.exceptions import BotoCoreError, ClientError
-    except ImportError:
-        raise HTTPException(503, detail="boto3 not installed")
-
+    # Keep the prompt compact: this endpoint is fronted by CloudFront, whose
+    # origin response timeout is 120s. Trim the findings blob to ~60KB (plenty
+    # for a good narrative) so the model has less to read and responds well
+    # inside the window.
     findings_json = json.dumps(findings, default=str, indent=2)
-    if len(findings_json) > 180_000:
-        findings_json = findings_json[:180_000] + "\n... (truncated)"
+    if len(findings_json) > 60_000:
+        findings_json = findings_json[:60_000] + "\n... (truncated)"
     prompt = SYSTEM_PROMPT.replace("{findings_json}", findings_json)
 
-    client = boto3.client(
-        "bedrock-runtime",
-        region_name=settings.bedrock_region,
-        config=_BotoConfig(retries={"max_attempts": 3, "mode": "adaptive"},
-                           read_timeout=900),
-    )
-    body = json.dumps({
-        "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 4096,
-        "temperature": 0.2,
-        "messages": [{"role": "user", "content": prompt}],
-    })
-    try:
-        resp = client.invoke_model(
-            modelId=settings.bedrock_model_id,
-            contentType="application/json",
-            accept="application/json",
-            body=body,
-        )
-    except (BotoCoreError, ClientError) as e:
-        raise HTTPException(502, detail=f"Bedrock call failed: {type(e).__name__}: {e}")
+    # PRIMARY: synthesize via the bedrock-mantle endpoint (Anthropic Messages
+    # API) — the dashboard dogfoods the OpenAI-compatible endpoint it recommends
+    # to customers. Sonnet 5, flagship-but-fast, finishes inside the 120s budget.
+    # FALLBACK: if mantle errors OR returns an empty narrative (e.g. reasoning
+    # consumed the whole token budget, or a transient mantle issue), fall back to
+    # bedrock-runtime invoke_model so Ops Review still produces a report. The
+    # response label records which path actually served it.
+    def _extract(payload):
+        parts = payload.get("content") or []
+        return "".join(p.get("text", "") for p in parts if p.get("type") == "text")
 
-    payload = json.loads(resp["body"].read())
-    parts = payload.get("content") or []
-    narrative = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
+    # Primary/fallback order is toggleable. OPS_REVIEW_USE_MANTLE=true tries the
+    # bedrock-mantle endpoint first (to dogfood it) with runtime as fallback;
+    # false (default) uses bedrock-runtime as primary with mantle as fallback.
+    # Default is runtime-first because us-west-2 mantle is currently unhealthy
+    # (500s) and runtime Sonnet 5 is fast + reliable (~20s). Flip to mantle-first
+    # once the regional mantle endpoint is stable.
+    if settings.ops_review_use_mantle:
+        primary = ("bedrock-mantle", _synthesize_via_mantle, settings.ops_review_model)
+        secondary = ("bedrock-runtime (fallback)", _synthesize_via_runtime, settings.bedrock_model_id)
+    else:
+        primary = ("bedrock-runtime", _synthesize_via_runtime, settings.bedrock_model_id)
+        secondary = ("bedrock-mantle (fallback)", _synthesize_via_mantle, settings.ops_review_model)
+
+    source, model_used = primary[0], primary[2]
+    payload, narrative, first_err = None, "", None
+    try:
+        payload = primary[1](prompt)
+        narrative = _extract(payload)
+    except Exception as e:  # noqa: BLE001 — remember, then try the other endpoint
+        first_err = f"{primary[0]}: {type(e).__name__}: {e}"
+
+    if not narrative.strip():
+        try:
+            payload = secondary[1](prompt)
+            narrative = _extract(payload)
+            source, model_used = secondary[0], secondary[2]
+        except Exception as e:  # noqa: BLE001 — both failed → clean 502
+            detail = f"Secondary ({secondary[0]}) failed: {type(e).__name__}: {e}"
+            if first_err:
+                detail = f"Primary {first_err}; {detail}"
+            raise HTTPException(502, detail=detail)
+
+    if not narrative.strip():
+        raise HTTPException(502, detail="Synthesis returned an empty narrative from both endpoints.")
 
     narrative = _scrub_punctuation(narrative)
     narrative = _strip_note_preamble(narrative)
     narrative = _strip_lifecycle_gantt(narrative)
+    narrative = _fix_mermaid_labels(narrative)
 
     out = {
         "narrative": narrative,
-        "model_id": settings.bedrock_model_id,
+        "model_id": f"{model_used} ({source})",
         "input_tokens":  (payload.get("usage") or {}).get("input_tokens"),
         "output_tokens": (payload.get("usage") or {}).get("output_tokens"),
         "cached": False,
     }
     _NARRATIVE_CACHE[cache_key] = out
     return out
+
+
+def _synthesize_via_mantle(prompt: str) -> dict:
+    """Call the bedrock-mantle endpoint's Anthropic Messages API with SigV4.
+
+    Host  : bedrock-mantle.<region>.api.aws
+    Path  : POST /anthropic/v1/messages
+    Auth  : SigV4, service name 'bedrock' (same creds/role as bedrock-runtime)
+    Body  : {"model", "max_tokens", "messages", "anthropic_version"}
+    Returns the parsed JSON (content[].text + usage), matching the shape the
+    caller already expects from invoke_model. read_timeout bounded to 110s so a
+    slow model surfaces a clean 502 before CloudFront's 120s origin cap fires."""
+    import urllib.request
+    import urllib.error
+    import botocore.session
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    region = settings.ops_review_mantle_region
+    host = f"bedrock-mantle.{region}.api.aws"
+    url = f"https://{host}/anthropic/v1/messages"
+    # NB: no `temperature` — Sonnet 5 (and newer models) reject it as deprecated
+    # ("temperature is deprecated for this model"). Omit it entirely.
+    # thinking disabled + max_tokens 8192: matches the runtime path. Unbounded
+    # extended thinking on the complex findings prompt exhausts the token budget
+    # (truncated narrative) and the 120s origin cap. The report is ~2000 output
+    # tokens; with thinking off it finishes fast with the full text.
+    body = json.dumps({
+        "model": settings.ops_review_model,
+        "max_tokens": 8192,
+        "thinking": {"type": "disabled"},
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+
+    creds = botocore.session.get_session().get_credentials().get_frozen_credentials()
+    sig_req = AWSRequest(method="POST", url=url, data=body,
+                         headers={"Content-Type": "application/json", "Host": host,
+                                  "anthropic-version": "2023-06-01"})
+    SigV4Auth(creds, "bedrock", region).add_auth(sig_req)
+
+    req = urllib.request.Request(url, data=body, method="POST")
+    for k, v in sig_req.headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=110) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {e.read().decode()[:300]}")
+
+
+def _synthesize_via_runtime(prompt: str) -> dict:
+    """Fallback: synthesize via bedrock-runtime invoke_model (boto3). Uses the
+    runtime model id (BEDROCK_MODEL_ID / bedrock_model_id, CRIS-prefixed) and the
+    Anthropic InvokeModel body shape. Same one-user-message prompt; returns the
+    parsed JSON (content[].text + usage) so the caller extracts it identically.
+    read_timeout bounded under the 120s origin cap."""
+    import boto3
+    from botocore.config import Config as _BotoConfig
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    client = boto3.client(
+        "bedrock-runtime", region_name=settings.bedrock_region,
+        config=_BotoConfig(retries={"max_attempts": 1, "mode": "standard"},
+                           read_timeout=110, connect_timeout=5),
+    )
+    # Disable extended thinking. On the complex real findings prompt, Sonnet 5's
+    # unbounded reasoning would consume the entire output budget (leaving a
+    # truncated ~410-char narrative at 8192) AND blow past the 120s Lambda/origin
+    # cap (a 120s timeout observed at 16384). The report itself is only ~2000
+    # output tokens; with thinking off it completes in ~25-30s with the full text.
+    # 8192 is ample headroom for the structured report + diagram.
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 8192,
+        "thinking": {"type": "disabled"},
+        "messages": [{"role": "user", "content": prompt}],
+    })
+    try:
+        resp = client.invoke_model(
+            modelId=settings.bedrock_model_id,
+            contentType="application/json", accept="application/json", body=body,
+        )
+    except (BotoCoreError, ClientError) as e:
+        raise RuntimeError(f"{type(e).__name__}: {e}")
+    return json.loads(resp["body"].read())

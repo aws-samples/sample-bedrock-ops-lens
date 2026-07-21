@@ -13,6 +13,7 @@ from .auth import install_auth
 from .config import settings
 from .db import close_pool, init_pool
 from .routers import (
+    attribution as attribution_router,
     cost as cost_router,
     errors as errors_router,
     extras as extras_router,
@@ -26,6 +27,7 @@ from .routers import (
     quota_drilldown as quota_drilldown_router,
     tags as tags_router,
     utility as utility_router,
+    workload_usage as workload_usage_router,
 )
 
 
@@ -68,6 +70,8 @@ app.include_router(model_insights_router.router, prefix="/api", tags=["model-ins
 app.include_router(model_lifecycle_router.router, prefix="/api", tags=["model-lifecycle"])
 app.include_router(opsreview_router.router,  prefix="/api", tags=["ops-review"])
 app.include_router(quota_drilldown_router.router, prefix="/api", tags=["quota-drilldown"])
+app.include_router(workload_usage_router.router, prefix="/api", tags=["workload-usage"])
+app.include_router(attribution_router.router, prefix="/api", tags=["attribution"])
 
 # SPA static mount goes LAST so /api/* takes precedence.
 _static_dir = Path(__file__).parent.parent / "static"

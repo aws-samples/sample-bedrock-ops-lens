@@ -65,6 +65,16 @@ async def _apply(db_url: str, sql_files: list[str]) -> dict:
             # so the Peak-TPM formula can subtract them.
             "ALTER TABLE f_hourly_peak "
             "ADD COLUMN IF NOT EXISTS total_cache_read_input_tokens BIGINT",
+            # Cache-WRITE tokens DO count toward the TPM quota (per the AWS
+            # token-burndown doc: quota input = InputTokenCount +
+            # CacheWriteInputTokens). Store it so the Peak-TPM calc can add it.
+            "ALTER TABLE f_hourly_peak "
+            "ADD COLUMN IF NOT EXISTS total_cache_write_input_tokens BIGINT",
+            # Native EstimatedTPMQuotaUsage — authoritative quota consumption
+            # (AWS bakes in cache-write + burndown). Preferred over the
+            # reconstructed formula when present.
+            "ALTER TABLE f_hourly_peak "
+            "ADD COLUMN IF NOT EXISTS estimated_tpm_quota_usage BIGINT",
         ]
         for stmt in migrations:
             print(f"[schema-init] migration: {stmt[:80]}")
@@ -130,6 +140,15 @@ def handler(event, context):
             os.path.join(task_root, "db", "schema.sql"),
             os.path.join(task_root, "db", "partitions.sql"),
         ]
+        # Migrations run after the base schema. Each is idempotent (uses
+        # ADD COLUMN IF NOT EXISTS + DO blocks gated on pg_constraint state),
+        # so re-running them across deploys is safe. Sorted lexically: name
+        # files NNN_description.sql with zero-padded sequence numbers.
+        migrations_dir = os.path.join(task_root, "db", "migrations")
+        if os.path.isdir(migrations_dir):
+            for name in sorted(os.listdir(migrations_dir)):
+                if name.endswith(".sql"):
+                    sql_files.append(os.path.join(migrations_dir, name))
         for f in sql_files:
             if not os.path.isfile(f):
                 raise FileNotFoundError(f"missing SQL file: {f}")

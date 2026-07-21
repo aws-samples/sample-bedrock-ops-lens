@@ -1,12 +1,13 @@
 // Engagement Signals (= Ops Insights) tab — 12 containers.
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, ColumnLayout, PieChart, LineChart,
-  Box, Badge, Button, Spinner, StatusIndicator,
+  Box, Badge, Spinner, StatusIndicator,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtPct } from '../api.js';
 import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
+import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
 
 function modelShort(id) {
   return (id || '').replace(/^us\./, '').replace(/^eu\./, '').replace(/^global\./, '')
@@ -18,22 +19,36 @@ function severityType(p) {
   return p > 5 ? 'error' : p > 1 ? 'warning' : 'success';
 }
 
-function downloadCsv(filename, rows, columns) {
-  const esc = (v) => {
-    if (v === null || v === undefined) return '';
-    const s = String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  const header = columns.map(c => esc(c.label)).join(',');
-  const body = rows.map(r => columns.map(c => esc(c.get(r))).join(',')).join('\n');
-  const blob = new Blob([header + '\n' + body], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+export default function OpsInsightsTab({ filters, onInfo }) {
+  // CRIS adoption is a bedrock-runtime concept (Mantle is in-region only,
+  // no CRIS aggregation). Keep coverage='full' for runtime; for Mantle
+  // we still render the body but several charts will simply be empty
+  // (no CRIS rows). Coverage='metric' communicates partial fit.
+  const distinct = useApi('/distinct-filters', {}, []).data || {};
+  const mantleAvailable = !!distinct.mantle_available?.volumetric;
+  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
+  return (
+    <EndpointSubTabs
+      selected={endpoint === 'all' ? 'runtime' : endpoint}
+      onChange={setEndpoint}
+      runtimeCoverage="full"
+      mantleCoverage="metric"
+      mantleAvailable={mantleAvailable}
+    >
+      {({ endpoint: ep }) => <OpsInsightsBody filters={filtersWithEp} onInfo={onInfo} endpoint={ep} />}
+    </EndpointSubTabs>
+  );
 }
 
-export default function OpsInsightsTab({ filters, onInfo }) {
+function OpsInsightsBody({ filters, onInfo, endpoint }) {
+  // Thumb rule: on the mantle slice, show only what Mantle CloudWatch
+  // actually exposes (Inferences, 4xx, tokens → volume, throttle-ish, peak
+  // TPM, request shape). CRIS adoption, traffic-type, service tier, cache,
+  // context-length routing, and inference-profile adoption are runtime-only
+  // concepts Mantle doesn't publish — hide those panels rather than render
+  // them empty.
+  const isMantle = endpoint === 'mantle';
   const cris = useApi('/ops-cris-adoption', filters, [JSON.stringify(filters)]);
   const crisGaps = useApi('/ops-cris-by-account', filters, [JSON.stringify(filters)]);
   const profile = useApi('/ops-inference-profile', filters, [JSON.stringify(filters)]);
@@ -112,6 +127,10 @@ export default function OpsInsightsTab({ filters, onInfo }) {
 
   return (
     <SpaceBetween size="l">
+      {/* Runtime-only panels: CRIS adoption, inference-profile, service tier,
+          cache — all runtime concepts Mantle CloudWatch does not publish.
+          Hidden on the mantle slice (thumb rule: show only what exists). */}
+      {!isMantle && <>
       {/* Row 1: 2 columns of pies. fitHeight + grid stretch keeps the two
            cards the same height even when one renders an empty-state Box
            and the other renders a full pie. */}
@@ -166,8 +185,9 @@ export default function OpsInsightsTab({ filters, onInfo }) {
           }
         </Container>
       </div>
+      </>}
 
-      <Container header={<SectionHeader title="CRIS adoption gaps" sectionId="cris-gaps" onInfo={onInfo} />}>
+      {!isMantle && <Container header={<SectionHeader title="CRIS adoption gaps" sectionId="cris-gaps" onInfo={onInfo} />}>
         {crisGaps.loading ? <ChartLoading height={200} /> :
           <PaginatedTable
             items={(crisGaps.data || []).filter(r => Number(r.od_requests) > 0 && Number(r.cris_requests || 0) === 0)}
@@ -179,7 +199,7 @@ export default function OpsInsightsTab({ filters, onInfo }) {
             empty="All Claude workloads use CRIS — nice."
           />
         }
-      </Container>
+      </Container>}
 
       {matrixView && matrixView.models.length > 0 && (
         <Container header={<SectionHeader title={`Region × Model matrix (top ${matrixView.models.length} models)`} sectionId="region-matrix" onInfo={onInfo} />}>
@@ -246,24 +266,12 @@ export default function OpsInsightsTab({ filters, onInfo }) {
           title="Avg RPM & TPM"
           sectionId="avg-rpm-tpm"
           onInfo={onInfo}
-          actions={
-            <Button iconName="download" className="no-print"
-                    onClick={() => downloadCsv(`bedrock-rpm-tpm-${new Date().toISOString().slice(0, 10)}.csv`, peak.data || [], [
-                      { label: 'Account', get: r => r.accountid || r.accountId },
-                      { label: 'Model',   get: r => r.modelid || r.modelId },
-                      { label: 'Region',  get: r => r.region },
-                      { label: 'Peak hour requests', get: r => r.peak_requests_hour },
-                      { label: 'Peak input TPM',     get: r => r.peak_input_tpm },
-                      { label: 'Peak output TPM',    get: r => r.peak_output_tpm },
-                    ])}>
-              Download CSV
-            </Button>
-          }
         />
       }>
         {peak.loading ? <ChartLoading /> :
           <PaginatedTable
             items={peak.data || []}
+            downloadFileName="bedrock-rpm-tpm.csv"
             columnDefinitions={[
               { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
@@ -295,6 +303,7 @@ export default function OpsInsightsTab({ filters, onInfo }) {
         </Container>
       )}
 
+      {!isMantle && <>
       <Container header={<SectionHeader title="Prompt caching adoption" sectionId="caching" onInfo={onInfo} />}>
         {caching.loading ? <ChartLoading /> :
           <PaginatedTable
@@ -332,6 +341,7 @@ export default function OpsInsightsTab({ filters, onInfo }) {
           />
         }
       </Container>
+      </>}
     </SpaceBetween>
   );
 }

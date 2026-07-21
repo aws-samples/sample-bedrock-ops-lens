@@ -26,6 +26,7 @@ import { useApi, fmt, fmtPct } from '../api.js';
 import { ChartLoading, SectionHeader, KpiCard, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import QuotaDrillDown from './QuotaDrillDownTab.jsx';
+import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
 
 // Percentile selector removed for now — the underlying f_hourly_peak table
 // only stores max-over-hour values from CloudWatch, so there is no p50/p90/p99
@@ -51,22 +52,29 @@ function severityForUtil(pct) {
   return pct >= 100 ? 'error' : pct >= 80 ? 'warning' : pct > 0 ? 'success' : 'info';
 }
 
-function downloadCsv(filename, rows, columns) {
-  const esc = (v) => {
-    if (v === null || v === undefined) return '';
-    const s = String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  const header = columns.map(c => esc(c.label)).join(',');
-  const body = rows.map(r => columns.map(c => esc(c.get(r))).join(',')).join('\n');
-  const blob = new Blob([header + '\n' + body], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+export default function QuotasTab({ filters, onInfo }) {
+  // bedrock-mantle quotas are not in AWS Service Quotas (managed internally),
+  // so Mantle gets coverage='defaults'. The tab's utilization view needs
+  // actual Mantle peak-TPM data to be meaningful, so only show the Mantle
+  // sub-tab when such volumetric data exists (else hide it — no blank view).
+  const distinct = useApi('/distinct-filters', {}, []).data || {};
+  const mantleAvailable = !!distinct.mantle_available?.volumetric;
+  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
+  return (
+    <EndpointSubTabs
+      selected={endpoint === 'all' ? 'runtime' : endpoint}
+      onChange={setEndpoint}
+      runtimeCoverage="full"
+      mantleCoverage="defaults"
+      mantleAvailable={mantleAvailable}
+    >
+      {() => <QuotasBody filters={filtersWithEp} onInfo={onInfo} />}
+    </EndpointSubTabs>
+  );
 }
 
-export default function QuotasTab({ filters, onInfo }) {
+function QuotasBody({ filters, onInfo }) {
   const [scope, setScope] = useState('per-account');
 
   const peak = useApi('/ops-peak-rpm', filters, [JSON.stringify(filters)]);
@@ -227,27 +235,11 @@ export default function QuotasTab({ filters, onInfo }) {
           sectionId="ops-capacity-health"
           onInfo={onInfo}
           actions={
-            <SpaceBetween size="xs" direction="horizontal">
-              <SegmentedControl
-                selectedId={scope}
-                onChange={({ detail }) => setScope(detail.selectedId)}
-                options={SCOPE_OPTIONS.map(o => ({ id: o.id, text: o.label }))}
-              />
-              <Button iconName="download" className="no-print"
-                      onClick={() => downloadCsv(`bedrock-quotas-${scope}-${new Date().toISOString().slice(0,10)}.csv`, aggregated, [
-                        scope === 'per-account'
-                          ? { label: 'Account', get: r => r.accountId }
-                          : { label: 'Model + region', get: r => `${r.modelId} (${r.region})` },
-                        { label: 'Peak TPM (per min)', get: r => Math.round(r.peak_tpm) },
-                        { label: 'TPM limit',          get: r => r.tpm_lim || '' },
-                        { label: 'TPM util %',         get: r => r.tpm_util != null ? r.tpm_util.toFixed(2) : '' },
-                        { label: 'Peak RPM (per min)', get: r => Math.round(r.peak_rpm) },
-                        { label: 'RPM limit',          get: r => r.rpm_lim || '' },
-                        { label: 'RPM util %',         get: r => r.rpm_util != null ? r.rpm_util.toFixed(2) : '' },
-                      ])}>
-                Export CSV
-              </Button>
-            </SpaceBetween>
+            <SegmentedControl
+              selectedId={scope}
+              onChange={({ detail }) => setScope(detail.selectedId)}
+              options={SCOPE_OPTIONS.map(o => ({ id: o.id, text: o.label }))}
+            />
           }
         />
       }>
@@ -255,6 +247,7 @@ export default function QuotasTab({ filters, onInfo }) {
           items={aggregated}
           pageSize={15}
           trackBy="key"
+          downloadFileName="bedrock-quota-utilization.csv"
           columnDefinitions={
             scope === 'per-account'
               ? [

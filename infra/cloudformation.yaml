@@ -76,6 +76,23 @@ Parameters:
       per-region setting; it is commonly enabled in us-east-1). The
       invocation_logs ingester reads logs from this region. Empty falls back
       to the deploy region.
+  ProxyEventsBucket:
+    Type: String
+    Default: ''
+    Description: |
+      Optional S3 bucket where a GenAI proxy fronting Bedrock delivers
+      per-request, metadata-only telemetry (workload, model, tokens, status,
+      latency — NO prompt/response text) under proxy-events/<region>/...
+      Enables the per-workload "Workloads" view (Task A). If empty, the
+      proxy_events ingester is skipped. Read-only, cross-account — no public
+      inbound endpoint.
+  ProxyEventsRegions:
+    Type: String
+    Default: ''
+    Description: |
+      Comma-separated regions the proxy partitions its events under in
+      ProxyEventsBucket. Empty falls back to BedrockLogsRegion, then the
+      deploy region.
   IngesterScheduleHour:
     Type: Number
     Default: 5
@@ -101,6 +118,7 @@ Parameters:
 Conditions:
   AdminOnlySignUp:    !Equals [ !Ref CognitoSelfSignUp, 'disabled' ]
   HasBedrockLogsBkt:  !Not [ !Equals [ !Ref BedrockLogsBucket, '' ] ]
+  HasProxyEventsBkt:  !Not [ !Equals [ !Ref ProxyEventsBucket, '' ] ]
   HasCognitoDomain:   !Not [ !Equals [ !Ref CognitoDomainPrefix, '' ] ]
 
 # =============================================================================
@@ -1066,6 +1084,16 @@ Resources:
                     - !Sub 'arn:${AWS::Partition}:s3:::${BedrockLogsBucket}'
                     - !Sub 'arn:${AWS::Partition}:s3:::${BedrockLogsBucket}/*'
                 - !Ref AWS::NoValue
+              # GenAI proxy per-workload events bucket (read-only, Task A).
+              # Same no-op-when-empty pattern as the invocation-logs grant.
+              - !If
+                - HasProxyEventsBkt
+                - Effect: Allow
+                  Action: [ s3:ListBucket, s3:GetObject ]
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${ProxyEventsBucket}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${ProxyEventsBucket}/*'
+                - !Ref AWS::NoValue
 
   IngesterLambda:
     Type: AWS::Lambda::Function
@@ -1123,6 +1151,11 @@ Resources:
           # elsewhere). The invocation_logs ingester reads from this region;
           # empty falls back to BEDROCK_REGION (the deploy region).
           BEDROCK_LOGS_REGION: !Ref BedrockLogsRegion
+          # GenAI proxy per-workload events bucket (Task A). When non-empty the
+          # ingester also runs the proxy_events path → f_proxy_usage_hourly →
+          # the "Workloads" view. Empty = skipped.
+          PROXY_EVENTS_BUCKET: !Ref ProxyEventsBucket
+          PROXY_EVENTS_REGIONS: !Ref ProxyEventsRegions
 
   # Daily schedule. Cron: at IngesterScheduleHour:00 UTC every day.
   IngesterSchedule:

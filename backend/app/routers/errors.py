@@ -108,6 +108,100 @@ async def errors_hourly_trend(
     return db.rows_to_dicts(rows)
 
 
+@router.get("/mantle-health")
+async def mantle_health(f: FilterSet = Depends(parse_filters)):
+    """Health view for the bedrock-mantle endpoint.
+
+    Mantle's CloudWatch surface (AWS/BedrockMantle) publishes request volume
+    (Inferences) and a single aggregate client-error count (InferenceClientErrors,
+    a 4xx roll-up with throttles folded in) — but NO 5xx, no per-status-code
+    split, and no invocation logs. So the runtime Errors layout (per-code
+    stacked bars, 429-vs-4xx-vs-5xx trend) has nothing to render and reads as
+    blank/broken when Mantle traffic is healthy.
+
+    This endpoint instead returns exactly the signals Mantle DOES expose, framed
+    as health rather than errors:
+
+      summary:   {total_requests, client_errors_4xx, successful_requests,
+                  error_rate_pct, success_rate_pct, unique_accounts}
+      trend:     [{event_date, total_requests, client_errors_4xx, error_rate_pct}]
+      by_model:  [{modelId, total_requests, client_errors_4xx, error_rate_pct}]
+
+    client_errors_4xx uses f_daily.failed_requests, which for the Mantle slice
+    IS the aggregate 4xx count the mantle ingester wrote. We deliberately do NOT
+    read status_429_count here — the ingester folds the whole 4xx total into
+    that column, which would mislabel ordinary client errors as "throttles".
+    """
+    # Force the mantle slice regardless of the tab's switcher state.
+    forced = FilterSet(start=f.start, end=f.end, provider=f.provider,
+                       region=f.region, accounts=f.accounts,
+                       traffic_type=f.traffic_type, tag_filter=f.tag_filter,
+                       endpoint="mantle")
+    w = build_where(forced)
+
+    summary_row = await db.fetchrow(
+        f"""
+        SELECT
+          COALESCE(SUM(total_requests), 0)::BIGINT      AS total_requests,
+          COALESCE(SUM(failed_requests), 0)::BIGINT     AS client_errors_4xx,
+          COALESCE(SUM(successful_requests), 0)::BIGINT AS successful_requests,
+          COUNT(DISTINCT accountId)::BIGINT             AS unique_accounts
+        FROM f_daily
+        WHERE {w.sql}
+        """,
+        *w.params,
+    )
+    s = dict(summary_row) if summary_row else {
+        "total_requests": 0, "client_errors_4xx": 0,
+        "successful_requests": 0, "unique_accounts": 0}
+    total = int(s["total_requests"] or 0)
+    errs = int(s["client_errors_4xx"] or 0)
+    s["error_rate_pct"] = round(errs * 100 / total, 4) if total else 0.0
+    s["success_rate_pct"] = round((total - errs) * 100 / total, 4) if total else 0.0
+
+    trend_rows = await db.fetch(
+        f"""
+        SELECT year, month, day,
+          SUM(total_requests)::BIGINT  AS total_requests,
+          SUM(failed_requests)::BIGINT AS client_errors_4xx
+        FROM f_daily
+        WHERE {w.sql}
+        GROUP BY year, month, day
+        ORDER BY year, month, day
+        """,
+        *w.params,
+    )
+    trend = []
+    for r in trend_rows:
+        d = dict(r)
+        t = int(d["total_requests"] or 0)
+        e = int(d["client_errors_4xx"] or 0)
+        d["error_rate_pct"] = round(e * 100 / t, 4) if t else 0.0
+        trend.append(d)
+
+    model_rows = await db.fetch(
+        f"""
+        SELECT modelId,
+          SUM(total_requests)::BIGINT  AS total_requests,
+          SUM(failed_requests)::BIGINT AS client_errors_4xx
+        FROM f_daily
+        WHERE {w.sql}
+        GROUP BY modelId
+        ORDER BY total_requests DESC
+        """,
+        *w.params,
+    )
+    by_model = []
+    for r in model_rows:
+        d = dict(r)
+        t = int(d["total_requests"] or 0)
+        e = int(d["client_errors_4xx"] or 0)
+        d["error_rate_pct"] = round(e * 100 / t, 4) if t else 0.0
+        by_model.append(d)
+
+    return {"summary": s, "trend": trend, "by_model": by_model}
+
+
 @router.get("/status-codes")
 async def status_codes(f: FilterSet = Depends(parse_filters)):
     """Real per-HTTP-status-code hourly breakdown for the "Status Codes" chart.
@@ -151,6 +245,12 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
         from ..filters import PROVIDER_PREFIX
         parts.append(f"modelId LIKE ${len(params)+1}")
         params.append(PROVIDER_PREFIX[f.provider] + "%")
+    # Endpoint slice: f_hourly_status now carries the runtime/mantle endpoint
+    # (from invocation logs), so honor the tab's switcher — else runtime and
+    # mantle rendered the identical per-status-code series.
+    if f.endpoint != "all":
+        parts.append(f"endpoint = ${len(params)+1}")
+        params.append(f.endpoint)
     where = " AND ".join(parts)
 
     rows = await db.fetch(
@@ -209,9 +309,21 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
     import os as _os
     logs_bucket_configured = bool(_os.environ.get("BEDROCK_LOGS_BUCKET", "").strip())
 
-    range_row = await db.fetch(
-        "SELECT MIN(event_date) AS mn, MAX(event_date) AS mx, COUNT(*) AS n FROM f_hourly_status"
-    )
+    # Scope the "does ANY data exist" probe to the SAME endpoint slice as the
+    # series query. Otherwise the Mantle sub-tab (which has no per-code data —
+    # Mantle publishes no invocation logs) would see runtime's rows here and
+    # wrongly report 'out_of_window' pointing at runtime's date range, instead
+    # of the honest 'no_data' for the Mantle endpoint.
+    if f.endpoint != "all":
+        range_row = await db.fetch(
+            "SELECT MIN(event_date) AS mn, MAX(event_date) AS mx, COUNT(*) AS n "
+            "FROM f_hourly_status WHERE endpoint = $1",
+            f.endpoint,
+        )
+    else:
+        range_row = await db.fetch(
+            "SELECT MIN(event_date) AS mn, MAX(event_date) AS mx, COUNT(*) AS n FROM f_hourly_status"
+        )
     total_rows = int(range_row[0]["n"] or 0) if range_row else 0
     available_range = None
     if total_rows > 0 and range_row[0]["mn"] is not None:

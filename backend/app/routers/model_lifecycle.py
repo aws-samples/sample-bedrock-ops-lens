@@ -141,7 +141,10 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
         SELECT modelId,
                SUM(total_requests)::BIGINT     AS total_requests,
                COUNT(DISTINCT accountId)::INT  AS unique_accounts,
-               MAX(event_date)                 AS last_accessed
+               MAX(event_date)                 AS last_accessed,
+               -- gap E: LegacyModelInvocations (calls against models AWS marks
+               -- legacy). Confirms migration urgency: legacy AND actively used.
+               COALESCE(SUM(legacy_invocations),0)::BIGINT AS legacy_invocations
         FROM f_daily
         WHERE {where_sql}
         GROUP BY modelId
@@ -188,6 +191,7 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
         agg_total = int(agg["total_requests"]) if agg else 0
         agg_accts = int(agg["unique_accounts"]) if agg else 0
         agg_last = agg["last_accessed"] if agg else None
+        agg_legacy = int(agg["legacy_invocations"]) if agg else 0
         details: list = list(detail_by_model.get(legacy_id, []))
 
         for used_id, u in usage_by_model.items():
@@ -197,13 +201,14 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
             # legacy id. Same for eu., global., apac. prefixes.
             if used_id.endswith(legacy_id) or used_id.endswith(legacy_id.split(":")[0]):
                 agg_total += int(u["total_requests"] or 0)
+                agg_legacy += int(u["legacy_invocations"] or 0)
                 # accounts unioned isn't precise, but this is presentation
                 agg_accts = max(agg_accts, int(u["unique_accounts"] or 0))
                 d = u["last_accessed"]
                 if d and (not agg_last or d > agg_last):
                     agg_last = d
                 details.extend(detail_by_model.get(used_id, []))
-        return agg_total, agg_accts, agg_last, details
+        return agg_total, agg_accts, agg_last, details, agg_legacy
 
     # --- 4. Assemble per-model rows + severity.
     out_models = []
@@ -217,7 +222,7 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
         if sev == "active":
             continue
 
-        total_req, uniq_accts, last_acc, details = _matching_usage(mid)
+        total_req, uniq_accts, last_acc, details, legacy_inv = _matching_usage(mid)
         if total_req > 0:
             in_use += 1
 
@@ -232,6 +237,7 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
             "regions":              list(r["regions"] or []),
             "recommended_upgrade":  _recommended_upgrade(mid),
             "total_requests":       total_req,
+            "legacy_invocations":   legacy_inv,
             "unique_accounts":      uniq_accts,
             "last_accessed":        last_acc.isoformat() if last_acc else None,
             "accounts_detail":      details,

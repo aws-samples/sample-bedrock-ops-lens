@@ -82,6 +82,8 @@ mcp/*.egg-info/
 mcp/src/*.egg-info/
 mcp/build/
 
-# Local-only artifacts and internal docs (never shipped)
-.scan-artifacts/
-docs/
+# Local-only artifacts (never shipped)
+.holmes-loop/
+
+# local playwright scratch (contains creds — never commit)
+frontend/_ops*.cjs

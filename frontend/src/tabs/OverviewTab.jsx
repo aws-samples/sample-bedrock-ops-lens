@@ -9,6 +9,7 @@ import {
   ChartLoading, KpiCard, SectionHeader, SeverityCell, CHART_I18N,
 } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
+import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
 
 function modelShort(id) {
   return (id || '').replace(/^us\./, '').replace(/^eu\./, '').replace(/^global\./, '')
@@ -42,6 +43,10 @@ const GROUP_BY_OPTIONS = [
   { value: 'provider', label: 'Provider' },
   { value: 'traffic',  label: 'Traffic type' },
   { value: 'region',   label: 'Region' },
+  // Endpoint split: runtime vs mantle stacked per day, straight off
+  // /daily-trend's runtime_requests / mantle_requests columns (no separate
+  // fetch). Lets a manager see the composition over time at a glance.
+  { value: 'endpoint', label: 'Endpoint (runtime / mantle)' },
   // "Cost" reads from /cost-by-model rather than /daily-breakdown — the
   // y-axis switches from request count to dollars, but the visual
   // (stacked bars per day, top-N + Other) is the same shape.
@@ -49,17 +54,50 @@ const GROUP_BY_OPTIONS = [
 ];
 
 export default function OverviewTab({ filters, onInfo }) {
+  // Local endpoint state — defaults to 'all' so the consolidated KPI
+  // ribbon shows the full picture. The two-segment switcher below is
+  // the per-tab override. The bedrock-mantle segment shows only when
+  // Mantle volumetric data actually exists (else it's hidden, no blank
+  // view) — signalled by /distinct-filters.mantle_available.
+  const distinct = useApi('/distinct-filters', {}, []).data || {};
+  const mantleAvailable = !!distinct.mantle_available?.volumetric;
+  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
+  return (
+    <SpaceBetween size="m">
+      <EndpointSubTabs
+        selected={endpoint === 'all' ? 'runtime' : endpoint}
+        onChange={setEndpoint}
+        runtimeCoverage="full"
+        mantleCoverage="metric"
+        mantleAvailable={mantleAvailable}
+      >
+        {() => <OverviewBody filters={filtersWithEp} onInfo={onInfo} />}
+      </EndpointSubTabs>
+    </SpaceBetween>
+  );
+}
+
+function OverviewBody({ filters, onInfo }) {
   const [groupBy, setGroupBy] = useState(GROUP_BY_OPTIONS[0]);
+  // Spend tile in-card toggle: on an endpoint sub-tab, flip between that
+  // endpoint's allocated slice ('endpoint') and the combined CE total ('total').
+  const [spendView, setSpendView] = useState('endpoint');
 
   const summary = useApi('/summary', filters, [JSON.stringify(filters)]);
   const wow = useApi('/wow-comparison', {}, []);
   const trend = useApi('/daily-trend', filters, [JSON.stringify(filters)]);
   const cost  = useApi('/cost-summary', filters, [JSON.stringify(filters)]);
   const costByModel = useApi('/cost-by-model', filters, [JSON.stringify(filters)]);
+  // /daily-breakdown only supports model/provider/traffic/region. For 'none',
+  // 'cost', and 'endpoint' we don't call it (endpoint is served from
+  // /daily-trend's split columns; cost from /cost-by-model).
+  const breakdownGroupBy = ['model', 'provider', 'traffic', 'region'].includes(groupBy.value)
+    ? groupBy.value : undefined;
   const breakdown = useApi(
     '/daily-breakdown',
-    { ...filters, group_by: groupBy.value === 'none' ? undefined : groupBy.value },
-    [JSON.stringify(filters), groupBy.value],
+    { ...filters, group_by: breakdownGroupBy },
+    [JSON.stringify(filters), breakdownGroupBy],
   );
   const byModel = useApi('/requests-by-model', filters, [JSON.stringify(filters)]);
   const byTraffic = useApi('/traffic-types', filters, [JSON.stringify(filters)]);
@@ -84,15 +122,45 @@ export default function OverviewTab({ filters, onInfo }) {
   const errorRate = s.total_requests ? (s.failed_requests * 100 / s.total_requests) : 0;
   const errorRatePrev = prev.total_requests ? (prev.failed_requests * 100 / prev.total_requests) : 0;
 
+  // Runtime/mantle composition for the KPI tiles. Show the split only when
+  // there IS mantle usage in the window (else runtime-only fleets stay clean).
+  // The KPI total above already reflects the current endpoint filter; this
+  // subtext always shows the underlying runtime·mantle breakdown so a
+  // manager sees "total + what's Mantle" at a glance, no toggle.
+  const be = s.by_endpoint || {};
+  const mantleReqs = Number(be.mantle?.total_requests || 0);
+  const kpiSplit = (rtField, mtField) => (
+    mantleReqs > 0
+      ? { runtime: fmt(be.runtime?.[rtField] ?? 0), mantle: fmt(be.mantle?.[mtField ?? rtField] ?? 0) }
+      : undefined
+  );
+
   // Daily trend → BarChart series (stacked successful + failed)
   const trendSeries = useMemo(() => {
     if (!trend.data) return [];
     return [
-      { title: 'Successful', type: 'bar',
+      { title: 'Successful', type: 'bar', valueFormatter: fmt,
         data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.successful_requests || 0) })) },
-      { title: 'Failed', type: 'bar',
+      { title: 'Failed', type: 'bar', valueFormatter: fmt,
         data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.failed_requests || 0) })) },
     ];
+  }, [trend.data]);
+
+  // Endpoint split: runtime vs mantle stacked per day (from /daily-trend's
+  // conditional-sum columns). Mantle series dropped when there's zero mantle
+  // volume so runtime-only fleets don't get an empty second series.
+  const endpointSeries = useMemo(() => {
+    if (!trend.data) return [];
+    const mantleTotal = trend.data.reduce((a, r) => a + Number(r.mantle_requests || 0), 0);
+    const series = [
+      { title: 'bedrock-runtime', type: 'bar', color: '#0972d3', valueFormatter: fmt,
+        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.runtime_requests || 0) })) },
+    ];
+    if (mantleTotal > 0) {
+      series.push({ title: 'bedrock-mantle', type: 'bar', color: '#12cdd4', valueFormatter: fmt,
+        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.mantle_requests || 0) })) });
+    }
+    return series;
   }, [trend.data]);
 
   // Breakdown series (top categories, "Other" pinned to end)
@@ -114,9 +182,22 @@ export default function OverviewTab({ filters, onInfo }) {
     return cats.map(cat => ({
       title: cat,
       type: 'bar',
-      data: byCat.get(cat).map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.total_requests) })),
+      valueFormatter: fmt,
+      data: byCat.get(cat)
+        .map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.total_requests) }))
+        .sort((a, b) => a.x - b.x),
     }));
   }, [breakdown.data, groupBy.value]);
+
+  // Shared chronological x-domain for the request-volume charts (breakdown +
+  // endpoint), so the categorical axis is ordered regardless of the order
+  // categories introduce dates.
+  const volumeXDomain = useMemo(() => {
+    const src = (groupBy.value === 'endpoint' ? (trend.data || []) : (breakdown.data || []));
+    const ds = new Set();
+    for (const r of src) ds.add(new Date(r.year, r.month - 1, r.day).getTime());
+    return [...ds].sort((a, b) => a - b).map(t => new Date(t));
+  }, [breakdown.data, trend.data, groupBy.value]);
 
   // Cost-by-model stacked series — same shape as breakdownSeries but
   // sourced from /cost-by-model. Used when groupBy='cost'.
@@ -149,10 +230,21 @@ export default function OverviewTab({ filters, onInfo }) {
     return cats.map(cat => ({
       title: cat,
       type: 'bar',
+      // Sort by real date, not string compare — event_date formats can vary and
+      // a lexical sort scrambles the categorical x-axis (Jun 3, Jun 22, Jun 7…).
       data: [...folded.get(cat).entries()]
-        .sort((a, b) => a[0].localeCompare(b[0]))
+        .sort((a, b) => new Date(a[0]) - new Date(b[0]))
         .map(([day, amt]) => ({ x: new Date(day), y: amt })),
     }));
+  }, [costByModel.data]);
+
+  // Explicit chronological x-domain shared by all cost series, so the
+  // categorical axis is ordered even when series introduce dates in different
+  // orders.
+  const costXDomain = useMemo(() => {
+    const ds = new Set();
+    for (const r of (costByModel.data || [])) ds.add(r.event_date);
+    return [...ds].sort((a, b) => new Date(a) - new Date(b)).map(d => new Date(d));
   }, [costByModel.data]);
 
   // Health indicators
@@ -173,8 +265,8 @@ export default function OverviewTab({ filters, onInfo }) {
   const tokenSeries = useMemo(() => {
     if (!trend.data) return [];
     return [
-      { title: 'Input tokens',  type: 'bar', data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.input_tokens || 0) })) },
-      { title: 'Output tokens', type: 'bar', data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.output_tokens || 0) })) },
+      { title: 'Input tokens',  type: 'bar', valueFormatter: fmt, data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.input_tokens || 0) })) },
+      { title: 'Output tokens', type: 'bar', valueFormatter: fmt, data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.output_tokens || 0) })) },
     ];
   }, [trend.data]);
 
@@ -209,11 +301,21 @@ export default function OverviewTab({ filters, onInfo }) {
 
   const opsData = useMemo(() => {
     if (!byOp.data) return [];
+    // The AWS/Bedrock CloudWatch metrics carry no `operation` dimension, so the
+    // ingester stores the '__none__' sentinel unless invocation logs (which do
+    // record the API operation) are enabled. Show a human label instead of the
+    // raw sentinel.
     return byOp.data.map(r => ({
-      title: r.operation || 'Other',
+      title: (r.operation && r.operation !== '__none__') ? r.operation : 'Not attributed',
       value: Number(r.total_requests),
     }));
   }, [byOp.data]);
+
+  // When operation is entirely unattributed (CW-only, no invocation logs), the
+  // pie is a single "Not attributed" slice — call that out honestly.
+  const opsAllUnattributed = useMemo(
+    () => opsData.length === 1 && opsData[0].title === 'Not attributed',
+    [opsData]);
 
   const topReqData = useMemo(() => {
     if (!byModel.data) return [];
@@ -244,16 +346,23 @@ export default function OverviewTab({ filters, onInfo }) {
     }
     const top = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 7).map(([k]) => k);
     const topSet = new Set(top);
-    const byCat = new Map();
+    // Fold non-top models into 'Other', summing per (category, date) so a day
+    // never has two segments for the same category.
+    const byCatDate = new Map();   // cat -> Map(dateStr -> cost)
     for (const r of costByModel.data) {
       const cat = topSet.has(r.model_label) ? r.model_label : 'Other';
-      if (!byCat.has(cat)) byCat.set(cat, []);
-      byCat.get(cat).push(r);
+      if (!byCatDate.has(cat)) byCatDate.set(cat, new Map());
+      const m = byCatDate.get(cat);
+      m.set(r.event_date, (m.get(r.event_date) || 0) + Number(r.total_cost || 0));
     }
-    return [...byCat.entries()].map(([cat, rows]) => ({
+    return [...byCatDate.entries()].map(([cat, m]) => ({
       title: modelShort(cat),
       type: 'bar',
-      data: rows.map(r => ({ x: new Date(r.event_date), y: Number(r.total_cost) })),
+      // Sort by real date, not string compare — the API returns rows grouped by
+      // model, so without this the categorical x-axis renders days out of order.
+      data: [...m.entries()]
+        .sort((a, b) => new Date(a[0]) - new Date(b[0]))
+        .map(([d, cost]) => ({ x: new Date(d), y: cost })),
     }));
   }, [costByModel.data]);
   const isCostDerived = useMemo(() => {
@@ -281,29 +390,54 @@ export default function OverviewTab({ filters, onInfo }) {
       ]}>
         <KpiCard title="Total requests"
                  value={fmt(s.total_requests)}
-                 wow={[cur.total_requests, prev.total_requests]} />
+                 wow={[cur.total_requests, prev.total_requests]}
+                 split={kpiSplit('total_requests')} />
         <KpiCard title="Active accounts"
                  value={fmt(s.unique_accounts)}
                  wow={[cur.unique_accounts, prev.unique_accounts]} />
         <KpiCard title="Input tokens"
                  value={fmt(s.total_input_tokens)}
-                 wow={[cur.total_input_tokens, prev.total_input_tokens]} />
+                 wow={[cur.total_input_tokens, prev.total_input_tokens]}
+                 split={kpiSplit('total_input_tokens')} />
         <KpiCard title="Error rate"
                  value={fmtPct(errorRate)}
                  wow={[errorRate, errorRatePrev]} invert />
-        <KpiCard title="Total spend"
-                 value={cost.data
-                   ? `${cost.data.currency === 'USD' ? '$' : cost.data.currency + ' '}${
-                     // Don't K-abbreviate currency — $1.0K loses precision and
-                     // makes ranges look frozen ($1.0K in two windows that
-                     // actually differ by $200). Use full localized number
-                     // with 2 decimals instead.
-                     Number(cost.data.total_cost).toLocaleString(undefined, {
-                       minimumFractionDigits: 2, maximumFractionDigits: 2,
-                     })
-                   }`
-                   : '—'}
-                 wow={[cost.data?.total_cost, cost.data?.previous_total_cost]} invert />
+        {(() => {
+          // Cost Explorer gives an invoice-accurate TOTAL but no runtime-vs-
+          // mantle dimension. On a specific endpoint sub-tab, show that
+          // endpoint's ALLOCATED share (total split by each endpoint's
+          // token-cost weight) rather than repeating the same flat total —
+          // labeled as an allocation so it's honest.
+          const ep = filters.endpoint;
+          const be = cost.data?.by_endpoint;
+          const onEndpoint = (ep === 'runtime' || ep === 'mantle') && be;
+          // On an endpoint sub-tab, the in-card toggle picks which figure shows:
+          // that endpoint's allocated slice, or the combined CE total.
+          const showAlloc = onEndpoint && spendView === 'endpoint';
+          const cur = cost.data?.currency === 'USD' ? '$' : (cost.data?.currency || '') + ' ';
+          const amount = showAlloc ? Number(be[ep] || 0) : Number(cost.data?.total_cost || 0);
+          const fmtUsd = (n) => `${cur}${n.toLocaleString(undefined, {
+            minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+          return (
+            <KpiCard title="Total spend"
+                     tabs={onEndpoint ? {
+                       selectedId: spendView,
+                       onChange: setSpendView,
+                       options: [
+                         { id: 'endpoint', text: ep === 'mantle' ? 'Mantle' : 'Runtime' },
+                         { id: 'total', text: 'Total' },
+                       ],
+                     } : undefined}
+                     value={cost.data ? fmtUsd(amount) : '—'}
+                     wow={showAlloc ? undefined : [cost.data?.total_cost, cost.data?.previous_total_cost]}
+                     invert
+                     split={be && ep === 'all'
+                       ? { runtime: fmtUsd(Number(be.runtime || 0)),
+                           mantle: be.mantle != null ? fmtUsd(Number(be.mantle)) : null }
+                       : undefined}
+                     note={showAlloc ? 'token-cost share' : undefined} />
+          );
+        })()}
       </Grid>
 
       {/* 2. Request Volume + Group by */}
@@ -328,6 +462,7 @@ export default function OverviewTab({ filters, onInfo }) {
               <BarChart
                 series={costSeries}
                 xScaleType="categorical"
+                xDomain={costXDomain}
                 stackedBars
                 hideFilter
                 ariaLabel="Daily spend by model"
@@ -347,16 +482,36 @@ export default function OverviewTab({ filters, onInfo }) {
               </Box>
             )
           ) :
+          groupBy.value === 'endpoint' ? (
+            <BarChart
+              series={endpointSeries}
+              xScaleType="categorical"
+              xDomain={volumeXDomain}
+              stackedBars
+              hideFilter
+              ariaLabel="Daily request volume by endpoint"
+              i18nStrings={{
+                ...CHART_I18N,
+                xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                yTickFormatter: fmt,
+              }}
+              height={250}
+              empty={<ChartLoading />}
+              xTitle="Day" yTitle="Requests"
+            />
+          ) :
           breakdownSeries ? (
             <BarChart
               series={breakdownSeries}
               xScaleType="categorical"
+              xDomain={volumeXDomain}
               stackedBars
               hideFilter
               ariaLabel="Daily request volume by category"
               i18nStrings={{
                 ...CHART_I18N,
                 xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                yTickFormatter: fmt,
               }}
               height={250}
               empty={<ChartLoading />}
@@ -372,6 +527,7 @@ export default function OverviewTab({ filters, onInfo }) {
               i18nStrings={{
                 ...CHART_I18N,
                 xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                yTickFormatter: fmt,
               }}
               height={250}
               xTitle="Day" yTitle="Requests"
@@ -401,7 +557,7 @@ export default function OverviewTab({ filters, onInfo }) {
             <BarChart
               series={stackSuccess} stackedBars hideFilter xScaleType="categorical"
               ariaLabel="Requests success/failed"
-              i18nStrings={{ ...CHART_I18N, xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }}
+              i18nStrings={{ ...CHART_I18N, xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), yTickFormatter: fmt }}
               height={200}
             />
           }
@@ -411,7 +567,7 @@ export default function OverviewTab({ filters, onInfo }) {
             <BarChart
               series={tokenSeries} stackedBars hideFilter xScaleType="categorical"
               ariaLabel="Tokens input/output"
-              i18nStrings={{ ...CHART_I18N, xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }}
+              i18nStrings={{ ...CHART_I18N, xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), yTickFormatter: fmt }}
               height={200}
             />
           }
@@ -443,6 +599,16 @@ export default function OverviewTab({ filters, onInfo }) {
         </Container>
         <Container fitHeight header={<SectionHeader title="Operations" sectionId="operations" onInfo={onInfo} />}>
           {byOp.loading ? <ChartLoading height={180} /> :
+            opsAllUnattributed ? (
+              <Box textAlign="center" color="text-body-secondary" padding={{ vertical: 'l' }}>
+                <b>Operation not available from CloudWatch.</b>
+                <div style={{ fontSize: '12px', marginTop: 4 }}>
+                  AWS/Bedrock metrics aren’t broken out by API operation
+                  (Converse / InvokeModel). Enable Bedrock model invocation
+                  logging to attribute requests by operation.
+                </div>
+              </Box>
+            ) :
             <PieChart data={opsData} size="small" hideFilter
                       ariaLabel="Operations"
                       empty="No data" />
@@ -500,6 +666,7 @@ export default function OverviewTab({ filters, onInfo }) {
           <BarChart
             series={spendSeries}
             xScaleType="categorical"
+            xDomain={costXDomain}
             stackedBars
             hideFilter
             ariaLabel="Spend by model"

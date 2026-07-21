@@ -59,6 +59,10 @@ class FilterSet:
     # Tag filter: list of (tag_key, tag_value) AND-d across keys, OR-d within a key.
     # Frontend serializes as ?tag_filter=team:platform,team:ml&tag_filter=env:prod
     tag_filter: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # Bedrock endpoint slice: 'runtime' (AWS/Bedrock CW namespace, the
+    # bedrock-runtime API), 'mantle' (AWS/BedrockMantle, bedrock-mantle
+    # endpoint), or 'all' to sum across both. Defaults to 'all'.
+    endpoint: str = "all"
 
 
 def parse_filters(
@@ -70,6 +74,7 @@ def parse_filters(
     accounts: str | None = Query(None, description="comma-separated 12-digit IDs"),
     traffic_type: str = Query("all"),
     tag_filter: list[str] | None = Query(None, description="key:value, repeatable"),
+    endpoint: str = Query("all", description="bedrock-runtime / bedrock-mantle / all"),
 ) -> FilterSet:
     """FastAPI dependency — pass as a function param to inherit all filters."""
     today = date.today()
@@ -88,6 +93,11 @@ def parse_filters(
 
     if traffic_type not in TRAFFIC_TYPE_MAP and traffic_type != "all":
         traffic_type = "all"
+
+    # Endpoint allowlist. Drop unknown values rather than 400-ing — keeps
+    # the dashboard tolerant of stale URLs.
+    if endpoint not in ("runtime", "mantle", "all"):
+        endpoint = "all"
 
     accounts_tuple: tuple[str, ...] = ()
     if accounts:
@@ -116,6 +126,7 @@ def parse_filters(
         accounts=accounts_tuple,
         traffic_type=traffic_type,
         tag_filter=tag_tuple,
+        endpoint=endpoint,
     )
 
 
@@ -132,12 +143,15 @@ def build_where(
     table_alias: str = "",
     has_traffic_type: bool = True,
     has_account: bool = True,
+    has_endpoint: bool = True,
 ) -> Where:
     """Build a WHERE-clause fragment from the FilterSet.
 
-    `has_traffic_type` and `has_account` let you turn off filters when the
-    target table doesn't have those columns (e.g., f_latency_daily has no
-    accountId so account filtering is impossible).
+    `has_traffic_type`, `has_account`, `has_endpoint` let you turn off
+    filters when the target table doesn't have those columns (e.g.,
+    f_daily_cost has no `endpoint` column — Cost Explorer is endpoint-
+    agnostic, so passing `has_endpoint=False` makes the cost router
+    immune to UI endpoint switches).
     """
     a = (table_alias + ".") if table_alias else ""
     parts: list[str] = []
@@ -163,6 +177,10 @@ def build_where(
         tts = TRAFFIC_TYPE_MAP[f.traffic_type]
         parts.append(f"{a}traffic_type = ANY(${len(params)+1}::text[])")
         params.append(list(tts))
+
+    if has_endpoint and f.endpoint != "all":
+        parts.append(f"{a}endpoint = ${len(params)+1}")
+        params.append(f.endpoint)
 
     return Where(sql=" AND ".join(parts), params=params)
 

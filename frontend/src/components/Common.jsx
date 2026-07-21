@@ -1,5 +1,5 @@
 // Reusable presentational components shared across tabs.
-import { Container, Box, Header, Spinner, Link, StatusIndicator } from '@cloudscape-design/components';
+import { Container, Box, Header, Spinner, Link, StatusIndicator, SegmentedControl } from '@cloudscape-design/components';
 
 export function ChartLoading({ height = 220, label = 'Loading…' }) {
   return (
@@ -15,12 +15,63 @@ export function ChartLoading({ height = 220, label = 'Loading…' }) {
   );
 }
 
-export function KpiCard({ title, value, wow, invert }) {
+export function KpiCard({ title, value, wow, invert, split, note, tabs }) {
+  // A KPI value is usually a short number ("547", "4.20%") but sometimes a
+  // free-text string ("search-service"). Long strings at display-l wrap to two
+  // lines and make one tile taller than its row-mates — the KPI ribbon then
+  // looks ragged. So: (1) fillHeight so every tile in a Grid row is the same
+  // height regardless of content, and (2) scale the value font down for long
+  // text values so they stay on one line and never blow up the tile.
+  const asText = value == null ? '' : String(value);
+  const isNumericish = /^[\d.,%$\sKMBkmb+\-]+$/.test(asText);  // "547", "4.20%", "$71.09"
+  // Long non-numeric strings get a smaller size; numbers keep the big display font.
+  const valFontSize = isNumericish
+    ? 'display-l'
+    : asText.length > 16 ? 'heading-m'
+    : asText.length > 10 ? 'heading-l'
+    : 'display-l';
   return (
-    <Container>
+    <Container fitHeight>
       <Box variant="awsui-key-label">{title}</Box>
-      <Box variant="h1" fontSize="display-l">{value}</Box>
+      {/* Optional in-card toggle — e.g. flip the spend tile between an
+          endpoint's allocated slice and the combined Total. */}
+      {tabs ? (
+        <Box padding={{ bottom: 'xxs' }}>
+          <SegmentedControl
+            selectedId={tabs.selectedId}
+            onChange={({ detail }) => tabs.onChange(detail.selectedId)}
+            options={tabs.options}
+            label={title}
+          />
+        </Box>
+      ) : null}
+      <Box
+        variant="h1"
+        fontSize={valFontSize}
+        // Break only between words (not mid-word) and cap at two lines with an
+        // ellipsis so an unusually long value can never distort the layout.
+        // Full value stays available on hover via the title attribute.
+      >
+        <span title={asText} style={{
+          display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+          overflow: 'hidden', overflowWrap: 'anywhere', wordBreak: 'normal',
+        }}>{value}</span>
+      </Box>
       {wow ? <WowBadge current={wow[0]} previous={wow[1]} invert={invert} /> : null}
+      {/* Optional runtime/mantle composition line. Total stays the headline
+          above; this shows how it splits by Bedrock endpoint at a glance.
+          Rendered only when there IS mantle usage, so runtime-only fleets
+          aren't cluttered with a "· mantle 0" tail. */}
+      {split ? (
+        <Box color="text-body-secondary" fontSize="body-s">
+          runtime {split.runtime}{split.mantle != null ? ` · mantle ${split.mantle}` : ''}
+        </Box>
+      ) : null}
+      {/* Optional caveat line — e.g. a metric that can't be split by the
+          active filter (Cost Explorer doesn't break spend out by endpoint). */}
+      {note ? (
+        <Box color="text-body-secondary" fontSize="body-s"><i>{note}</i></Box>
+      ) : null}
     </Container>
   );
 }

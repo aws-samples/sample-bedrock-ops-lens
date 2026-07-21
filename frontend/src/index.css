@@ -100,7 +100,7 @@ body { margin: 0; }
 }
 
 /* AWS-orange primary button. Reserved STRICTLY for action-triggering
-   buttons: "Generate AI report", "Save preferences", "Export CSV", etc.
+   buttons: "Perform Ops review", "Save preferences", "Export CSV", etc.
    Never for navigation, never for info, never for "view more". One orange
    button per page max. Apply via:
        <Button variant="primary" className="action-orange">…</Button>

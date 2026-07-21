@@ -119,6 +119,12 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
         from ..filters import PROVIDER_PREFIX
         parts.append(f"modelId LIKE ${len(params)+1}")
         params.append(PROVIDER_PREFIX[f.provider] + "%")
+    # Endpoint slice: f_hourly_peak carries the runtime/mantle endpoint column,
+    # so honor the tab's switcher here (else the Mantle sub-tab would show the
+    # combined runtime+mantle peak — identical to runtime).
+    if f.endpoint != "all":
+        parts.append(f"endpoint = ${len(params)+1}")
+        params.append(f.endpoint)
     w = " AND ".join(parts)
 
     # Fetch per-hour rows and reduce in Python so the output-token burndown
@@ -126,43 +132,67 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
     # is per-model, and the busiest quota-hour can differ from the busiest
     # raw-token hour — so we cannot pre-sum then multiply). See app/burndown.py
     # and the AWS quota-token-burndown doc.
+    # Per the AWS token-burndown doc, the quota-consuming input is
+    #   InputTokenCount + CacheWriteInputTokens
+    # (CacheReadInputTokens do NOT count). In this repo total_input_tokens is
+    # exactly InputTokenCount (cache excluded), and cache-write is its own
+    # column. So the quota-input is input + cache_write (COALESCE NULLs to 0 for
+    # endpoints/rows that don't populate cache columns, e.g. Mantle).
+    # peak_quota_tpm prefers the NATIVE AWS metric EstimatedTPMQuotaUsage
+    # (estimated_tpm_quota_usage) — AWS computes it including cache-write + the
+    # output burndown multiplier, so no reconstruction is needed. When it's
+    # absent (rows ingested before the column; the mantle endpoint, which has
+    # no such metric), we fall back to the doc formula:
+    #   InputTokenCount + CacheWriteInputTokens + OutputTokenCount*rate
+    # (CacheRead excluded). total_input_tokens = InputTokenCount; add cache-write.
     rows = await db.fetch(
         f"""
         SELECT accountId, modelId, region,
           total_requests,
-          CASE WHEN total_cache_read_input_tokens IS NULL THEN NULL
-               ELSE GREATEST(total_input_tokens - total_cache_read_input_tokens, 0) END AS input_quota_tokens,
-          total_output_tokens
+          (total_input_tokens + COALESCE(total_cache_write_input_tokens, 0)) AS input_quota_tokens,
+          total_output_tokens,
+          estimated_tpm_quota_usage
         FROM f_hourly_peak
         WHERE {w}
         """,
         *params,
     )
 
+    is_mantle = (f.endpoint == "mantle")
     agg: dict = {}
+    used_native = False
     for r in db.rows_to_dicts(rows):
         mid = r.get("modelid") or r.get("modelId")
         key = (r.get("accountid") or r.get("accountId"), mid, r["region"])
         a = agg.get(key)
         if a is None:
-            rate = output_burndown_rate(mid)
+            # Burndown applies only to bedrock-runtime; Mantle has separate
+            # input/output quotas (rate forced to 1 by is_mantle).
+            rate = output_burndown_rate(mid, is_mantle=is_mantle)
             a = agg[key] = {
                 "accountId": key[0], "modelId": mid, "region": key[2],
                 "burndown_rate": rate,
                 "peak_requests_hour": 0,
-                "peak_input_tpm": 0,    # raw input (cache-read excluded)
+                "peak_input_tpm": 0,    # InputTokenCount + CacheWriteInputTokens
                 "peak_output_tpm": 0,   # raw output, 1:1
-                "peak_quota_tpm": 0,    # (input) + output*rate, weighted per-hour
+                "peak_quota_tpm": 0,    # native metric, else doc formula
+                "quota_tpm_source": "formula",
             }
         rate = a["burndown_rate"]
         req = int(r["total_requests"] or 0)
         out = int(r["total_output_tokens"] or 0)
-        inp = r["input_quota_tokens"]
+        inp = int(r["input_quota_tokens"] or 0)
+        native = r.get("estimated_tpm_quota_usage")
         a["peak_requests_hour"] = max(a["peak_requests_hour"], req)
         a["peak_output_tpm"] = max(a["peak_output_tpm"], out)
-        if inp is not None:
-            inp = int(inp)
-            a["peak_input_tpm"] = max(a["peak_input_tpm"], inp)
+        a["peak_input_tpm"] = max(a["peak_input_tpm"], inp)
+        if native is not None and int(native) > 0:
+            # Authoritative: AWS already applied cache-write + burndown.
+            a["peak_quota_tpm"] = max(a["peak_quota_tpm"], int(native))
+            a["quota_tpm_source"] = "native"
+            used_native = True
+        else:
+            # Fallback reconstruction (per-hour, weighted before the peak).
             a["peak_quota_tpm"] = max(a["peak_quota_tpm"], inp + out * rate)
 
     out_rows = [a for a in agg.values() if a["peak_requests_hour"] > 0]
@@ -194,17 +224,22 @@ async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
     if f.region != "all":
         parts.append(f"h.region = ${len(params)+1}")
         params.append(f.region)
+    if f.endpoint != "all":
+        parts.append(f"h.endpoint = ${len(params)+1}")
+        params.append(f.endpoint)
     w = " AND ".join(parts)
 
     # Per-hour rows; reduce in Python so the per-model rate is applied to each
     # hour's output before the peak (the rate is per-model so it can't live in
     # the SQL aggregate, and the busiest quota-hour differs from the busiest
     # raw-token hour).
+    # Quota-input per the AWS doc: InputTokenCount + CacheWriteInputTokens
+    # (cache-read excluded). total_input_tokens is InputTokenCount; add cache
+    # write. This block is Claude-only (see LIKE filter) on bedrock-runtime.
     hourly = await db.fetch(
         f"""
         SELECT h.accountId, h.modelId, h.region,
-          CASE WHEN h.total_cache_read_input_tokens IS NULL THEN NULL
-               ELSE GREATEST(h.total_input_tokens - h.total_cache_read_input_tokens, 0) END AS input_quota_tokens,
+          (h.total_input_tokens + COALESCE(h.total_cache_write_input_tokens, 0)) AS input_quota_tokens,
           h.total_output_tokens
         FROM f_hourly_peak h
         WHERE {w}
@@ -212,23 +247,22 @@ async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
         *params,
     )
 
+    is_mantle = (f.endpoint == "mantle")
     peaks: dict = {}
     for r in db.rows_to_dicts(hourly):
         mid = r.get("modelid") or r.get("modelId")
         key = (r.get("accountid") or r.get("accountId"), mid, r["region"])
-        inp = r["input_quota_tokens"]
-        if inp is None:
-            continue  # cache split unknown -> can't compute quota-accurate TPM
+        inp = int(r["input_quota_tokens"] or 0)
         p = peaks.get(key)
         if p is None:
             p = peaks[key] = {
                 "accountId": key[0], "modelId": mid, "region": key[2],
-                "burndown_rate": output_burndown_rate(mid),
+                "burndown_rate": output_burndown_rate(mid, is_mantle=is_mantle),
                 "peak_output_tpm": 0, "peak_quota_tpm": 0,
             }
         out = int(r["total_output_tokens"] or 0)
         p["peak_output_tpm"] = max(p["peak_output_tpm"], out)
-        p["peak_quota_tpm"] = max(p["peak_quota_tpm"], int(inp) + out * p["burndown_rate"])
+        p["peak_quota_tpm"] = max(p["peak_quota_tpm"], inp + out * p["burndown_rate"])
 
     if not peaks:
         return []

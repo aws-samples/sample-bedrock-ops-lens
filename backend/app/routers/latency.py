@@ -38,7 +38,38 @@ async def latency_by_model(f: FilterSet = Depends(parse_filters)):
         """,
         *w.params,
     )
-    return db.rows_to_dicts(rows)
+    out = db.rows_to_dicts(rows)
+
+    # OTPS (Output Tokens Per Second) — the wiki's key throughput/UX latency
+    # signal alongside TTFT: OTPS = output_tokens / (TTLT - TTFT), i.e. the
+    # generation speed AFTER the first token. We approximate the generation
+    # window as (avg_e2e - avg_ttft) ms and divide the per-model average output
+    # tokens per request by it. Output tokens + request counts come from f_daily
+    # (f_latency_daily has no token columns). Endpoint-agnostic join.
+    tok = await db.fetch(
+        f"""
+        SELECT modelId,
+          SUM(total_output_tokens)::BIGINT AS out_tokens,
+          SUM(total_requests)::BIGINT      AS reqs
+        FROM f_daily
+        WHERE {build_where(f).sql}
+        GROUP BY modelId
+        """,
+        *build_where(f).params,
+    )
+    tok_by_model = {(r["modelid"] if "modelid" in r else r["modelId"]): r for r in tok}
+    for row in out:
+        mid = row.get("modelid") or row.get("modelId")
+        t = tok_by_model.get(mid)
+        avg_out_per_req = (int(t["out_tokens"]) / int(t["reqs"])) if (t and t["reqs"]) else None
+        gen_ms = None
+        if row.get("avg_e2e") and row.get("avg_ttft") is not None:
+            gen_ms = float(row["avg_e2e"]) - float(row["avg_ttft"])
+        # OTPS only meaningful when we have a positive generation window and
+        # per-request output tokens; else null (chart shows a gap, not a fake 0).
+        row["avg_output_tokens_per_req"] = round(avg_out_per_req, 1) if avg_out_per_req is not None else None
+        row["otps"] = round(avg_out_per_req / (gen_ms / 1000.0), 1) if (avg_out_per_req and gen_ms and gen_ms > 0) else None
+    return out
 
 
 @router.get("/latency-cris-vs-od")

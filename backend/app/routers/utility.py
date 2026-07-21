@@ -168,7 +168,28 @@ async def distinct_filters():
             region_totals[rg] = region_totals.get(rg, 0) + rq
     providers = [p for p, _ in sorted(prov_totals.items(),  key=lambda x: -x[1])]
     regions   = [r for r, _ in sorted(region_totals.items(), key=lambda x: -x[1])]
-    return {"providers": providers, "regions": regions}
+
+    # Which Bedrock endpoints actually have data, per source table. The UI
+    # uses this to decide whether to SHOW the bedrock-mantle sub-tab on each
+    # page: show Mantle wherever data is obtainable by any means, hide it
+    # only when a table genuinely has zero Mantle rows (never render a blank
+    # Mantle view). Latency is the notable case — Mantle publishes no CW
+    # latency, so f_latency_daily only has a 'mantle' slice when the customer
+    # enabled invocation logging (invocation_logs.py derives it).
+    mantle = {}
+    for key, table in (("volumetric", "f_daily"),
+                       ("peak", "f_hourly_peak"),
+                       ("errors", "f_hourly_errors"),
+                       ("latency", "f_latency_daily")):
+        try:
+            row = await db.fetch(
+                f"SELECT EXISTS(SELECT 1 FROM {table} WHERE endpoint = 'mantle') AS has_mantle"
+            )
+            mantle[key] = bool(row and row[0]["has_mantle"])
+        except Exception:
+            mantle[key] = False
+    return {"providers": providers, "regions": regions,
+            "mantle_available": mantle}
 
 
 @router.get("/ingestion-status")

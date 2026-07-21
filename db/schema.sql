@@ -46,6 +46,13 @@ CREATE TABLE IF NOT EXISTS f_daily (
     traffic_type              TEXT NOT NULL DEFAULT '__none__',
     service_tier              TEXT NOT NULL DEFAULT '__none__',
     inference_profile_prefix  TEXT NOT NULL DEFAULT '__none__',
+    -- AWS Bedrock exposes two endpoints with separate CW namespaces:
+    --   'runtime' — bedrock-runtime (Converse/InvokeModel; AWS/Bedrock)
+    --   'mantle'  — bedrock-mantle  (Responses/ChatCompletions/Messages;
+    --                                AWS/BedrockMantle, launched 2026-06-01)
+    -- Same model can run under either endpoint; keep them split so the
+    -- side-by-side dashboard view doesn't collide.
+    endpoint                  TEXT NOT NULL DEFAULT 'runtime',
 
     -- Measures. BIGINT (not INTEGER) — token counts can hit 10^12+ at scale.
     total_requests                  BIGINT NOT NULL,
@@ -60,9 +67,18 @@ CREATE TABLE IF NOT EXISTS f_daily (
     status_429_count                BIGINT,
     status_500_count                BIGINT,
     status_503_count                BIGINT,
+    -- Multimodal token breakdown (AWS/Bedrock InputTextTokenCount etc.). Sum of
+    -- text+speech ≈ total for multimodal models; NULL/0 for text-only fleets.
+    total_input_text_tokens         BIGINT,
+    total_input_speech_tokens       BIGINT,
+    total_output_text_tokens        BIGINT,
+    total_output_speech_tokens      BIGINT,
+    total_output_image_count        BIGINT,
+    -- LegacyModelInvocations: requests against models past their legacy date.
+    legacy_invocations              BIGINT,
 
     PRIMARY KEY (event_date, accountId, modelId, region, operation,
-                 traffic_type, service_tier, inference_profile_prefix)
+                 traffic_type, service_tier, inference_profile_prefix, endpoint)
 ) PARTITION BY RANGE (event_date);
 
 -- Partitioned indexes — each cascades to every child partition.
@@ -133,17 +149,28 @@ CREATE TABLE IF NOT EXISTS f_hourly_peak (
     accountId   TEXT NOT NULL,
     modelId     TEXT NOT NULL,
     region      TEXT NOT NULL,
+    endpoint    TEXT NOT NULL DEFAULT 'runtime',  -- 'runtime' | 'mantle'
 
     total_requests      BIGINT NOT NULL,
     total_input_tokens  BIGINT,
     total_output_tokens BIGINT,
-    -- Cache-read input tokens are pre-computed and do NOT count toward the
-    -- TPM rate-limit quota (CloudWatch EstimatedTPMQuotaUsage excludes them).
-    -- Stored here so Peak TPM can subtract them for quota-accurate numbers.
+    -- Cache-read input tokens do NOT count toward the TPM quota (excluded by
+    -- CloudWatch EstimatedTPMQuotaUsage). Cache-write DOES count. Per the AWS
+    -- token-burndown doc the quota input is InputTokenCount + CacheWriteInput.
+    -- total_input_tokens = InputTokenCount (cache excluded), so cache-write is
+    -- stored separately and added in the Peak-TPM calc.
     total_cache_read_input_tokens BIGINT,
+    total_cache_write_input_tokens BIGINT,
+    -- Native AWS/Bedrock EstimatedTPMQuotaUsage (Sum per hour). This is the
+    -- AUTHORITATIVE quota-consumption metric — AWS computes it including
+    -- cache-write tokens and the output burndown multiplier, so we prefer it
+    -- over our reconstructed formula when present. NULL for rows ingested
+    -- before this column existed, and for the mantle endpoint (Mantle has no
+    -- such metric); callers fall back to the formula then.
+    estimated_tpm_quota_usage BIGINT,
     status_429_count    BIGINT,
 
-    PRIMARY KEY (event_date, hour, accountId, modelId, region)
+    PRIMARY KEY (event_date, hour, accountId, modelId, region, endpoint)
 ) PARTITION BY RANGE (event_date);
 
 CREATE INDEX IF NOT EXISTS ix_f_hourly_peak_brin    ON f_hourly_peak USING BRIN (event_date);
@@ -166,6 +193,7 @@ CREATE TABLE IF NOT EXISTS f_hourly_errors (
     accountId   TEXT NOT NULL,
     modelId     TEXT NOT NULL,
     region      TEXT NOT NULL,
+    endpoint    TEXT NOT NULL DEFAULT 'runtime',  -- 'runtime' | 'mantle'
 
     total_requests      BIGINT NOT NULL,
     failed_requests     BIGINT,
@@ -175,7 +203,7 @@ CREATE TABLE IF NOT EXISTS f_hourly_errors (
     status_500_count    BIGINT,
     status_503_count    BIGINT,
 
-    PRIMARY KEY (event_date, hour, accountId, modelId, region)
+    PRIMARY KEY (event_date, hour, accountId, modelId, region, endpoint)
 );
 
 CREATE INDEX IF NOT EXISTS ix_f_hourly_errors_brin  ON f_hourly_errors USING BRIN (event_date);
@@ -192,7 +220,8 @@ CREATE INDEX IF NOT EXISTS ix_f_hourly_errors_model ON f_hourly_errors (modelId)
 -- simply stays empty and the dashboard degrades gracefully (shows the honest
 -- CloudWatch 4xx/5xx aggregates instead, with a clear note).
 --
--- Rolling 7-day window, same as f_hourly_errors. Small; not partitioned.
+-- Rolling 90-day window to match the dashboard's max date-range filter (a
+-- shorter retention silently caps the Status Codes chart). Small; not partitioned.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS f_hourly_status (
     event_date  DATE      NOT NULL,
@@ -204,6 +233,10 @@ CREATE TABLE IF NOT EXISTS f_hourly_status (
     accountId   TEXT NOT NULL,
     modelId     TEXT NOT NULL,
     region      TEXT NOT NULL,
+    -- Bedrock endpoint: 'runtime' (AWS/Bedrock) or 'mantle' (bedrock-mantle).
+    -- Per-code data comes from invocation logs, which may carry both endpoints;
+    -- the Status Codes chart slices on this so runtime/mantle differ.
+    endpoint    TEXT NOT NULL DEFAULT 'runtime',
 
     total_requests   BIGINT NOT NULL,
     status_200_count BIGINT,
@@ -216,7 +249,7 @@ CREATE TABLE IF NOT EXISTS f_hourly_status (
     status_500_count BIGINT,
     status_503_count BIGINT,
 
-    PRIMARY KEY (event_date, hour, accountId, modelId, region)
+    PRIMARY KEY (event_date, hour, accountId, modelId, region, endpoint)
 );
 
 CREATE INDEX IF NOT EXISTS ix_f_hourly_status_brin  ON f_hourly_status USING BRIN (event_date);
@@ -272,6 +305,7 @@ CREATE TABLE IF NOT EXISTS f_latency_daily (
     modelId       TEXT NOT NULL,
     traffic_type  TEXT NOT NULL DEFAULT '__none__',
     region        TEXT NOT NULL DEFAULT '__none__',
+    endpoint      TEXT NOT NULL DEFAULT 'runtime',  -- 'runtime' (CW) | 'mantle' (invocation logs)
 
     sample_count  BIGINT,
     avg_e2e       DOUBLE PRECISION,
@@ -283,7 +317,7 @@ CREATE TABLE IF NOT EXISTS f_latency_daily (
     p90_ttft      DOUBLE PRECISION,
     p99_ttft      DOUBLE PRECISION,
 
-    PRIMARY KEY (event_date, modelId, traffic_type, region)
+    PRIMARY KEY (event_date, modelId, traffic_type, region, endpoint)
 );
 
 CREATE INDEX IF NOT EXISTS ix_f_latency_brin  ON f_latency_daily USING BRIN (event_date);
@@ -399,7 +433,8 @@ CREATE INDEX IF NOT EXISTS ix_dim_model_lifecycle_status
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS user_preferences (
     user_id             TEXT PRIMARY KEY,
-    pinned_tag_keys     TEXT[] NOT NULL DEFAULT '{}',
+    pinned_tag_keys     TEXT[] NOT NULL DEFAULT '{}',   -- invocation-log tag keys to surface
+    pinned_proxy_keys   TEXT[] NOT NULL DEFAULT '{}',   -- proxy dimension keys to surface
     default_time_range  TEXT,
     default_provider    TEXT,
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -432,3 +467,174 @@ CREATE TABLE IF NOT EXISTS ingestion_days (
 );
 
 CREATE INDEX IF NOT EXISTS ix_ingestion_days_loaded ON ingestion_days (loaded_at DESC);
+
+-- ============================================================================
+-- PROXY PER-WORKLOAD TELEMETRY  (shared proxy/gateway pattern)
+--
+-- A GenAI proxy fronting Bedrock signs every request with ONE IAM role, so
+-- caller identity can't attribute usage to a workload. Instead the proxy
+-- emits ONE metadata-only event per request (workload, model, tokens,
+-- status, latency — NO prompt/response text) to an S3 bucket in the
+-- customer's account, which we read cross-account (same pattern as Bedrock
+-- invocation logs — no public inbound endpoint). Works across BOTH
+-- bedrock-runtime and bedrock-mantle because the proxy reads token counts
+-- from whichever response body it gets.
+--
+-- Layout the proxy writes (NDJSON, gzip optional):
+--   s3://<bucket>/proxy-events/<region>/<YYYY>/<MM>/<DD>/<HH>/*.jsonl[.gz]
+-- Each line (metadata only):
+--   {"ts","workload","model","endpoint","region","input_tokens",
+--    "output_tokens","cache_read_tokens","status","throttled","latency_ms",
+--    "request_id"}
+-- ============================================================================
+
+-- f_request_events — raw per-request rows, short retention (per-request
+-- drill-down for incident triage). Kept lean; rolled up into
+-- f_proxy_dim_hourly for the charts. request_id gives idempotency.
+--
+-- `dimensions` is the full JSONB attribute map the proxy emitted for the
+-- request (e.g. {"workload":"search","env":"prod","bu":"retail"}), retained
+-- verbatim so any custom dimension can be drilled into later.
+CREATE TABLE IF NOT EXISTS f_request_events (
+    ts             TIMESTAMPTZ NOT NULL,
+    event_date     DATE NOT NULL,
+    dimensions     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    modelId        TEXT NOT NULL,
+    endpoint       TEXT NOT NULL DEFAULT 'runtime',  -- 'runtime' | 'mantle'
+    region         TEXT NOT NULL,
+    accountId      TEXT NOT NULL DEFAULT '__none__',
+    input_tokens   BIGINT NOT NULL DEFAULT 0,
+    output_tokens  BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+    status         INTEGER NOT NULL DEFAULT 200,
+    throttled      BOOLEAN NOT NULL DEFAULT false,
+    latency_ms     DOUBLE PRECISION,
+    request_id     TEXT NOT NULL,
+    -- event_date is in the PK because Postgres requires a partitioned table's
+    -- PK to include the partition key. (request_id, ts) alone is the logical
+    -- idempotency key; event_date is derivable from ts so it doesn't weaken it.
+    PRIMARY KEY (event_date, request_id, ts)
+) PARTITION BY RANGE (event_date);
+
+CREATE TABLE IF NOT EXISTS f_request_events_default PARTITION OF f_request_events DEFAULT;
+CREATE INDEX IF NOT EXISTS ix_f_request_events_brin ON f_request_events USING BRIN (event_date);
+CREATE INDEX IF NOT EXISTS ix_f_request_events_dims ON f_request_events USING GIN (dimensions);
+
+-- f_proxy_dim_hourly — hourly rollup, ONE ROW PER (dim_key, dim_value, model,
+-- endpoint, region). The proxy emits an arbitrary `dimensions` map per request
+-- (workload / env / business_unit / cost_center / …); we fan each request out
+-- to one row per dimension key — exactly the f_daily_tagged pattern. Summing
+-- over a single dim_key is correct (each key covers 100% of the request);
+-- summing across DIFFERENT keys would multiply-count, so queries always pin one
+-- dim_key. `workload` is just the conventional default key, not special.
+-- Additive upsert so re-ingesting an overlapping window is safe.
+CREATE TABLE IF NOT EXISTS f_proxy_dim_hourly (
+    event_date     DATE NOT NULL,
+    hour           SMALLINT NOT NULL,
+    dim_key        TEXT NOT NULL,
+    dim_value      TEXT NOT NULL,
+    modelId        TEXT NOT NULL,
+    endpoint       TEXT NOT NULL DEFAULT 'runtime',
+    region         TEXT NOT NULL,
+    accountId      TEXT NOT NULL DEFAULT '__none__',
+    total_requests BIGINT NOT NULL DEFAULT 0,
+    input_tokens   BIGINT NOT NULL DEFAULT 0,
+    output_tokens  BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+    throttled_count BIGINT NOT NULL DEFAULT 0,
+    error_count    BIGINT NOT NULL DEFAULT 0,
+    -- latency percentiles computed at ingest from the hour's samples
+    p50_latency_ms DOUBLE PRECISION,
+    p90_latency_ms DOUBLE PRECISION,
+    p99_latency_ms DOUBLE PRECISION,
+    PRIMARY KEY (event_date, hour, dim_key, dim_value, modelId, endpoint, region, accountId)
+);
+
+CREATE INDEX IF NOT EXISTS ix_f_proxy_dim_brin  ON f_proxy_dim_hourly USING BRIN (event_date);
+CREATE INDEX IF NOT EXISTS ix_f_proxy_dim_kv    ON f_proxy_dim_hourly (dim_key, dim_value, event_date);
+CREATE INDEX IF NOT EXISTS ix_f_proxy_dim_model ON f_proxy_dim_hourly (event_date, modelId, region);
+
+-- dim_proxy_dimensions — distinct (dim_key, dim_value) pairs seen recently,
+-- with rollup volume. Backs the top-bar "dimension : value" picker (never scan
+-- the fact tables for dropdown population). Mirrors dim_tags.
+CREATE TABLE IF NOT EXISTS dim_proxy_dimensions (
+    dim_key             TEXT NOT NULL,
+    dim_value           TEXT NOT NULL,
+    first_seen          DATE NOT NULL,
+    last_seen           DATE NOT NULL,
+    total_requests_30d  BIGINT NOT NULL DEFAULT 0,
+    endpoints           TEXT[] NOT NULL DEFAULT '{}',  -- which endpoints used
+    PRIMARY KEY (dim_key, dim_value)
+);
+
+CREATE INDEX IF NOT EXISTS ix_dim_proxy_key ON dim_proxy_dimensions (dim_key, total_requests_30d DESC);
+
+-- proxy_events_objects — resumability: S3 keys already ingested (mirrors
+-- ingestion_log_objects for invocation logs).
+CREATE TABLE IF NOT EXISTS proxy_events_objects (
+    s3_key      TEXT PRIMARY KEY,
+    row_count   BIGINT NOT NULL DEFAULT 0,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ----------------------------------------------------------------------------
+-- f_mantle_token_pctl — per-inference token percentiles for bedrock-mantle.
+-- Source: AWS/BedrockMantle InputTokens / OutputTokens (per-inference metrics,
+-- Project+Model level) → p50/p90/p99. Mantle publishes NO latency, so token
+-- percentiles are its only per-request distribution signal.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_mantle_token_pctl (
+    event_date  DATE NOT NULL,
+    accountId   TEXT NOT NULL,
+    modelId     TEXT NOT NULL,
+    region      TEXT NOT NULL,
+    project     TEXT NOT NULL DEFAULT '__none__',
+    sample_count BIGINT,
+    p50_input_tokens  DOUBLE PRECISION,
+    p90_input_tokens  DOUBLE PRECISION,
+    p99_input_tokens  DOUBLE PRECISION,
+    p50_output_tokens DOUBLE PRECISION,
+    p90_output_tokens DOUBLE PRECISION,
+    p99_output_tokens DOUBLE PRECISION,
+    PRIMARY KEY (event_date, accountId, modelId, region, project)
+);
+CREATE INDEX IF NOT EXISTS ix_f_mantle_token_pctl_brin ON f_mantle_token_pctl USING BRIN (event_date);
+
+-- ----------------------------------------------------------------------------
+-- f_mantle_project — native per-project Mantle usage (Project dimension) for
+-- chargeback. Complements the proxy-workloads attribution with the endpoint's
+-- own Project tag.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_mantle_project (
+    event_date  DATE NOT NULL,
+    accountId   TEXT NOT NULL,
+    region      TEXT NOT NULL,
+    project     TEXT NOT NULL,
+    modelId     TEXT NOT NULL DEFAULT '__all__',
+    total_requests      BIGINT,
+    client_errors_4xx   BIGINT,
+    total_input_tokens  BIGINT,
+    total_output_tokens BIGINT,
+    PRIMARY KEY (event_date, accountId, region, project, modelId)
+);
+CREATE INDEX IF NOT EXISTS ix_f_mantle_project_brin ON f_mantle_project USING BRIN (event_date);
+
+-- ----------------------------------------------------------------------------
+-- f_identity_usage — per-principal (identity.arn) usage from invocation logs.
+-- Answers "who is calling Bedrock" at the IAM-principal level (vs tag-based
+-- workload attribution). Populated only when invocation logging is enabled.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_identity_usage (
+    event_date  DATE NOT NULL,
+    accountId   TEXT NOT NULL,
+    region      TEXT NOT NULL,
+    identity_arn TEXT NOT NULL,
+    modelId     TEXT NOT NULL DEFAULT '__all__',
+    endpoint    TEXT NOT NULL DEFAULT 'runtime',
+    total_requests      BIGINT,
+    total_input_tokens  BIGINT,
+    total_output_tokens BIGINT,
+    failed_requests     BIGINT,
+    PRIMARY KEY (event_date, accountId, region, identity_arn, modelId, endpoint)
+);
+CREATE INDEX IF NOT EXISTS ix_f_identity_usage_brin ON f_identity_usage USING BRIN (event_date);

@@ -12,6 +12,31 @@ import { Box, HelpPanel, Link, SpaceBetween } from '@cloudscape-design/component
 
 export const SECTION_INFO = {
   /* --------------------------------------------------------------------- */
+  /* Cross-tab: bedrock-runtime vs bedrock-mantle                          */
+  /* --------------------------------------------------------------------- */
+  'endpoint-switcher': {
+    title: 'bedrock-runtime vs bedrock-mantle',
+    body: 'Every tab on this dashboard has a sub-tab switcher between the two Bedrock endpoints. bedrock-runtime is the long-standing API path (Converse, ConverseStream, InvokeModel, InvokeModelWithResponseStream). bedrock-mantle is the newer endpoint that exposes OpenAI-compatible Responses + Chat Completions APIs and the Anthropic Messages API. Both endpoints stay supported — Mantle is not a deprecation of runtime, it is a new entry point for OpenAI/Anthropic-native clients. The two endpoints publish to separate CloudWatch namespaces (AWS/Bedrock and AWS/BedrockMantle) and have subtly different gaps in what they emit.',
+    why: 'Most fleets will end up with traffic on both endpoints. Looking at "all of Bedrock" without splitting would average bedrock-mantle latency gaps and quota oddities into the runtime numbers, masking real signal.',
+    action: 'Switch to bedrock-mantle on any tab to see the Mantle slice in isolation. The coverage badge tells you what data path backs the active view: Live metric (CW publishes it), Live metric (partial) (CW publishes it but with known gaps), Log-derived (CW does not publish; we parse Bedrock invocation logs), Defaults only (only static AWS-published defaults available), or Not available (no data path exists).',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-mantle-metrics.html',
+  },
+  'mantle-coverage-latency': {
+    title: 'Latency coverage on bedrock-mantle',
+    body: 'AWS does not publish latency or time-to-first-token metrics for the bedrock-mantle endpoint. The dashboard derives Mantle latency from Bedrock Model Invocation Logs when the customer enables them: per-request output.outputBodyJson.metrics.latencyMs is parsed and aggregated into p50 / p90 / p99 per (model, region, day).',
+    why: 'Without invocation logging enabled, Mantle latency is invisible. Most observability tools render zero in this case — that is wrong. We render an explicit "not available" banner so an operator can tell "no traffic" apart from "no telemetry source enabled".',
+    action: 'Enable Bedrock Model Invocation Logging in the AWS console (Bedrock > Settings > Model invocation logging > Enable). Point it at S3 or CloudWatch Logs. Once the dashboard ingester picks up the new logs (next 05:00 UTC or via manual ingest), Mantle latency populates.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html',
+  },
+  'mantle-coverage-quotas': {
+    title: 'Quotas coverage on bedrock-mantle',
+    body: 'The bedrock-mantle endpoint does not publish quotas through AWS Service Quotas — Mantle quotas are managed internally. The default published values per the AWS docs are 10M input TPM, 2M output TPM, and 100M RPM, with structured ramp-up. The dashboard surfaces these as static defaults for the Mantle sub-tab; live applied values are not retrievable.',
+    why: 'A customer cannot see "is my Mantle workload near its quota" from anywhere today, including the AWS console. The dashboard at least shows the published ceiling so operators have a number to compare peak usage against.',
+    action: 'For a quota increase on Mantle, contact AWS Support directly — Service Quotas console requests will not work for the Mantle endpoint until AWS exposes those quota codes publicly.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-mantle.html',
+  },
+
+  /* --------------------------------------------------------------------- */
   /* Overview tab                                                          */
   /* --------------------------------------------------------------------- */
   'daily-trend': {
@@ -59,9 +84,9 @@ export const SECTION_INFO = {
   },
   'operations': {
     title: 'Operations',
-    body: 'Distribution across Bedrock-runtime API operations: InvokeModel, Converse, InvokeModelWithResponseStream, ConverseStream.',
+    body: 'Distribution across Bedrock-runtime API operations: InvokeModel, Converse, InvokeModelWithResponseStream, ConverseStream. The AWS/Bedrock CloudWatch metrics do NOT carry an operation dimension, so this is only populated from Bedrock model invocation logs. Without logging enabled, all traffic shows as "Not attributed".',
     why: 'Streaming operations (ConverseStream, InvokeModelWithResponseStream) indicate real-time UX. Non-streaming indicates batch or backend workloads.',
-    action: 'Streaming-heavy fleets are more latency-sensitive. Prioritize prompt caching and CRIS for those workloads.',
+    action: 'Enable Bedrock model invocation logging to break traffic out by operation. Streaming-heavy fleets are more latency-sensitive — prioritize prompt caching and CRIS for those workloads.',
   },
   'regions-health': {
     title: 'Regions — volume & capacity pressure',
@@ -299,10 +324,10 @@ export const SECTION_INFO = {
     action: 'Heavy single-provider dependency → evaluate whether a second provider can serve the same use case as a fallback. Bedrock makes provider switching a one-line modelId change.',
   },
   'insights-cost-pie': {
-    title: 'Cost share by model (estimate)',
-    body: 'Top 8 models by approximate spend, computed from token volumes × an in-code provider price table. Rough — for relative proportions only.',
-    why: 'Numbers in the Cost tab are real (Cost Explorer); numbers here are an instantaneous "where is my budget going right now" snapshot driven by usage telemetry. Useful between Cost Explorer refreshes (which lag 24-48 hours).',
-    action: 'Compare against the Cost tab\'s Cost Explorer numbers to validate. Big gaps usually mean a model has heavy prompt caching that the price-table approximation doesn\'t account for.',
+    title: 'Cost share by model',
+    body: 'Top 8 models by real AWS Cost Explorer spend over the window. When Cost Explorer breaks Bedrock out per model (EDP/marketplace line items), these are exact. When Cost Explorer reports one consolidated "Amazon Bedrock" line (most accounts), the real CE total is allocated across models by their token usage — the header states which mode is in effect.',
+    why: 'Grounded in your actual invoice, not a price guess: the dollar total always matches Cost Explorer. Only the per-model split is approximated, and only when AWS itself doesn\'t provide one.',
+    action: 'Use it to see which models dominate spend. The full daily trend and by-account breakdown live on the Cost Insights tab.',
   },
   'quota-drilldown': {
     title: 'Quota drill-down',
@@ -339,6 +364,145 @@ export const SECTION_INFO = {
     action: 'Sort by Error rate descending to find unstable models. Sort by I/O ratio to spot caching candidates. Filter by provider in the top FilterBar to narrow scope.',
   },
 
+  'insights-request-shape': {
+    title: 'Request shape by model',
+    body: 'Per-model average input tokens per request, average output tokens per request, the input:output ratio, and total requests over the window. Request shape drives capacity: TPM ≈ RPM × (avg input + avg output tokens per request). A typical chatbot runs around 10:1 input:output.',
+    why: 'You cannot size a quota without knowing the shape of the traffic. Two workloads at the same RPM can have wildly different TPM if one is input-heavy (long context, RAG) and the other output-heavy (generation). Shape also points at the right optimization: input-heavy (ratio > 50:1) is a prompt-caching candidate; output-heavy (ratio < 2:1) on Claude 4+ amplifies TPM burndown, so max_tokens tuning matters most there.',
+    action: 'Input-heavy → enable prompt caching for stable system prompts and shared context (~90% cheaper on the cached portion). Output-heavy on Claude 4+ → tune max_tokens close to actual output length. Use avg input + avg output × RPM to project TPM before filing a Service Quotas increase.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
+  },
+  'insights-multimodal': {
+    title: 'Multimodal token breakdown',
+    body: 'For models that process more than text, this splits token usage into input text, input speech, output text, output speech, and output images per model. Only shown when the fleet actually has multimodal usage — text-only fleets see nothing here.',
+    why: 'Multimodal tokens (speech, image) are priced and rate-limited differently from text and are easy to under-account for when planning capacity. Seeing the split tells you whether a spike is coming from text volume or from a growing speech/image workload.',
+    action: 'Growing speech or image token share → confirm the relevant modality quotas and pricing are sized for it. If image output dominates, verify the workload genuinely needs image generation vs. a cheaper text path.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/what-is-bedrock.html',
+  },
+  'insights-mantle-token-pct': {
+    title: 'Token size percentiles (per inference)',
+    body: 'p50 / p90 / p99 of input and output tokens per inference for each model on the bedrock-mantle endpoint. Mantle publishes no latency to CloudWatch, so this per-request token distribution is the primary shape signal available for Mantle traffic.',
+    why: 'Averages hide the tail. A model with a modest average input but a heavy p99 input has a small set of very large requests that drive TPM burndown and can trip throttling even when the average looks safe. The percentile spread tells you how bursty the request sizes are.',
+    action: 'Wide gap between p50 and p99 input → the workload has a few very large prompts; size TPM headroom against p99, not the average. Large p99 output on Claude 4+ → tune max_tokens for those calls to limit burndown.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-mantle-metrics.html',
+  },
+  'workloads-setup': {
+    title: 'Set up per-workload attribution',
+    custom: (
+      <SpaceBetween size="m">
+        <div>
+          <Box variant="awsui-key-label">What this is</Box>
+          <p style={{ margin: '4px 0' }}>
+            The Workloads tab answers “which of my use-cases is driving Bedrock
+            usage, throttling, and latency” — attribution the AWS-native metrics
+            can’t provide, because CloudWatch is keyed by <strong>model</strong>,
+            not by your application’s use-case.
+          </p>
+          <p style={{ margin: '4px 0' }}>
+            It works only if you front Bedrock with a <strong>shared GenAI proxy
+            / gateway</strong> (LiteLLM, a Bedrock gateway, an internal SDK
+            wrapper, etc.) that can tag each call with a <code>workload</code>.
+            If your apps call Bedrock directly with no common layer, this tab
+            stays empty — the rest of the dashboard is unaffected.
+          </p>
+        </div>
+
+        <div>
+          <Box variant="awsui-key-label">Privacy model</Box>
+          <p style={{ margin: '4px 0' }}>
+            Your proxy drops <strong>one metadata-only event per request</strong>
+            into an S3 bucket; the dashboard reads that bucket <strong>read-only</strong>
+            (no inbound endpoint, never sits in your request path). No prompt or
+            response text ever leaves your proxy.
+          </p>
+        </div>
+
+        <div>
+          <Box variant="awsui-key-label">1. Emit an event per request</Box>
+          <p style={{ margin: '4px 0' }}>
+            After each Bedrock call, append one NDJSON line to S3 under this
+            exact layout (<code>.jsonl</code> or <code>.jsonl.gz</code>):
+          </p>
+          <Box variant="code" display="block">
+            s3://&lt;your-bucket&gt;/proxy-events/&lt;region&gt;/&lt;YYYY&gt;/&lt;MM&gt;/&lt;DD&gt;/&lt;HH&gt;/*.jsonl
+          </Box>
+          <Box variant="code" display="block">
+            {'{'}"ts":"2026-07-04T18:03:22Z","workload":"flights-search",<br/>
+            &nbsp;"model":"anthropic.claude-opus-4-8","endpoint":"runtime","region":"us-east-1",<br/>
+            &nbsp;"input_tokens":812,"output_tokens":143,"cache_read_tokens":0,<br/>
+            &nbsp;"status":200,"throttled":false,"latency_ms":940,"request_id":"msg_..."{'}'}
+          </Box>
+          <p style={{ margin: '4px 0' }}>
+            <code>workload</code> is your attribution key; <code>endpoint</code>
+            is <code>runtime</code> or <code>mantle</code>. A working,
+            copy-paste starting point ships in the deployment package under
+            <code> tools/reference-proxy/</code>, and the full field reference
+            is in the project README under “Workloads: per-workload attribution”.
+          </p>
+        </div>
+
+        <div>
+          <Box variant="awsui-key-label">2. Grant the dashboard read access</Box>
+          <p style={{ margin: '4px 0' }}>
+            Add a bucket policy allowing the ingester role <code>s3:GetObject</code>
+            + <code>s3:ListBucket</code> on <code>.../proxy-events/*</code>
+            (read-only; cross-account is supported).
+          </p>
+        </div>
+
+        <div>
+          <Box variant="awsui-key-label">3. Point the deploy at the bucket</Box>
+          <Box variant="code" display="block">
+            export PROXY_EVENTS_BUCKET=your-genai-proxy-events<br/>
+            export PROXY_EVENTS_REGIONS=us-east-1,us-west-2<br/>
+            ./deploy.sh --yes
+          </Box>
+          <p style={{ margin: '4px 0' }}>
+            The daily ingester reads new events into this view. Nothing is ever
+            synthesized — the tab shows only what your proxy emits. Once the
+            first events land, this tab populates automatically and stays on.
+          </p>
+        </div>
+      </SpaceBetween>
+    ),
+  },
+  'wl-quota': {
+    title: 'Quota utilization by dimension',
+    body: 'Peak TPM (tokens-per-minute) for each dimension value, as a share of the applicable Bedrock Service Quotas limit. Bedrock quota limits are set per (account, model, region) — never per workload — so this attributes a share of that ceiling to each value: for each (value, model) it takes the busiest hour of quota-tokens (input + output × the AWS per-model burndown multiplier; cache-read excluded per the AWS burndown doc), converts to per-minute TPM, and divides by the applied limit (or the published default when no increase is set).',
+    why: 'Tokens and throttle rate tell you WHO is heavy and WHO is getting throttled; quota utilization tells you WHO is about to BE throttled. A workload sitting at 85% of its model TPM ceiling is one traffic spike from 429s — this is the leading indicator the account-level view can\'t give you when many workloads share one model.',
+    action: 'Values in the red (>80%) need headroom now — request a quota increase for that model/region, or move the workload to a cross-region inference profile (CRIS) for ~2x capacity. This is a proxy-derived ESTIMATE: it uses proxy-reported tokens and excludes cache-write (which the proxy doesn\'t send), so it can slightly under-count vs CloudWatch\'s native EstimatedTPMQuotaUsage — treat it as a floor.',
+  },
+  'wl-tokens': {
+    title: 'Tokens by workload',
+    body: 'Input and output token totals for the top workloads in the window. A "workload" is your application-level use-case (search, chat, summarize…) as tagged by a GenAI proxy/gateway fronting Bedrock. This attribution is not available from AWS-native metrics: CloudWatch is keyed by model, not by use-case. It only populates when a proxy emits one metadata-only event per request to the S3 bucket this dashboard reads (no prompt/response text, never in your request path).',
+    why: 'Model-level metrics tell you "Claude Sonnet is busy" but not "the recommendation engine is what is driving it". Token totals per workload are the truth metric for cost allocation and for finding which use-case to optimize first.',
+    action: 'No data? Front Bedrock with a shared proxy (LiteLLM, a Bedrock gateway, an internal SDK wrapper) that tags each call and drops events to S3, set PROXY_EVENTS_BUCKET in config.yaml, and re-run ./deploy.sh. See the README "Workloads: per-workload attribution" section. High output-token workloads on Claude 4+ burn TPM fastest — tune max_tokens there first.',
+  },
+  'wl-throttle': {
+    title: 'Throttle rate by workload',
+    body: 'Percentage of each workload\'s requests that were throttled (HTTP 429) in the window, from proxy-emitted per-request status. Workloads are sorted by throttle rate so the most quota-starved use-cases are first.',
+    why: 'Throttling is invisible at the model level when several workloads share a model — one bursty use-case can trip the shared quota and degrade every other caller. Splitting throttle rate by workload isolates the culprit.',
+    action: 'A single workload with a high throttle rate → move it to a cross-region inference profile (CRIS) for ~2x quota, or request a quota increase scoped to its traffic. Broadly elevated throttling → the shared quota is undersized for the fleet.',
+  },
+  'wl-table': {
+    title: 'Per-workload detail',
+    body: 'One row per workload with requests, input/output tokens, throttle %, error %, p99 latency, and which Bedrock endpoints (runtime / mantle) it used. Endpoint-agnostic — the proxy reports the same shape for both. Downloadable as CSV for chargeback or review.',
+    why: 'The charts show the top workloads; this table is the complete, exportable ledger. p99 latency and error % per workload surface reliability problems that request/token counts alone hide.',
+    action: 'Export for chargeback or a review meeting. A workload with high p99 latency but low volume → likely large prompts or a slow model choice; check its token percentiles. High error % → engage that use-case\'s owner.',
+  },
+  'identity-usage': {
+    title: 'Top callers (by IAM principal)',
+    body: 'Per-IAM-principal usage — requests, input/output tokens, failed requests, and distinct models used — attributed from the identity.arn in Bedrock Model Invocation Logs. This complements the tag-based workload view with principal-level attribution. It is empty when model invocation logging is not enabled, since that is the only source of caller identity.',
+    why: 'Tag-based workload attribution needs a proxy or tagging discipline; the invocation-log identity is emitted automatically. This is the most direct answer to "which role/user is driving this traffic" and surfaces principals with high failure counts that a workload rollup can hide.',
+    action: 'Enable Bedrock Model Invocation Logging (Bedrock > Settings > Model invocation logging) to populate this. High failed-request counts on one principal → engage that caller. A single principal dominating requests → confirm its quotas and CRIS adoption.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html',
+  },
+  'mantle-projects': {
+    title: 'Per-project usage (chargeback)',
+    body: 'Per-project usage on the bedrock-mantle endpoint — requests, 4xx client errors, input/output tokens, and distinct models used — grouped by the Mantle Project dimension. Intended for chargeback and per-project accountability.',
+    why: 'The Project dimension is Mantle-native attribution: it does not need a proxy or tag conventions. When populated it is the cleanest way to split a shared Mantle fleet across teams for cost and quota accountability.',
+    action: 'Use the token columns for chargeback allocation. A project with a high 4xx share → engage that team about malformed requests. If empty, the Mantle Project dimension has no data yet for this window.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-mantle-metrics.html',
+  },
   'lifecycle-timeline': {
     title: 'Lifecycle timeline',
     body: 'Horizontal timeline of the top 8 legacy models that are actively in use in the selected window. Each row is one model; the colored band runs from its Legacy date to its EOL date. The vertical line on every row is today. The Legacy / Extended access / EOL milestones are dotted on each band.',
@@ -380,20 +544,25 @@ export default function SectionPanel({ sectionId }) {
         </SpaceBetween>
       ) : undefined}
     >
-      <SpaceBetween size="m">
-        <div>
-          <Box variant="awsui-key-label">What it shows</Box>
-          {info.body.split('\n').map((line, i) => <p key={i} style={{ margin: '4px 0' }}>{line}</p>)}
-        </div>
-        <div>
-          <Box variant="awsui-key-label">Why it matters</Box>
-          {info.why.split('\n').map((line, i) => <p key={i} style={{ margin: '4px 0' }}>{line}</p>)}
-        </div>
-        <div>
-          <Box variant="awsui-key-label">Action to take</Box>
-          {info.action.split('\n').map((line, i) => <p key={i} style={{ margin: '4px 0' }}>{line}</p>)}
-        </div>
-      </SpaceBetween>
+      {/* An entry may either supply the standard shows/why/action strings, or
+          a `custom` React node for rich content (numbered steps, code blocks)
+          — e.g. the Workloads setup guide that used to live only in the README. */}
+      {info.custom ? info.custom : (
+        <SpaceBetween size="m">
+          <div>
+            <Box variant="awsui-key-label">What it shows</Box>
+            {info.body.split('\n').map((line, i) => <p key={i} style={{ margin: '4px 0' }}>{line}</p>)}
+          </div>
+          <div>
+            <Box variant="awsui-key-label">Why it matters</Box>
+            {info.why.split('\n').map((line, i) => <p key={i} style={{ margin: '4px 0' }}>{line}</p>)}
+          </div>
+          <div>
+            <Box variant="awsui-key-label">Action to take</Box>
+            {info.action.split('\n').map((line, i) => <p key={i} style={{ margin: '4px 0' }}>{line}</p>)}
+          </div>
+        </SpaceBetween>
+      )}
     </HelpPanel>
   );
 }

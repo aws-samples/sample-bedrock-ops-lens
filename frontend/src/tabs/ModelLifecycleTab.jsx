@@ -15,10 +15,10 @@
 //   3. Table — every legacy model in the customer's portfolio with
 //              expandable per-account drill-down + CSV download
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
   SpaceBetween, Container, Header, Box, ColumnLayout,
-  StatusIndicator, Button,
+  StatusIndicator, SegmentedControl,
 } from '@cloudscape-design/components';
 import { useApi, fmt } from '../api.js';
 import { ChartLoading, KpiCard, SectionHeader } from '../components/Common.jsx';
@@ -38,57 +38,15 @@ function SeverityBadge({ severity }) {
   return <StatusIndicator type={type}>{SEV_LABEL[severity] || severity}</StatusIndicator>;
 }
 
-// Build a CSV including per-account drill-down rows. One header row,
-// one row per (model, account) plus a "summary" row per model where
-// the account fields are blank — so re-importing into a spreadsheet
-// keeps both totals and detail visible.
-function buildCsv(models) {
-  const headers = [
-    'severity', 'modelId', 'public_name', 'provider',
-    'legacy_date', 'extended_access_date', 'eol_date',
-    'recommended_upgrade', 'regions',
-    'total_requests', 'unique_accounts', 'last_accessed',
-    'detail_accountId', 'detail_requests', 'detail_regions', 'detail_last_accessed',
-  ];
-  const esc = (v) => {
-    if (v === null || v === undefined) return '';
-    const s = String(v);
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-  const lines = [headers.join(',')];
-  for (const m of models) {
-    const baseFields = [
-      m.severity, m.modelId, m.public_name, m.provider,
-      m.legacy_date, m.extended_access_date, m.eol_date,
-      m.recommended_upgrade, (m.regions || []).join(';'),
-      m.total_requests, m.unique_accounts, m.last_accessed,
-    ];
-    if (!m.accounts_detail || m.accounts_detail.length === 0) {
-      lines.push([...baseFields, '', '', '', ''].map(esc).join(','));
-      continue;
-    }
-    for (const d of m.accounts_detail) {
-      lines.push([
-        ...baseFields,
-        d.accountId, d.total_requests,
-        (d.regions || []).join(';'), d.last_accessed,
-      ].map(esc).join(','));
-    }
-  }
-  return lines.join('\n');
-}
-
-function downloadCsv(filename, text) {
-  const blob = new Blob([text], { type: 'text/csv' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
-}
-
 export default function ModelLifecycleTab({ filters, onInfo }) {
+  // Lifecycle is endpoint-agnostic: model status (Legacy / EOL / etc.) is a
+  // property of the model identity, not how it's invoked. No runtime/mantle
+  // switcher — it would only ever show identical numbers.
+  const filtersAll = useMemo(() => ({ ...filters, endpoint: 'all' }), [filters]);
+  return <ModelLifecycleBody filters={filtersAll} onInfo={onInfo} />;
+}
+
+function ModelLifecycleBody({ filters, onInfo }) {
   const { data, loading, error } = useApi('/model-lifecycle', filters,
     [filters.start_date, filters.end_date,
      (filters.accounts || []).join(',')]);
@@ -99,10 +57,14 @@ export default function ModelLifecycleTab({ filters, onInfo }) {
   const pastEol    = useMemo(() => models.filter(m => m.severity === 'critical'), [models]);
   const top8       = useMemo(() => inUse.slice(0, 8), [inUse]);
 
-  // Show all legacy models in the table — even ones with 0 requests in the
-  // window, since "this model is dying and you might not know yet" is exactly
-  // the kind of hint the tab is here to deliver.
-  const tableItems = models;
+  // Default the table to models the fleet is ACTUALLY using — otherwise most
+  // rows expand to "no usage in window", which is noise. A toggle exposes the
+  // full catalog (a model going legacy that you don't use yet can still be
+  // worth knowing). Default 'in-use' per user feedback.
+  const [scope, setScope] = useState('in-use');
+  const tableItems = useMemo(
+    () => (scope === 'in-use' ? inUse : models),
+    [scope, inUse, models]);
 
   if (error) {
     return (
@@ -156,6 +118,15 @@ export default function ModelLifecycleTab({ filters, onInfo }) {
     {
       id: 'total_requests', header: 'Requests (window)', minWidth: 130,
       cell: (item) => fmt(item.total_requests),
+    },
+    {
+      id: 'legacy_invocations', header: 'Legacy calls', minWidth: 120,
+      // A legacy model that is still being actively invoked is the highest-
+      // urgency migration signal. Flag >0 with a warning; render 0 plainly.
+      cell: (item) => Number(item.legacy_invocations) > 0
+        ? <StatusIndicator type="warning">{fmt(item.legacy_invocations)}</StatusIndicator>
+        : fmt(item.legacy_invocations || 0),
+      exportValue: (item) => item.legacy_invocations || 0,
     },
     {
       id: 'last_accessed', header: 'Last accessed', minWidth: 110,
@@ -247,21 +218,20 @@ export default function ModelLifecycleTab({ filters, onInfo }) {
         {/* Table ----------------------------------------------------- */}
         <Container header={
           <SectionHeader
-            title={`Legacy models${models.length ? ` (${models.length})` : ''}`}
+            title={`Legacy models (${tableItems.length})`}
             description="Click a row to see which accounts are using each model."
             sectionId="lifecycle-table"
             onInfo={onInfo}
             actions={
-              <Button
-                iconName="download"
-                disabled={models.length === 0}
-                onClick={() => {
-                  const csv = buildCsv(models);
-                  downloadCsv(`model-lifecycle-${new Date().toISOString().slice(0,10)}.csv`, csv);
-                }}
-              >
-                Download CSV
-              </Button>
+              <SegmentedControl
+                selectedId={scope}
+                onChange={({ detail }) => setScope(detail.selectedId)}
+                label="Scope"
+                options={[
+                  { id: 'in-use', text: `In use (${inUse.length})` },
+                  { id: 'all',    text: `All legacy (${models.length})` },
+                ]}
+              />
             }
           />
         }>
@@ -269,9 +239,12 @@ export default function ModelLifecycleTab({ filters, onInfo }) {
             : <PaginatedTable
                 items={tableItems}
                 pageSize={25}
+                downloadFileName="model-lifecycle.csv"
                 trackBy="modelId"
                 renderRowDetail={renderRowDetail}
-                empty="No legacy models in your portfolio. Nothing to migrate."
+                empty={scope === 'in-use'
+                  ? 'No legacy models in active use in this window. Switch to "All legacy" to see the full catalog.'
+                  : 'No legacy models in your portfolio. Nothing to migrate.'}
                 searchPlaceholder="Search by model id, name, provider…"
                 columnDefinitions={columnDefinitions}
               />

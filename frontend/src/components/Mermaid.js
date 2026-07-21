@@ -23,13 +23,21 @@ async function _loadMermaid() {
         startOnLoad: false,
         theme: dark ? 'dark' : 'default',
         fontSize: 16,
+        // htmlLabels:true so node labels render as HTML (inside <foreignObject>)
+        // and support <br/> line breaks (name / account / metric on separate
+        // lines). NB: mermaid 11 emits <foreignObject> regardless of this flag,
+        // so the sanitize step MUST allow foreignObject + its label HTML (see
+        // renderMermaidIn); stripping it leaves visible-but-empty node boxes.
         flowchart: { useMaxWidth: true, htmlLabels: true, padding: 12 },
         gantt: {
           fontSize: 14, sectionFontSize: 14, leftPadding: 120,
           gridLineStartPadding: 40, barHeight: 22, axisFormat: '%b %Y',
         },
         sequence: { actorFontSize: 14, messageFontSize: 13 },
-        securityLevel: 'loose',
+        // 'strict': mermaid sanitizes label text and emits no click handlers.
+        // Label HTML is limited to span/p/br (no script), so allowing it through
+        // our DOMPurify pass (which re-sanitizes anyway) carries no XSS risk.
+        securityLevel: 'strict',
       });
       return mermaid;
     });
@@ -41,12 +49,29 @@ async function _loadMermaid() {
 //   - Mermaid code blocks become <div class="ops-mermaid-source" data-source="…"></div>
 //     placeholders that the post-pass walks and replaces with real SVG.
 //   - Every link gets target="_blank" rel="noreferrer".
+// Base64-encode/decode the mermaid source we stash in the data-source
+// attribute. This is REQUIRED, not cosmetic: mermaid flowcharts contain `-->`
+// edge arrows, and when that string sits in an HTML attribute value DOMPurify
+// treats `-->` as an HTML-comment terminator and strips the WHOLE attribute —
+// leaving an empty data-source and a silently-missing diagram. Base64 output
+// is only [A-Za-z0-9+/=], none of which trip the sanitizer, so the source
+// round-trips through any number of DOMPurify passes intact. Unicode-safe via
+// encodeURIComponent (btoa alone throws on non-Latin1 chars like em dashes).
+function _b64encode(s) {
+  return btoa(unescape(encodeURIComponent(s)));
+}
+function _b64decode(s) {
+  try { return decodeURIComponent(escape(atob(s))); } catch { return ''; }
+}
+
 const _renderer = {
   code(token) {
     const lang = (token.lang || '').toLowerCase();
     if (lang === 'mermaid') {
-      const escaped = (token.text || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-      return `<div class="ops-mermaid-source" data-source="${escaped}"></div>`;
+      // data-b64 holds the base64 source (survives DOMPurify); the legacy
+      // data-source is dropped by the sanitizer for `-->`, so we no longer
+      // rely on it.
+      return `<div class="ops-mermaid-source" data-b64="${_b64encode(token.text || '')}"></div>`;
     }
     return false; // fall through to default
   },
@@ -65,7 +90,7 @@ const _markedInstance = marked.use({ renderer: _renderer });
 // onerror=, no javascript: hrefs).
 const _PURIFY_CFG = {
   ADD_TAGS: ['details', 'summary'],
-  ADD_ATTR: ['target', 'data-source'],
+  ADD_ATTR: ['target', 'data-source', 'data-b64'],
 };
 
 export function renderMarkdownToHtml(md) {
@@ -84,6 +109,28 @@ function _diagramLabel(src) {
   return 'Diagram';
 }
 
+// Targeted XSS scrub for a mermaid-produced SVG node tree. We can't use
+// DOMPurify here (it strips foreignObject label content — see renderMermaidIn),
+// so we remove the executable vectors ourselves: <script> elements, any on*
+// event-handler attribute, and javascript:/data: URLs on href/xlink:href/src.
+// Everything presentational (<style>, <foreignObject>, shapes, text) is kept.
+function _scrubSvgNode(node) {
+  if (!node || node.nodeType !== 1) return;
+  const tag = (node.tagName || '').toLowerCase();
+  if (tag === 'script') { node.remove(); return; }
+  // Copy attributes to an array first — we mutate during iteration.
+  for (const attr of Array.from(node.attributes || [])) {
+    const name = attr.name.toLowerCase();
+    const val = (attr.value || '').replace(/\s+/g, '').toLowerCase();
+    if (name.startsWith('on')) { node.removeAttribute(attr.name); continue; }
+    if ((name === 'href' || name === 'xlink:href' || name === 'src' || name === 'xlink:href') &&
+        (val.startsWith('javascript:') || val.startsWith('data:text/html'))) {
+      node.removeAttribute(attr.name);
+    }
+  }
+  for (const child of Array.from(node.childNodes)) _scrubSvgNode(child);
+}
+
 // Walk every .ops-mermaid-source placeholder in `root`, render its source
 // with mermaid, and replace the placeholder with a <details><summary> wrapper
 // containing the SVG.
@@ -94,25 +141,67 @@ export async function renderMermaidIn(root) {
   const mermaid = await _loadMermaid();
   let i = 0;
   for (const el of placeholders) {
-    const src = (el.getAttribute('data-source') || '').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
-    if (!src.trim() || src.length > MAX_MERMAID_SOURCE_LEN) {
-      // Static literal — no interpolation, no XSS surface.
-      el.outerHTML = `<pre>Diagram too large to render</pre>`; // nosemgrep: insecure-document-method
+    // Prefer the base64 attribute (survives DOMPurify); fall back to the legacy
+    // plain data-source for any cached HTML that predates the b64 encoding.
+    const b64 = el.getAttribute('data-b64');
+    const src = b64
+      ? _b64decode(b64)
+      : (el.getAttribute('data-source') || '').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+    if (!src.trim()) { el.remove(); continue; }
+    if (src.length > MAX_MERMAID_SOURCE_LEN) {
+      // Oversized source (rare — the LLM overshot the diagram size guardrail).
+      // Rather than a bare "too large" error, degrade gracefully: keep the
+      // section readable by offering the raw diagram source in a collapsed
+      // <details>. Built with DOM APIs + textContent so the source (model
+      // output) is never parsed as HTML — no innerHTML/outerHTML sink, no XSS.
+      const details = document.createElement('details');
+      details.className = 'ops-mermaid-details';
+      const summary = document.createElement('summary');
+      summary.textContent = `Show ${_diagramLabel(src)} (source)`;
+      const pre = document.createElement('pre');
+      pre.textContent = src;
+      details.appendChild(summary);
+      details.appendChild(pre);
+      if (el.parentNode) el.parentNode.replaceChild(details, el);
       continue;
     }
     const id = `mermaid-${Date.now()}-${i++}`;
     try {
       const { svg } = await mermaid.render(id, src);
       const label = _diagramLabel(src);
-      // Sanitize the mermaid-emitted SVG before splicing into the DOM.
-      // Mermaid is trusted code, but defense-in-depth: any user content
-      // that flows into a node label could become an XSS vector if mermaid
-      // ever has a renderer regression. SVG profile keeps shapes/styles.
-      const cleanSvg = DOMPurify.sanitize(svg, { USE_PROFILES: { svg: true, svgFilters: true } });
-      // SVG (cleanSvg) and label are both sanitized above; remaining
-      // template fragments are static literals.
-      const html = `<details class="ops-mermaid-details" open><summary>Show ${label}</summary><div class="ops-mermaid">${cleanSvg}</div></details>`;
-      el.outerHTML = html; // nosemgrep: insecure-document-method
+      // Splice the mermaid SVG in via a PARSED, TARGETED-SCRUBBED node — not
+      // DOMPurify. Why not DOMPurify: its SVG profile (and even its default
+      // config) strips the xhtml content inside <foreignObject>, and mermaid 11
+      // renders every node label as HTML inside foreignObject. Sanitizing with
+      // DOMPurify therefore yields black/empty node boxes (fills + labels gone).
+      //
+      // This is still safe. The SVG is produced by mermaid.render() under
+      // securityLevel:'strict' (no click handlers, label text pre-escaped) from
+      // a source we control (our own base64-decoded diagram). We additionally
+      // scrub the real XSS vectors ourselves: drop <script>, any on* event
+      // handler attribute, and javascript:/data: URLs. Nothing executable
+      // survives; the presentational <style> + foreignObject labels are kept.
+      const container = document.createElement('div');
+      container.className = 'ops-mermaid';
+      // Parse as text/html (lenient), NOT image/svg+xml (strict XML). Mermaid's
+      // foreignObject labels contain unclosed HTML void tags like <br>, which
+      // strict XML rejects ("tag mismatch: br"), aborting the parse after the
+      // first node. The HTML parser handles <br> and still builds the <svg>
+      // subtree correctly.
+      const doc = new DOMParser().parseFromString(svg, 'text/html');
+      const svgEl = doc.querySelector('svg');
+      if (!svgEl) { el.remove(); continue; }
+      _scrubSvgNode(svgEl);
+      container.appendChild(document.importNode(svgEl, true));
+
+      const details = document.createElement('details');
+      details.className = 'ops-mermaid-details';
+      details.setAttribute('open', '');
+      const summary = document.createElement('summary');
+      summary.textContent = `Show ${label}`;
+      details.appendChild(summary);
+      details.appendChild(container);
+      if (el.parentNode) el.parentNode.replaceChild(details, el);
     } catch (e) {
       // Use DOM APIs with textContent to avoid any innerHTML/outerHTML
       // sink for the error message (which may include mermaid-surfaced

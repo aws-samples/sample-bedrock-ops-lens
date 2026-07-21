@@ -106,6 +106,22 @@ class Settings:
     bedrock_model_id: str = os.environ.get(
         "BEDROCK_MODEL_ID", "us.anthropic.claude-opus-4-1-20250805-v1:0"
     )
+    # Ops Review synthesis runs against the bedrock-mantle endpoint (Anthropic
+    # Messages API) — the dashboard dogfoods the endpoint it recommends. Mantle
+    # uses short model ids (no CRIS prefix). Sonnet 5: flagship quality, fast
+    # enough to finish inside the 120s CloudFront/Lambda budget.
+    ops_review_model: str = os.environ.get("OPS_REVIEW_MODEL", "anthropic.claude-sonnet-5")
+    # Mantle model availability is per-region: Sonnet 5 lives on us-east-1
+    # mantle (us-west-2 mantle only has Haiku 4.5). This is a standalone HTTPS
+    # call, so it can target a different region than the app's BEDROCK_REGION
+    # (which is used for the app's own region context). Overridable per deploy.
+    ops_review_mantle_region: str = os.environ.get("OPS_REVIEW_MANTLE_REGION", "us-east-1")
+    # Try the mantle endpoint FIRST for Ops Review synthesis (dogfooding) when
+    # true; runtime-first when false. Default false: us-west-2 mantle is
+    # currently 500-ing, and runtime Sonnet 5 is fast (~20s) + reliable. The
+    # other endpoint is always the fallback either way. Flip to "true" once the
+    # regional mantle endpoint is healthy to lead with mantle again.
+    ops_review_use_mantle: bool = _bool("OPS_REVIEW_USE_MANTLE", False)
 
 
 settings = Settings()

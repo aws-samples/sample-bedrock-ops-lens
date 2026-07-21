@@ -6,6 +6,7 @@ import {
 import { useApi, fmt, fmtMs } from '../api.js';
 import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
+import EndpointSubTabs, { EndpointNotAvailable } from '../components/EndpointSubTabs.jsx';
 
 function isLLM(modelId) {
   const m = (modelId || '').toLowerCase();
@@ -20,6 +21,38 @@ function modelShort(id) {
 }
 
 export default function LatencyTab({ filters, onInfo }) {
+  // bedrock-mantle does not publish latency to CloudWatch. The dashboard
+  // can still surface Mantle latency, but only when the customer enabled
+  // Bedrock Model Invocation Logging — invocation_logs.py parses the
+  // per-request latencyMs and writes percentiles to f_latency_daily for
+  // the 'mantle' slice. So we SHOW the Mantle sub-tab only when such
+  // log-derived rows actually exist; otherwise hide it entirely (no blank
+  // Mantle view). The signal comes from /distinct-filters.mantle_available.
+  const distinct = useApi('/distinct-filters', {}, []).data || {};
+  const mantleAvailable = !!distinct.mantle_available?.latency;
+
+  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
+  return (
+    <EndpointSubTabs
+      selected={endpoint === 'all' ? 'runtime' : endpoint}
+      onChange={setEndpoint}
+      runtimeCoverage="full"
+      mantleCoverage="log-derived"
+      mantleAvailable={mantleAvailable}
+    >
+      {({ endpoint: ep }) => (
+        <LatencyBody
+          filters={filtersWithEp}
+          onInfo={onInfo}
+          mantleHint={ep === 'mantle'}
+        />
+      )}
+    </EndpointSubTabs>
+  );
+}
+
+function LatencyBody({ filters, onInfo, mantleHint }) {
   const [metric, setMetric] = useState('e2e');
   const byModel = useApi('/latency-by-model', filters, [JSON.stringify(filters)]);
   const cris = useApi('/latency-cris-vs-od', filters, [JSON.stringify(filters)]);
@@ -68,7 +101,14 @@ export default function LatencyTab({ filters, onInfo }) {
         }
       </Container>
 
-      <Container header={<SectionHeader title="Latency table" sectionId="latency-table" onInfo={onInfo} />}>
+      <Container header={
+        <SectionHeader
+          title="Latency table"
+          description="OTPS = output tokens/sec after the first token (generation speed; higher = faster). TTFT is time to the first token. — means the endpoint does not publish that metric."
+          sectionId="latency-table"
+          onInfo={onInfo}
+        />
+      }>
         {byModel.loading ? <ChartLoading /> :
           <PaginatedTable
             items={(byModel.data || []).filter(r => isLLM(r.modelid || r.modelId))}
@@ -78,9 +118,12 @@ export default function LatencyTab({ filters, onInfo }) {
               { id: 'p50',  header: 'E2E p50',   cell: r => fmtMs(r.p50_e2e) },
               { id: 'p90',  header: 'E2E p90',   cell: r => fmtMs(r.p90_e2e) },
               { id: 'p99',  header: 'E2E p99',   cell: r => fmtMs(r.p99_e2e) },
+              { id: 'att',  header: 'Avg TTFT',  cell: r => fmtMs(r.avg_ttft) },
               { id: 'tt50', header: 'TTFT p50',  cell: r => fmtMs(r.p50_ttft) },
               { id: 'tt90', header: 'TTFT p90',  cell: r => fmtMs(r.p90_ttft) },
               { id: 'tt99', header: 'TTFT p99',  cell: r => fmtMs(r.p99_ttft) },
+              { id: 'otps', header: 'OTPS (out tok/s)', cell: r => r.otps != null ? Number(r.otps).toFixed(1) : '—' },
+              { id: 'aotr', header: 'Avg out tok/req', cell: r => r.avg_output_tokens_per_req != null ? fmt(Math.round(r.avg_output_tokens_per_req)) : '—' },
             ]}
             empty="No latency data"
             sortingDisabled

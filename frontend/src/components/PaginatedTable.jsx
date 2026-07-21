@@ -15,8 +15,74 @@
 import { useMemo, useRef, useState } from 'react';
 import {
   Table, Box, TextFilter, Pagination, CollectionPreferences, Button,
+  SpaceBetween,
 } from '@cloudscape-design/components';
 import { useCollection } from '@cloudscape-design/collection-hooks';
+
+// --- CSV export helpers ----------------------------------------------------
+// Turn the table's column set + row items into a CSV and trigger a browser
+// download. Exports RAW row values (not rendered React cells) using each
+// column's `exportValue` if provided, else a best-effort read off the item
+// by column id (and its lowercased form, since Postgres returns lowercased
+// keys). Keeps downloads meaningful without every caller wiring it up.
+function csvEscape(v) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// Recursively pull the visible text out of whatever a column's `cell(item)`
+// returns — string/number, or a React element tree (Box, StatusIndicator,
+// <code>, nested children). This is the safety net so a column with a
+// React-rendering `cell` and no explicit `exportValue` still exports its
+// on-screen text instead of a blank. Skips SVG/icon nodes (no useful text).
+function nodeToText(node) {
+  if (node === null || node === undefined || node === false || node === true) return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(nodeToText).join(' ');
+  if (typeof node === 'object' && node.props) {
+    // Cloudscape StatusIndicator/Box/etc. carry their label in children.
+    return nodeToText(node.props.children);
+  }
+  return '';
+}
+
+function cellExportValue(col, item) {
+  // 1. Explicit exportValue always wins.
+  if (typeof col.exportValue === 'function') return col.exportValue(item);
+  // 2. Direct field match on the column id (exact or lowercased — Postgres
+  //    returns lowercased keys).
+  if (col.id && item[col.id] !== undefined) return item[col.id];
+  const lc = col.id && col.id.toLowerCase ? col.id.toLowerCase() : null;
+  if (lc && item[lc] !== undefined) return item[lc];
+  // 3. Fallback: render the cell and extract its visible text. Covers columns
+  //    whose id doesn't match a field and that render React elements — without
+  //    this they exported blank. Clean the '—' placeholder to empty.
+  if (typeof col.cell === 'function') {
+    try {
+      const txt = nodeToText(col.cell(item)).replace(/\s+/g, ' ').trim();
+      return txt === '—' ? '' : txt;
+    } catch { /* fall through */ }
+  }
+  return '';
+}
+
+function downloadCsv(filename, columns, rows) {
+  const header = columns.map(c => csvEscape(c.header ?? c.id)).join(',');
+  const body = rows
+    .filter(r => !r.__detail__)
+    .map(r => columns.map(c => csvEscape(cellExportValue(c, r))).join(','))
+    .join('\n');
+  const blob = new Blob([`${header}\n${body}`], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
 export default function PaginatedTable({
   items = [],
@@ -32,6 +98,10 @@ export default function PaginatedTable({
   sortingDisabled,
   empty = 'No data',
   searchPlaceholder = 'Search…',
+  // CSV download. Enabled by default; pass `downloadable={false}` to hide.
+  // `downloadFileName` names the file (defaults to bedrock-ops-lens-export.csv).
+  downloadable = true,
+  downloadFileName = 'bedrock-ops-lens-export.csv',
 }) {
   const [pageSize, setPageSize] = useState(initialPageSize);
   const [visible, setVisible] = useState(columnDefinitions.map(c => c.id));
@@ -136,11 +206,24 @@ export default function PaginatedTable({
       sortingDisabled
       {...(tableTrackBy ? { trackBy: tableTrackBy } : {})}
       filter={
-        <TextFilter
-          {...filterProps}
-          countText={`${filteredItemsCount} matches`}
-          filteringPlaceholder={searchPlaceholder}
-        />
+        <SpaceBetween direction="horizontal" size="xs">
+          <div style={{ minWidth: 220, flexGrow: 1 }}>
+            <TextFilter
+              {...filterProps}
+              countText={`${filteredItemsCount} matches`}
+              filteringPlaceholder={searchPlaceholder}
+            />
+          </div>
+          {downloadable && (
+            <Button
+              variant="icon"
+              iconName="download"
+              ariaLabel="Download table as CSV"
+              disabled={!items.length}
+              onClick={() => downloadCsv(downloadFileName, visibleCols, items)}
+            />
+          )}
+        </SpaceBetween>
       }
       pagination={<Pagination {...paginationProps} />}
       preferences={

@@ -70,10 +70,11 @@ async def list_tag_values(
 
 @router.get("/preferences")
 async def get_preferences(request: Request):
-    """Returns the calling user's pinned tag keys + dashboard defaults."""
+    """Returns the calling user's pinned tag/proxy keys + dashboard defaults."""
     user_id = current_user_id(request)
     row = await db.fetchrow(
-        "SELECT pinned_tag_keys, default_time_range, default_provider, updated_at "
+        "SELECT pinned_tag_keys, pinned_proxy_keys, default_time_range, "
+        "default_provider, updated_at "
         "FROM user_preferences WHERE user_id = $1",
         user_id,
     )
@@ -81,6 +82,7 @@ async def get_preferences(request: Request):
         return {
             "user_id": user_id,
             "pinned_tag_keys": [],
+            "pinned_proxy_keys": [],
             "default_time_range": None,
             "default_provider": None,
         }
@@ -92,27 +94,44 @@ async def get_preferences(request: Request):
 
 @router.put("/preferences")
 async def put_preferences(request: Request, body: dict):
-    """Upsert pinned tag keys + defaults for the calling user."""
+    """Partial upsert of the calling user's preferences. Only the fields present
+    in the body are updated — so saving proxy keys never wipes tag keys (and
+    vice-versa), and the two attribution sources keep independent key lists."""
     user_id = current_user_id(request)
-    pinned = body.get("pinned_tag_keys", [])
-    if not isinstance(pinned, list) or any(not isinstance(k, str) for k in pinned):
-        raise HTTPException(400, detail="pinned_tag_keys must be list[str]")
-    if len(pinned) > 10:
-        raise HTTPException(400, detail="max 10 pinned tag keys")
-    default_time_range = body.get("default_time_range")
-    default_provider = body.get("default_provider")
 
+    def _keys(field):
+        v = body.get(field)
+        if v is None:
+            return None
+        if not isinstance(v, list) or any(not isinstance(k, str) for k in v):
+            raise HTTPException(400, detail=f"{field} must be list[str]")
+        if len(v) > 10:
+            raise HTTPException(400, detail=f"max 10 {field}")
+        return v
+
+    pinned_tag = _keys("pinned_tag_keys")
+    pinned_proxy = _keys("pinned_proxy_keys")
+    dtr = body.get("default_time_range")
+    dp = body.get("default_provider")
+    dtr_set = "default_time_range" in body
+    dp_set = "default_provider" in body
+
+    # Ensure a row exists, then COALESCE-update only the provided fields.
+    # Explicit ::text[] casts so asyncpg can type the params even when NULL
+    # (a bare NULL array param otherwise fails type inference).
     await db.fetchval(
         """
-        INSERT INTO user_preferences (user_id, pinned_tag_keys, default_time_range, default_provider, updated_at)
-        VALUES ($1, $2, $3, $4, now())
-        ON CONFLICT (user_id) DO UPDATE
-          SET pinned_tag_keys = EXCLUDED.pinned_tag_keys,
-              default_time_range = EXCLUDED.default_time_range,
-              default_provider = EXCLUDED.default_provider,
-              updated_at = now()
+        INSERT INTO user_preferences (user_id, pinned_tag_keys, pinned_proxy_keys,
+                                      default_time_range, default_provider, updated_at)
+        VALUES ($1, COALESCE($2::text[], '{}'), COALESCE($3::text[], '{}'), $4::text, $5::text, now())
+        ON CONFLICT (user_id) DO UPDATE SET
+          pinned_tag_keys    = COALESCE($2::text[], user_preferences.pinned_tag_keys),
+          pinned_proxy_keys  = COALESCE($3::text[], user_preferences.pinned_proxy_keys),
+          default_time_range = CASE WHEN $6 THEN $4::text ELSE user_preferences.default_time_range END,
+          default_provider   = CASE WHEN $7 THEN $5::text ELSE user_preferences.default_provider END,
+          updated_at = now()
         RETURNING user_id
         """,
-        user_id, pinned, default_time_range, default_provider,
+        user_id, pinned_tag, pinned_proxy, dtr, dp, dtr_set, dp_set,
     )
     return {"ok": True, "user_id": user_id}

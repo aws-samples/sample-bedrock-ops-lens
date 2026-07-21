@@ -28,11 +28,47 @@ async def summary(f: FilterSet = Depends(parse_filters)):
         """,
         *w.params,
     )
-    return dict(rows)
+    out = dict(rows)
+
+    # Per-endpoint breakdown for the Overview KPI tiles — each tile shows the
+    # total plus a "runtime X · mantle Y" split without a second round-trip.
+    # has_endpoint=False so the tab's active endpoint filter is ignored here
+    # and BOTH slices always come back (respecting all OTHER filters).
+    wb = build_where(f, has_endpoint=False)
+    ep_rows = await db.fetch(
+        f"""
+        SELECT endpoint,
+          COALESCE(SUM(total_requests), 0)::BIGINT       AS total_requests,
+          COALESCE(SUM(failed_requests), 0)::BIGINT      AS failed_requests,
+          COALESCE(SUM(total_input_tokens), 0)::BIGINT   AS total_input_tokens,
+          COALESCE(SUM(total_output_tokens), 0)::BIGINT  AS total_output_tokens,
+          COALESCE(SUM(status_429_count), 0)::BIGINT     AS throttled_requests,
+          COALESCE(SUM(status_500_count + status_503_count), 0)::BIGINT AS server_errors,
+          COUNT(DISTINCT accountId)::BIGINT              AS unique_accounts
+        FROM f_daily
+        WHERE {wb.sql}
+        GROUP BY endpoint
+        """,
+        *wb.params,
+    )
+    by_endpoint = {"runtime": {}, "mantle": {}}
+    for r in ep_rows:
+        d = dict(r)
+        ep = d.pop("endpoint", "runtime")
+        if ep not in ("runtime", "mantle"):
+            ep = "runtime"
+        by_endpoint[ep] = d
+    out["by_endpoint"] = by_endpoint
+    return out
 
 
 @router.get("/daily-trend")
 async def daily_trend(f: FilterSet = Depends(parse_filters)):
+    # Endpoint filter is honored normally (has_endpoint default True): when the
+    # tab is scoped to one endpoint, total_* reflects only that endpoint. The
+    # extra runtime_requests / mantle_requests conditional sums let the Overview
+    # trend chart stack the split in the default 'all' view (in a single-endpoint
+    # view the other slice is simply 0 — correct).
     w = build_where(f)
     rows = await db.fetch(
         f"""
@@ -43,7 +79,9 @@ async def daily_trend(f: FilterSet = Depends(parse_filters)):
           SUM(total_input_tokens)::BIGINT   AS input_tokens,
           SUM(total_output_tokens)::BIGINT  AS output_tokens,
           SUM(total_cache_read_input_tokens)::BIGINT AS cache_read_tokens,
-          SUM(status_429_count)::BIGINT     AS throttled
+          SUM(status_429_count)::BIGINT     AS throttled,
+          SUM(CASE WHEN endpoint = 'runtime' THEN total_requests ELSE 0 END)::BIGINT AS runtime_requests,
+          SUM(CASE WHEN endpoint = 'mantle'  THEN total_requests ELSE 0 END)::BIGINT AS mantle_requests
         FROM f_daily
         WHERE {w.sql}
         GROUP BY year, month, day
@@ -145,16 +183,32 @@ async def traffic_types(f: FilterSet = Depends(parse_filters)):
 
 @router.get("/operations")
 async def operations(f: FilterSet = Depends(parse_filters)):
-    w = build_where(f)
+    """Requests by API operation (Converse / InvokeModel / *Stream).
+
+    The AWS/Bedrock CloudWatch metrics carry NO operation dimension, so f_daily
+    only ever has the '__none__' sentinel. The real per-operation split comes
+    from Bedrock model invocation logs → f_daily_tagged (which has an
+    `operation` column). We read that here.
+
+    f_daily_tagged fans out one row per requestMetadata tag_key, so summing all
+    rows would multiply-count. Restrict to a single tag_key (each key covers
+    100% of requests) so the totals are correct. When invocation logging is off
+    f_daily_tagged is empty → we return [] and the UI shows the "enable logging"
+    note.
+    """
+    w = build_where(f, has_traffic_type=False, has_endpoint=False)
     rows = await db.fetch(
         f"""
+        WITH one_key AS (
+            SELECT MIN(tag_key) AS k FROM f_daily_tagged WHERE {w.sql}
+        )
         SELECT operation,
           SUM(total_requests)::BIGINT      AS total_requests,
           SUM(failed_requests)::BIGINT     AS failed_requests,
           SUM(total_input_tokens)::BIGINT  AS input_tokens,
           SUM(total_output_tokens)::BIGINT AS output_tokens
-        FROM f_daily
-        WHERE {w.sql}
+        FROM f_daily_tagged
+        WHERE {w.sql} AND tag_key = (SELECT k FROM one_key)
         GROUP BY operation
         ORDER BY total_requests DESC
         """,

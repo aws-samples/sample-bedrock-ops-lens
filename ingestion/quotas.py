@@ -75,6 +75,59 @@ def _parse(q: dict) -> dict | None:
     }
 
 
+async def _order_accounts(conn: asyncpg.Connection, accts: list) -> list:
+    """Sort accounts so the ones with real Bedrock traffic come FIRST.
+
+    At org scale the Service Quotas API rate-limits hard and a single quotas
+    pass can run for 10+ minutes, so the Lambda may time out before covering
+    every (account, region). Whichever accounts we process first are the ones
+    whose util% actually renders. Accounts that appear in f_hourly_peak /
+    f_daily are the ones with traffic (and therefore the only ones where a
+    quota util% is even meaningful), so we front-load them. Idle accounts
+    still get covered — just after the ones that matter, and across successive
+    runs via the resumable skip in main(). This keeps full multi-account
+    support while guaranteeing the util-critical accounts never starve.
+    """
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT accountId, SUM(cnt)::BIGINT AS cnt FROM (
+                SELECT accountId, COUNT(*) AS cnt FROM f_hourly_peak GROUP BY accountId
+                UNION ALL
+                SELECT accountId, COUNT(*) AS cnt FROM f_daily GROUP BY accountId
+            ) t GROUP BY accountId
+            """
+        )
+        weight = {str(r["accountid"]): int(r["cnt"] or 0) for r in rows}
+    except Exception:
+        weight = {}
+    # Stable sort: higher traffic weight first, then preserve discovery order.
+    return sorted(accts, key=lambda m: -weight.get(str(m.accountId), 0))
+
+
+async def _recent_refresh(conn: asyncpg.Connection, stale_hours: int) -> set[tuple[str, str]]:
+    """Return {(accountId, region)} refreshed within the last `stale_hours`.
+
+    Lets a rate-limited quotas pass RESUME across scheduled runs: each run
+    skips (account, region) pairs already refreshed recently, so successive
+    runs make forward progress and the whole org gets covered instead of every
+    run dying at the same throttled spot. A daily full refresh is plenty fresh
+    for quota limits, which change rarely.
+    """
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT accountId, region FROM f_quotas
+            WHERE last_refreshed_at > now() - ($1::text || ' hours')::interval
+            GROUP BY accountId, region
+            """,
+            str(stale_hours),
+        )
+        return {(str(r["accountid"]), str(r["region"])) for r in rows}
+    except Exception:
+        return set()
+
+
 def _fetch_quotas_for_region(region: str, session: boto3.Session | None = None) -> list[tuple]:
     """Returns rows ready for INSERT. Joins applied + default by quota_code."""
     sq = _sq_client(region, session=session)
@@ -117,6 +170,9 @@ async def main() -> int:
     ap.add_argument("--regions", default="",
                     help="comma-separated AWS regions; defaults to config.yaml monitored_regions")
     ap.add_argument("--db-url", default=DEFAULT_DB_URL)
+    ap.add_argument("--stale-hours", type=int, default=20,
+                    help="skip (account, region) pairs refreshed within this many "
+                         "hours so a rate-limited pass resumes across runs (0=always refresh)")
     args = ap.parse_args()
 
     accts = discover_accounts(args)
@@ -136,9 +192,23 @@ async def main() -> int:
     conn = await asyncpg.connect(args.db_url)
     failures: list[tuple[str, str, str]] = []
     try:
+        # Traffic-first ordering so accounts whose util% actually renders get
+        # covered before the pass risks timing out; recently-refreshed pairs
+        # are skipped so a throttled run resumes rather than restarting.
+        accts = await _order_accounts(conn, accts)
+        recent = await _recent_refresh(conn, args.stale_hours) if args.stale_hours > 0 else set()
+        if recent:
+            print(f"  resumable: skipping {len(recent)} (account, region) pair(s) "
+                  f"refreshed within {args.stale_hours}h", flush=True)
+
         total = 0
+        skipped = 0
         for monitored in accts:
             acct = monitored.accountId
+            # Skip whole account only if EVERY target region is fresh.
+            if all((acct, r) in recent for r in regions):
+                skipped += len(regions)
+                continue
             try:
                 session = session_for(acct, role_name=args.role_name,
                                       external_id=args.external_id)
@@ -149,6 +219,9 @@ async def main() -> int:
                 continue
 
             for region in regions:
+                if (acct, region) in recent:
+                    skipped += 1
+                    continue
                 try:
                     rows = _fetch_quotas_for_region(region, session=session)
                 except Exception as e:
@@ -191,11 +264,12 @@ async def main() -> int:
             datetime.now(timezone.utc).isoformat(),
         )
         if failures:
-            print(f"\nDONE with {len(failures)} failure(s); {total} rows ingested.")
+            print(f"\nDONE with {len(failures)} failure(s); {total} rows ingested, "
+                  f"{skipped} pair(s) skipped as fresh.")
             for acct, region, msg in failures:
                 print(f"  [{acct}/{region}] {msg}")
             return 1
-        print(f"DONE. {total} quota rows.")
+        print(f"DONE. {total} quota rows; {skipped} pair(s) skipped as fresh.")
     finally:
         await conn.close()
     return 0

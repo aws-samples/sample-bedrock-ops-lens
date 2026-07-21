@@ -13,13 +13,14 @@
 //   4. Spend by model table ($/1M tokens, $/request)
 //   5. Cost concentration: top-N (account, model) by spend with WoW
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, Box, Grid, BarChart, Alert, StatusIndicator, Link,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtPct } from '../api.js';
 import { ChartLoading, KpiCard, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
+import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
 
 // Currency formatter:
 //   - For axis ticks where space is tight: pass `compact: true` for $1.2K.
@@ -52,6 +53,33 @@ function deltaCell(cur, prev) {
 }
 
 export default function CostTab({ filters, onInfo }) {
+  // Cost Explorer bills Bedrock per account/service/region — it has NO
+  // runtime-vs-mantle dimension. The 'all' view shows the exact CE dollars;
+  // the runtime/mantle sub-tabs show that endpoint's ALLOCATED share (the real
+  // CE total apportioned per model/account/day by token-cost weight). Labeled
+  // as an allocation so it's never mistaken for a billed per-endpoint figure.
+  const distinct = useApi('/distinct-filters', {}, []).data || {};
+  const mantleAvailable = !!distinct.mantle_available?.volumetric;
+  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
+  return (
+    <EndpointSubTabs
+      selected={endpoint === 'all' ? 'runtime' : endpoint}
+      onChange={setEndpoint}
+      runtimeCoverage="metric"
+      mantleCoverage="metric"
+      mantleAvailable={mantleAvailable}
+    >
+      {() => <CostBody filters={filtersWithEp} endpoint={endpoint} onInfo={onInfo} />}
+    </EndpointSubTabs>
+  );
+}
+
+function CostBody({ filters, endpoint, onInfo }) {
+  // In-card toggle on the Total spend tile (endpoint sub-tabs only): flip
+  // between this endpoint's allocated slice and the combined CE total —
+  // mirrors the Overview tab's spend tile.
+  const [spendView, setSpendView] = useState('endpoint');
   const summary  = useApi('/cost-summary',           filters, [JSON.stringify(filters)]);
   const daily    = useApi('/cost-daily',             filters, [JSON.stringify(filters)]);
   const byAcct   = useApi('/cost-by-account',        filters, [JSON.stringify(filters)]);
@@ -76,17 +104,34 @@ export default function CostTab({ filters, onInfo }) {
     }
     const top = [...totals.entries()].sort((a, b) => b[1] - a[1]).slice(0, 7).map(([k]) => k);
     const topSet = new Set(top);
-    const byCat = new Map();
+    // Fold non-top models into 'Other', summing per (category, date) so a day
+    // never has two segments for the same category.
+    const byCatDate = new Map();   // cat -> Map(dateStr -> cost)
     for (const r of byModelChart.data) {
       const cat = topSet.has(r.model_label) ? r.model_label : 'Other';
-      if (!byCat.has(cat)) byCat.set(cat, []);
-      byCat.get(cat).push(r);
+      if (!byCatDate.has(cat)) byCatDate.set(cat, new Map());
+      const m = byCatDate.get(cat);
+      m.set(r.event_date, (m.get(r.event_date) || 0) + Number(r.total_cost || 0));
     }
-    return [...byCat.entries()].map(([cat, rows]) => ({
+    return [...byCatDate.entries()].map(([cat, m]) => ({
       title: modelShort(cat),
       type: 'bar',
-      data: rows.map(r => ({ x: new Date(r.event_date), y: Number(r.total_cost) })),
+      // Sort points chronologically — the API returns rows grouped by model,
+      // so without this the categorical x-axis renders days out of order
+      // (Jun 3, Jun 22, Jun 7, … Jul 3, Jun 5). Sort by real date ascending.
+      data: [...m.entries()]
+        .sort((a, b) => new Date(a[0]) - new Date(b[0]))
+        .map(([d, cost]) => ({ x: new Date(d), y: cost })),
     }));
+  }, [byModelChart.data]);
+
+  // Explicit sorted x-domain so the categorical axis is chronological across
+  // ALL series (per-series sort alone can still interleave when series
+  // introduce different dates first). Union of every date, ascending.
+  const spendXDomain = useMemo(() => {
+    const ds = new Set();
+    for (const r of (byModelChart.data || [])) ds.add(r.event_date);
+    return [...ds].sort((a, b) => new Date(a) - new Date(b)).map(d => new Date(d));
   }, [byModelChart.data]);
 
   const isCostDerived = useMemo(
@@ -96,10 +141,50 @@ export default function CostTab({ filters, onInfo }) {
 
   return (
     <SpaceBetween size="l">
+      {/* Provenance banner on the endpoint sub-tabs: these dollars are the real
+          CE total apportioned to this endpoint by token-cost weight, not a
+          billed per-endpoint figure (AWS bills Bedrock with no endpoint dim). */}
+      {(endpoint === 'runtime' || endpoint === 'mantle') && (
+        <Alert type="info">
+          Showing <strong>bedrock-{endpoint}</strong>'s allocated share of spend —
+          the invoice-accurate Cost Explorer total apportioned per model/account/day
+          by token-cost weight. AWS bills Bedrock without a runtime/mantle
+          dimension, so this is an allocation, not a billed per-endpoint amount.
+          Switch to the combined view for exact CE dollars.
+        </Alert>
+      )}
       {/* 1. KPI ribbon */}
       <Grid gridDefinition={[{ colspan: 3 }, { colspan: 3 }, { colspan: 3 }, { colspan: 3 }]}>
-        <KpiCard title={`Total spend (${s.window?.days || '—'}d)`}
-                 value={fmtCurrency(s.total_cost, currency)} />
+        {(() => {
+          // CE gives an invoice-accurate TOTAL but no runtime-vs-mantle
+          // dimension. On an endpoint sub-tab, the in-card toggle picks which
+          // figure shows: that endpoint's ALLOCATED slice (total split by
+          // token-cost weight) or the combined CE total. On 'all' there's no
+          // toggle — just show the total plus the runtime·mantle split line.
+          const be = s.by_endpoint;
+          const onEndpoint = (endpoint === 'runtime' || endpoint === 'mantle') && be;
+          const showAlloc = onEndpoint && spendView === 'endpoint';
+          const amount = showAlloc ? Number(be[endpoint] || 0) : Number(s.total_cost || 0);
+          return (
+            <KpiCard title={`Total spend (${s.window?.days || '—'}d)`}
+                     tabs={onEndpoint ? {
+                       selectedId: spendView,
+                       onChange: setSpendView,
+                       options: [
+                         { id: 'endpoint', text: endpoint === 'mantle' ? 'Mantle' : 'Runtime' },
+                         { id: 'total', text: 'Total' },
+                       ],
+                     } : undefined}
+                     value={s.total_cost != null ? fmtCurrency(amount, currency) : '—'}
+                     // Endpoint split line only on the combined 'all' view, and
+                     // only when there's actual mantle spend to break out.
+                     split={!onEndpoint && be && Number(be.mantle) > 0
+                       ? { runtime: fmtCurrency(Number(be.runtime || 0), currency),
+                           mantle: fmtCurrency(Number(be.mantle || 0), currency) }
+                       : undefined}
+                     note={showAlloc ? 'token-cost share' : undefined} />
+          );
+        })()}
         <KpiCard title="WoW change"
                  value={wowPct == null ? '—' : `${wowPct >= 0 ? '+' : ''}${wowPct.toFixed(1)}%`} />
         <KpiCard title="Active services"  value={fmt(s.unique_services)} />
@@ -134,6 +219,7 @@ export default function CostTab({ filters, onInfo }) {
           <BarChart
             series={spendStackedSeries}
             xScaleType="categorical"
+            xDomain={spendXDomain}
             stackedBars
             hideFilter
             ariaLabel="Daily spend"

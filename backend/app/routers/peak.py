@@ -25,6 +25,9 @@ async def hourly_heatmap(f: FilterSet = Depends(parse_filters)):
         from ..filters import PROVIDER_PREFIX
         parts.append(f"modelId LIKE ${len(params)+1}")
         params.append(PROVIDER_PREFIX[f.provider] + "%")
+    if f.endpoint != "all":
+        parts.append(f"endpoint = ${len(params)+1}")
+        params.append(f.endpoint)
     where_sql = " AND ".join(parts)
 
     rows = await db.fetch(

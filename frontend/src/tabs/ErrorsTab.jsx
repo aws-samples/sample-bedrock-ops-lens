@@ -2,29 +2,195 @@
 import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, BarChart, LineChart, Grid, Box,
-  Button, Spinner, Alert, SegmentedControl,
+  Button, Spinner, Alert, SegmentedControl, ColumnLayout, StatusIndicator,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtPct, api as apiCall } from '../api.js';
-import { ChartLoading, SectionHeader, InfoLink, CHART_I18N } from '../components/Common.jsx';
+import { ChartLoading, KpiCard, SectionHeader, InfoLink, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
+import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
 
 // Per-code palette + render order for the "Status Codes" stacked chart.
 // 200 OK first (bottom of stack), then client codes, then server codes.
 // Distinct, high-contrast hues so adjacent stacked segments never blur into
 // each other (the previous orange/brown/red ramp was hard to tell apart).
+// Hues chosen to stay visible on BOTH the light and dark Cloudscape themes.
+// The old 500 (#111827 near-black) and 503 (#6b7280 dim gray) vanished against
+// the dark theme's near-black panel background — a lone 500 bar looked like an
+// empty chart. Server codes now use a bright crimson / warm-brown that read on
+// either background.
 const STATUS_SERIES = [
   { key: 'ok',   title: '200 OK', color: '#2e7d32' },  // green
   { key: 's400', title: '400',    color: '#f59e0b' },  // amber
   { key: 's403', title: '403',    color: '#8b5cf6' },  // violet
   { key: 's404', title: '404',    color: '#0ea5e9' },  // sky blue
   { key: 's408', title: '408',    color: '#ec4899' },  // pink
-  { key: 's424', title: '424',    color: '#a16207' },  // brown
+  { key: 's424', title: '424',    color: '#14b8a6' },  // teal
   { key: 's429', title: '429',    color: '#ef4444' },  // red
-  { key: 's500', title: '500',    color: '#111827' },  // near-black
-  { key: 's503', title: '503',    color: '#6b7280' },  // gray
+  { key: 's500', title: '500',    color: '#dc2626' },  // crimson (was near-black — invisible on dark)
+  { key: 's503', title: '503',    color: '#d97706' },  // dark amber (was dim gray)
 ];
 
 export default function ErrorsTab({ filters, onInfo }) {
+  // bedrock-mantle CW publishes 4xx but not 5xx and folds 429 into the
+  // 4xx total, so the Errors tab is partial for Mantle. Coverage =
+  // 'metric' (live but partial); 5xx breakdown comes from invocation
+  // logs only when the customer enabled them.
+  const distinct = useApi('/distinct-filters', {}, []).data || {};
+  const mantleAvailable = !!distinct.mantle_available?.volumetric;
+  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
+  return (
+    <EndpointSubTabs
+      selected={endpoint === 'all' ? 'runtime' : endpoint}
+      onChange={setEndpoint}
+      runtimeCoverage="full"
+      mantleCoverage="metric"
+      mantleAvailable={mantleAvailable}
+    >
+      {() => <ErrorsBody filters={filtersWithEp} onInfo={onInfo} />}
+    </EndpointSubTabs>
+  );
+}
+
+function ErrorsBody({ filters, onInfo }) {
+  // bedrock-mantle publishes a fundamentally different (and narrower) health
+  // surface than runtime: request volume + a single aggregate 4xx client-error
+  // count, with NO 5xx, no per-status-code split, and no invocation logs. The
+  // runtime layout below (per-code stacked bars, 429/4xx/5xx trend, per-code
+  // tables) therefore renders blank/zero for Mantle and reads as "broken".
+  // Show a purpose-built health view built from the signals Mantle DOES expose
+  // instead. Runtime is unchanged.
+  if (filters.endpoint === 'mantle') {
+    return <MantleHealthBody filters={filters} onInfo={onInfo} />;
+  }
+  return <RuntimeErrorsBody filters={filters} onInfo={onInfo} />;
+}
+
+// ---- bedrock-mantle: dedicated health view -------------------------------
+// Positive, volume-first framing driven entirely by real AWS/BedrockMantle
+// CloudWatch signals (Inferences + InferenceClientErrors). Never blank when
+// there is traffic; an honest footnote explains the (real) coverage gap.
+function MantleHealthBody({ filters, onInfo }) {
+  const { data, loading } = useApi('/mantle-health', filters, [JSON.stringify(filters)]);
+  const summary = data?.summary || {};
+  const trend = data?.trend || [];
+  const byModel = data?.by_model || [];
+  const hasTraffic = Number(summary.total_requests || 0) > 0;
+
+  const volumeSeries = useMemo(() => {
+    if (!trend.length) return [];
+    return [{
+      title: 'Requests', type: 'bar', color: '#0972d3', valueFormatter: fmt,
+      data: trend.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.total_requests || 0) })),
+    }];
+  }, [trend]);
+
+  const errRateSeries = useMemo(() => {
+    if (!trend.length) return [];
+    return [{
+      title: 'Client-error rate %', type: 'line', color: '#d13212',
+      data: trend.map(r => ({ x: `${r.month}/${r.day}`, y: Number(r.error_rate_pct || 0) })),
+    }];
+  }, [trend]);
+
+  return (
+    <SpaceBetween size="l">
+      <Alert type="info" header="bedrock-mantle health signals">
+        This view is built from bedrock-mantle’s native CloudWatch metrics:
+        request volume and an aggregate client-error (4xx) rate, broken down
+        per model. Use it to track Mantle throughput and error trends at a
+        glance. For per-status-code detail, switch to the bedrock-runtime tab.
+      </Alert>
+
+      {/* KPI ribbon ------------------------------------------------------ */}
+      <ColumnLayout columns={4} variant="text-grid">
+        <KpiCard title="Requests (Inferences)" value={loading ? '—' : fmt(summary.total_requests || 0)} />
+        <KpiCard title="Client errors (4xx)" value={loading ? '—' : fmt(summary.client_errors_4xx || 0)} />
+        <KpiCard title="Client-error rate"
+                 value={loading ? '—' : `${Number(summary.error_rate_pct || 0).toFixed(2)}%`}
+                 invert />
+        <KpiCard title="Success rate"
+                 value={loading ? '—' : `${Number(summary.success_rate_pct || 0).toFixed(2)}%`} />
+      </ColumnLayout>
+
+      {/* Volume + error-rate trend -------------------------------------- */}
+      <Container header={
+        <SectionHeader
+          title="Request volume & client-error rate"
+          description="Daily Mantle request volume with the aggregate 4xx client-error rate overlaid."
+          sectionId="mantle-health-trend"
+          onInfo={onInfo}
+        />
+      }>
+        {loading ? <ChartLoading /> :
+          !hasTraffic ? (
+            <Box textAlign="center" color="text-body-secondary" padding="l">
+              No bedrock-mantle traffic in the selected window. Widen the date
+              range or switch to bedrock-runtime above.
+            </Box>
+          ) : (
+            <Grid gridDefinition={[{ colspan: 8 }, { colspan: 4 }]}>
+              <BarChart
+                series={volumeSeries}
+                xScaleType="categorical"
+                hideFilter
+                ariaLabel="Mantle request volume by day"
+                i18nStrings={{
+                  ...CHART_I18N,
+                  xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                }}
+                xTitle="Day" yTitle="Requests"
+                height={260}
+              />
+              <LineChart
+                series={errRateSeries}
+                xScaleType="categorical"
+                hideFilter
+                ariaLabel="Mantle client-error rate"
+                i18nStrings={{ ...CHART_I18N, yTickFormatter: v => `${v.toFixed(2)}%` }}
+                xTitle="Day" yTitle="Client-error %"
+                height={260}
+              />
+            </Grid>
+          )
+        }
+      </Container>
+
+      {/* Per-model table ------------------------------------------------ */}
+      <Container header={
+        <SectionHeader
+          title="Health by model"
+          description="Per-model request volume and aggregate client-error rate on bedrock-mantle."
+          sectionId="mantle-health-by-model"
+          onInfo={onInfo}
+        />
+      }>
+        {loading ? <ChartLoading height={200} /> :
+          <PaginatedTable
+            items={byModel}
+            downloadFileName="mantle-health-by-model.csv"
+            columnDefinitions={[
+              { id: 'model', header: 'Model', cell: r => r.modelid || r.modelId,
+                exportValue: r => r.modelid || r.modelId },
+              { id: 'requests', header: 'Requests', cell: r => fmt(r.total_requests),
+                exportValue: r => r.total_requests },
+              { id: 'errs', header: 'Client errors (4xx)', cell: r => fmt(r.client_errors_4xx),
+                exportValue: r => r.client_errors_4xx },
+              { id: 'rate', header: 'Error rate', cell: (r) => {
+                  const p = Number(r.error_rate_pct || 0);
+                  const t = p > 5 ? 'error' : p > 1 ? 'warning' : 'success';
+                  return <StatusIndicator type={t}>{p.toFixed(2)}%</StatusIndicator>;
+                }, exportValue: r => `${Number(r.error_rate_pct || 0).toFixed(2)}%` },
+            ]}
+            empty="No bedrock-mantle traffic in window"
+          />
+        }
+      </Container>
+    </SpaceBetween>
+  );
+}
+
+function RuntimeErrorsBody({ filters, onInfo }) {
   const byModel = useApi('/errors-by-model', filters, [JSON.stringify(filters)]);
   const byAcct = useApi('/errors-by-account', filters, [JSON.stringify(filters)]);
   const trend = useApi('/errors-daily-trend', filters, [JSON.stringify(filters)]);
@@ -47,7 +213,7 @@ export default function ErrorsTab({ filters, onInfo }) {
     return visible
       .filter(s => rows.some(r => Number(r[s.key] || 0) > 0))
       .map(s => ({
-        title: s.title, type: 'bar', color: s.color,
+        title: s.title, type: 'bar', color: s.color, valueFormatter: fmt,
         data: rows.map(r => ({ x: new Date(r.ts), y: Number(r[s.key] || 0) })),
       }));
   }, [statusCodes.data, statusView]);
@@ -58,6 +224,17 @@ export default function ErrorsTab({ filters, onInfo }) {
   const hasChart = statusState === 'ok' && statusSeries.length > 0;
   const availRange = statusCodes.data?.available_range;  // {min,max} | null
   const statusNotice = useMemo(() => {
+    // bedrock-mantle NEVER exposes per-status-code data: its CloudWatch surface
+    // publishes only an aggregate client-error (4xx) count — no per-code split,
+    // no 5xx, and no invocation logs. So for the Mantle endpoint the Status
+    // Codes chart can never populate; say so honestly rather than promising
+    // data "after the next ingestion run" (which will never arrive).
+    if (filters.endpoint === 'mantle') {
+      return {
+        header: 'Per-code breakdown lives on the bedrock-runtime tab',
+        body: 'bedrock-mantle reports an aggregate client-error (4xx) rate — see the “Error trend” chart below for Mantle error volume. For a per-status-code breakdown, switch to the bedrock-runtime tab (with model invocation logging enabled).',
+      };
+    }
     switch (statusState) {
       case 'out_of_window':
         return {
@@ -78,7 +255,7 @@ export default function ErrorsTab({ filters, onInfo }) {
           body: 'Bedrock model invocation logging is not enabled for the monitored account(s), so a true per-status-code breakdown (403 / 404 / 408 / 424 / 429 …) can\'t be shown. CloudWatch metrics only expose all-4xx and all-5xx aggregates — those are in the “Error trend” chart below. To populate this chart, enable model invocation logging to S3 (it can be configured to capture only token counts and metadata — not prompt or response text), then re-run ingestion. The deploy script can set this up for you.',
         };
     }
-  }, [statusState, availRange]);
+  }, [statusState, availRange, filters.endpoint]);
 
   const [drill, setDrill] = useState(null);   // {year, month, day} | null
   const [hourly, setHourly] = useState(null); // payload | null
