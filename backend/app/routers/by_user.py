@@ -9,6 +9,14 @@ require every caller to opt in.
 Filter notes: the table has no traffic_type or operation column, so
 build_where is called with has_traffic_type=False. Tag filters don't apply
 here either (identity is orthogonal to request metadata).
+
+Trust caveat: for assumed roles the "user" axis is the sts:AssumeRole
+session name, which is chosen by the caller. It is reliable for
+attribution only when the session name is enforced (IAM condition on
+sts:RoleSessionName, or federation via IAM Identity Center, which pins it
+to the login). Without that, treat the user axis as informative, not as
+an audit-grade identity. The "group" axis (the role itself) is always
+trustworthy — a caller cannot fake which role they assumed.
 """
 from __future__ import annotations
 

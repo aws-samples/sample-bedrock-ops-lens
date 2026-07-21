@@ -31,7 +31,7 @@ applications:
       - "*claude-haiku-4-5*"
       - "*claude-sonnet-4-5*"
 
-  # Declared but never used — the "qualifier pour qualifier" case.
+  # Declared but never used — the "declared on paper only" case.
   - id: legacy-poc-summarizer
     name: "POC Meeting summarizer (2025)"
     owner: "innovation@example.com"

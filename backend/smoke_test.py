@@ -43,6 +43,22 @@ PATHS = [
     "/tags/team/values?q=plat",
     "/preferences",
     "/ops-review?days=7",
+    "/by-user/summary?days=7",
+    "/by-user/summary?days=7&group_by=group",
+    "/by-user/summary?days=7&group_by=user",
+    "/by-user/by-model?days=7",
+    "/by-user/daily-trend?days=7",
+    "/agents/summary?days=7",
+    "/agents/gateway-tools?days=7",
+    "/agents/real-cost?days=7",
+    "/agents/metrics-inventory?days=7",
+    "/compliance/summary?days=7",
+    "/compliance/totals?days=7",
+    "/compliance/by-guardrail?days=7",
+    "/compliance/daily-trend?days=7",
+    "/governance/registry",
+    "/governance/reconciliation?days=7",
+    "/governance/policy/bol-demo-team-data",
 ]
 
 

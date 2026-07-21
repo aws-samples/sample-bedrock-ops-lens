@@ -37,7 +37,7 @@ def _load_registry() -> list[dict]:
             if p and p.is_file():
                 data = yaml.safe_load(p.read_text()) or {}
                 return data.get("applications", []) or []
-        except Exception:
+        except (OSError, yaml.YAMLError):
             continue
     return []
 
@@ -101,6 +101,14 @@ async def governance_policy(app_id: str):
             f"arn:aws:bedrock:*::foundation-model/*{core}*",
             f"arn:aws:bedrock:*:*:inference-profile/*{core}*",
         ]
+    if not resources:
+        # Refuse to render: with no declared models an Allow would become
+        # Resource:["*"] and the Deny SCP NotResource:["*"] (deny nothing) —
+        # i.e. an allow-all policy the operator could paste by mistake.
+        return {
+            "error": f"app '{app_id}' declares no allowed_models; "
+                     "add at least one model pattern before rendering a policy"
+        }
     policy = {
         "Version": "2012-10-17",
         "Statement": [
@@ -108,7 +116,7 @@ async def governance_policy(app_id: str):
                 "Sid": "AllowDeclaredModelsOnly",
                 "Effect": "Allow",
                 "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-                "Resource": resources or ["*"],
+                "Resource": resources,
             },
         ],
     }
@@ -116,7 +124,7 @@ async def governance_policy(app_id: str):
         "Sid": "DenyUndeclaredBedrockModels",
         "Effect": "Deny",
         "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-        "NotResource": resources or ["*"],
+        "NotResource": resources,
         "Condition": {"ArnLike": {"aws:PrincipalArn": f"arn:aws:iam::*:role/{app_id}*"}},
     }
     return {"app": app_id, "identity_policy": policy, "scp_statement_example": scp_hint}

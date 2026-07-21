@@ -257,8 +257,14 @@ For very large customers (500+ accounts) the pull architecture becomes the wrong
 | Capacity and Adoption | CRIS adoption, throttle rates, prompt caching opportunities, Claude 4 burndown risk |
 | Model Insights | Per-model deep dive: requests, tokens, cache hit rate, errors, accounts |
 | Model Lifecycle | Live ListFoundationModels joined with usage, timeline of legacy and EOL bands |
+| By User | Per-caller attribution from invocation-log identity: by app/group (role), user (session), or full principal |
+| Agents & MCP | AgentCore runtimes and MCP gateway tools: invocations, sessions, errors, latency, real billed cost |
+| Compliance | Guardrails interventions by policy type, guardrail, and daily trend |
+| Governance | Declarative registry (`db/registry.yaml`) reconciled against observed usage: compliant, drift, undeclared (shadow AI) |
 | Ops Review | LLM-synthesized executive brief covering the top 3 issues |
 | Settings | Auth identity, ingestion freshness, region and account scope, pinned tag keys |
+
+Two notes on the By User tab. The "user" axis is the `sts:AssumeRole` session name, which the caller chooses — it is audit-grade only if you enforce it (IAM condition on `sts:RoleSessionName`, or IAM Identity Center federation, which pins it to the login); the "group" axis (the role itself) cannot be faked. And since it shows person-level usage to every signed-in dashboard user, check your organization's privacy requirements before enabling broad access.
 
 
 ## Cost
