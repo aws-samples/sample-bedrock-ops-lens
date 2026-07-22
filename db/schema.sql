@@ -136,6 +136,101 @@ CREATE INDEX IF NOT EXISTS ix_f_daily_tagged_model  ON f_daily_tagged (event_dat
 CREATE TABLE IF NOT EXISTS f_daily_tagged_default PARTITION OF f_daily_tagged DEFAULT;
 
 -- ----------------------------------------------------------------------------
+-- f_daily_by_identity — daily aggregates per IAM caller identity.
+--
+-- identity.arn is captured automatically by Bedrock on every invocation
+-- (no per-call tagging discipline needed), so this table answers "who is
+-- using what" even when teams don't use tagged inference profiles.
+-- principal_label is a display form: "<role>/<session>" for assumed roles
+-- (session carries the human login under SSO), "<name>" for IAM users.
+--
+-- Kept as a plain table (not partitioned): cardinality is bounded by
+-- principals × models × days, and the ingester also creates this table
+-- itself (_ensure_identity_table) for existing stacks — both DDLs MUST
+-- stay identical.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_daily_by_identity (
+    event_date          DATE NOT NULL,
+    accountId           TEXT NOT NULL,
+    modelId             TEXT NOT NULL,
+    region              TEXT NOT NULL,
+    principal_arn       TEXT NOT NULL,
+    principal_label     TEXT NOT NULL DEFAULT '',
+    principal_group     TEXT NOT NULL DEFAULT '',   -- role = team / app / workload
+    principal_user      TEXT NOT NULL DEFAULT '',   -- session = individual (SSO login)
+    total_requests      BIGINT NOT NULL DEFAULT 0,
+    failed_requests     BIGINT NOT NULL DEFAULT 0,
+    total_input_tokens  BIGINT NOT NULL DEFAULT 0,
+    total_output_tokens BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (event_date, accountId, modelId, region, principal_arn)
+);
+
+CREATE INDEX IF NOT EXISTS ix_f_daily_identity_arn   ON f_daily_by_identity (principal_arn, event_date);
+CREATE INDEX IF NOT EXISTS ix_f_daily_identity_label ON f_daily_by_identity (principal_label, event_date);
+
+-- ----------------------------------------------------------------------------
+-- f_daily_guardrails — Guardrails intervention metrics (Compliance tab).
+-- Source: CloudWatch namespace AWS/Bedrock/Guardrails (cw_guardrails.py).
+-- '__all__' = grain without that dimension (PolicyType is only published
+-- for InvocationsIntervened/TextUnitCount). REPLACE semantics.
+-- Ingester also self-creates this table (_ensure_guardrails_table) —
+-- both DDLs MUST stay identical.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_daily_guardrails (
+    event_date        DATE NOT NULL,
+    accountId         TEXT NOT NULL,
+    region            TEXT NOT NULL,
+    guardrail_arn     TEXT NOT NULL,
+    guardrail_version TEXT NOT NULL DEFAULT '',
+    policy_type       TEXT NOT NULL DEFAULT '__all__',
+    content_source    TEXT NOT NULL DEFAULT '__all__',
+    invocations       BIGINT NOT NULL DEFAULT 0,
+    intervened        BIGINT NOT NULL DEFAULT 0,
+    text_units        BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (event_date, accountId, region, guardrail_arn,
+                 guardrail_version, policy_type, content_source)
+);
+
+-- ----------------------------------------------------------------------------
+-- f_daily_agentcore — AgentCore observability metrics (Agents & MCP tab).
+-- Source: CloudWatch namespaces AWS/Bedrock-AgentCore + bedrock-agentcore
+-- (cw_agentcore.py). Generic metric-per-row: the AgentCore metric set moves
+-- fast; avoids an ALTER per new metric. REPLACE semantics.
+-- Ingester also self-creates this table (_ensure_agentcore_table).
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_daily_agentcore (
+    event_date      DATE NOT NULL,
+    accountId       TEXT NOT NULL,
+    region          TEXT NOT NULL,
+    namespace       TEXT NOT NULL,
+    resource_type   TEXT NOT NULL,
+    resource_id     TEXT NOT NULL,
+    metric_name     TEXT NOT NULL,
+    stat            TEXT NOT NULL,
+    value           DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (event_date, accountId, region, namespace,
+                 resource_type, resource_id, metric_name, stat)
+);
+
+CREATE INDEX IF NOT EXISTS ix_f_daily_agentcore_res ON f_daily_agentcore (resource_type, resource_id, event_date);
+
+-- ----------------------------------------------------------------------------
+-- f_daily_cost_usage_type — REAL billed dollars per usage-type line item
+-- (Cost Explorer, second grouping pass in ingestion/cost.py). Motivation:
+-- composite services (AgentCore) hide the Runtime/Memory/Browser split at
+-- the SERVICE level. No estimation — these are billed line items.
+-- Ingester self-creates this table too.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS f_daily_cost_usage_type (
+    event_date  DATE NOT NULL,
+    service     TEXT NOT NULL,
+    usage_type  TEXT NOT NULL,
+    total_cost  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    usage_qty   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (event_date, service, usage_type)
+);
+
+-- ----------------------------------------------------------------------------
 -- f_hourly_peak — hourly aggregate at (account, model, region) for peak RPM/TPM.
 -- Used by Ops Insights for max-over-hour math. Smaller than full-dim hourly.
 -- ----------------------------------------------------------------------------

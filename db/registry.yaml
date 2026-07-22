@@ -1,0 +1,45 @@
+# Declarative AI application registry (governance reference).
+#
+# This file is the declarative referential the observability data is
+# reconciled against — the same role as an AI Act registry: each entry is
+# an application/team that DECLARED its LLM usage, with allowed models
+# and a risk classification. Versioned in git so changes are auditable.
+#
+# Reconciliation statuses produced by /api/governance/reconciliation:
+#   compliant        observed usage matches a declaration (app + model)
+#   model_drift      declared app using a model NOT in allowed_models
+#   undeclared       observed usage with no declaration (shadow AI)
+#   declared_unused  declaration with zero observed usage (review candidate)
+
+applications:
+  - id: bol-demo-team-data
+    name: "Team Data - Contract entity extraction"
+    owner: "data-lead@example.com"
+    use_case: "Entity extraction from supplier contracts"
+    ai_act_risk: limited
+    status: approved
+    allowed_models:
+      - "*claude-haiku-4-5*"
+
+  - id: bol-demo-team-ml
+    name: "Team ML - Internal assistant"
+    owner: "ml-lead@example.com"
+    use_case: "Q&A over internal documentation"
+    ai_act_risk: minimal
+    status: approved
+    allowed_models:
+      - "*claude-haiku-4-5*"
+      - "*claude-sonnet-4-5*"
+
+  # Declared but never used — the "declared on paper only" case.
+  - id: legacy-poc-summarizer
+    name: "POC Meeting summarizer (2025)"
+    owner: "innovation@example.com"
+    use_case: "Automatic meeting minutes summarization"
+    ai_act_risk: minimal
+    status: declared
+    allowed_models:
+      - "*claude-3-5*"
+
+  # NOTE: bol-demo-team-platform is intentionally NOT declared here —
+  # its real traffic will surface as `undeclared` in the demo.
