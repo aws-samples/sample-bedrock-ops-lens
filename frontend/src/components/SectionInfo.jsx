@@ -523,6 +523,95 @@ export const SECTION_INFO = {
     why: 'The structured findings above aggregate to (account, model, region) so they read cleanly. This breakdown is the raw evidence: which exact API operation and traffic profile each row represents — useful for exports and for double-checking the AI summary.',
     action: 'Export rows for review meetings. Spot accounts that mix CRIS and on-demand on the same model (incomplete migration). Verify operation mix — heavy ConverseStream means latency-sensitive workload, so prompt caching pays double.',
   },
+
+  /* --------------------------------------------------------------------- */
+  /* By User tab (per-caller identity attribution)                        */
+  /* --------------------------------------------------------------------- */
+  'by-user-chart': {
+    title: 'Top callers by requests',
+    body: 'Request volume per caller, attributed from the identity.arn Bedrock stamps on every model invocation log record — no per-call tagging discipline needed. Three group-by axes: App/Group (the assumed IAM role — a team, app, or workload), User (the role-session name — the individual under SSO), and Principal (the full role/session identity).',
+    why: 'Cost and quota conversations end at "which team/person is driving this?". Tag-based attribution needs a proxy or tagging discipline; caller identity is emitted automatically on every logged invocation, so this view works from day one of invocation logging.',
+    action: 'Group by App/Group for team-level chargeback; switch to User to find individual heavy users. Note the trust caveat: the session name is chosen by the caller — it is audit-grade only when enforced (IAM condition on sts:RoleSessionName or Identity Center federation). The role axis cannot be faked. Empty → enable Bedrock Model Invocation Logging.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html',
+  },
+  'by-user-table': {
+    title: 'Callers',
+    body: 'One row per caller with total requests, failed requests, input/output tokens, distinct models used, and distinct principals behind the label. Downloadable as CSV.',
+    why: 'The chart shows the leaders; this is the complete, exportable ledger. Failed-request counts per caller surface a misbehaving client that fleet-wide error rates hide.',
+    action: 'Sort by failed requests to find callers with malformed requests or permission problems. Export for chargeback. A caller with many distinct models → check whether that spread is intentional or model-shopping.',
+  },
+  'by-user-model': {
+    title: 'Caller × model',
+    body: 'The caller-to-model matrix: which principal drives how much volume on which model, with token totals per pair.',
+    why: 'Per-caller totals hide the mix. This answers "who is using the expensive model" directly — the pair view is where cost-optimization and governance conversations get specific.',
+    action: 'Find callers on premium models (Opus-class) with high volume → check if a cheaper model fits their use-case. A caller suddenly appearing on a new model → confirm it is a sanctioned rollout.',
+  },
+
+  /* --------------------------------------------------------------------- */
+  /* Agents & MCP tab (AgentCore observability)                           */
+  /* --------------------------------------------------------------------- */
+  'agents-runtime': {
+    title: 'Agents (AgentCore Runtime)',
+    body: 'Per-agent-runtime operational metrics from the AWS/Bedrock-AgentCore CloudWatch namespace: invocations, sessions, errors, throttles, and latency (average and p99) for each deployed AgentCore runtime.',
+    why: 'Agentic workloads add a layer above model calls — an agent can be slow or failing even when every underlying model call succeeds. Runtime-level sessions/errors/latency is the operational view of the agent itself, not just its models.',
+    action: 'Rising p99 on one runtime → inspect its tool calls and model mix. Errors climbing → check the agent\'s CloudWatch logs. Empty → no AgentCore runtimes in the monitored accounts; agents running outside AgentCore appear in the By User tab as IAM principals.',
+    docLink: 'https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability.html',
+  },
+  'agents-cost': {
+    title: 'Billed cost (Cost Explorer, real)',
+    body: 'Actual billed AgentCore charges pulled from Cost Explorer usage-type line items — real invoice dollars, not estimates derived from token math.',
+    why: 'Agent runtimes bill for compute/session time in ways token-based cost models miss entirely. This is the only number that reconciles with the AWS bill.',
+    action: 'Compare against the invocation counts above — cost growing faster than invocations means longer sessions or heavier runtimes. Note Cost Explorer lags 24-48h, so today\'s usage appears in a day or two.',
+    docLink: 'https://docs.aws.amazon.com/cost-management/latest/userguide/ce-what-is.html',
+  },
+  'agents-tools': {
+    title: 'MCP tools (AgentCore Gateway)',
+    body: 'Per-tool call counts, errors, and latency for MCP (Model Context Protocol) tools fronted by AgentCore Gateway. Each row is one tool an agent can call.',
+    why: 'Tool calls are where agent latency and failures usually hide — a slow search tool drags every agent session that uses it. Per-tool telemetry pinpoints the bottleneck instead of blaming the model.',
+    action: 'Sort by latency to find the slow tool; by errors to find the broken one. A tool with zero calls → dead weight in the gateway config. Empty → no MCP servers fronted by AgentCore Gateway in the monitored accounts.',
+    docLink: 'https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway.html',
+  },
+
+  /* --------------------------------------------------------------------- */
+  /* Compliance tab (Guardrails)                                          */
+  /* --------------------------------------------------------------------- */
+  'compliance-kpi': {
+    title: 'Guardrails activity',
+    body: 'Fleet-wide Guardrails totals for the window: guarded invocations, interventions (requests where a guardrail blocked or masked content), and text units processed. Source: the AWS/Bedrock/Guardrails CloudWatch namespace.',
+    why: 'Deploying guardrails is a policy statement; this proves they are actually in the request path and firing. Zero guarded invocations while the fleet is busy means traffic is bypassing guardrails entirely — the most common silent compliance gap.',
+    action: 'Compare guarded invocations to total fleet requests (Overview tab) to estimate coverage. Interventions trending up → content drift in inputs or a new workload pushing boundaries; drill into policy type below. Empty → no Guardrails configured in the monitored accounts.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html',
+  },
+  'compliance-policy': {
+    title: 'Interventions by policy type',
+    body: 'Intervention counts split by Guardrails policy type — content filters, denied topics, sensitive information (PII), word filters, and contextual grounding — with a daily trend.',
+    why: 'The policy mix tells you WHAT kind of risk is being caught: PII interventions point at data-handling problems upstream; denied-topic hits show users probing boundaries; prompt-attack filters catch adversarial inputs.',
+    action: 'A PII spike → audit the workload feeding user data into prompts. Persistent denied-topic hits from one app → its users need clearer scope, or the topic list needs tuning. Use the trend to verify a policy change had the intended effect.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-components.html',
+  },
+  'compliance-guardrails': {
+    title: 'Guardrails',
+    body: 'Per-guardrail breakdown: invocations, interventions, and intervention rate for each configured guardrail, so you can see which policies do the work.',
+    why: 'Fleets accumulate guardrails per team/app. A guardrail with zero invocations is configured but not attached to any live traffic; one with a very high intervention rate may be miscalibrated and blocking legitimate use.',
+    action: 'Zero-invocation guardrails → verify the workloads that should use them actually pass the guardrail ID. Intervention rate > ~10% → review sampled blocked content; tighten the workload or loosen the policy deliberately, not by accident.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-use.html',
+  },
+
+  /* --------------------------------------------------------------------- */
+  /* Governance tab (registry reconciliation)                             */
+  /* --------------------------------------------------------------------- */
+  'gov-kpi': {
+    title: 'Registry reconciliation',
+    body: 'Compares the declared AI-app registry (db/registry.yaml — a git-versioned list of approved apps, owners, and allowed models) against what the ingester actually observes. Buckets: compliant (declared, using declared models), drift (declared, but calling models it did not declare), and undeclared (observed usage no registry entry claims — shadow AI).',
+    why: 'Every AI governance program needs the declared-vs-actual answer: "is anyone using GenAI outside the approved list, and are approved apps staying inside their lane?" Nothing AWS-native reconciles a policy document against observed usage — this closes that loop.',
+    action: 'Undeclared count > 0 → identify the caller (By User tab helps) and either register the app or shut it down. Drift → the team expanded model usage without updating the registry; make them declare it. Keep registry.yaml in code review so changes are auditable.',
+  },
+  'gov-table': {
+    title: 'Observed vs Declared',
+    body: 'The row-level reconciliation: each observed app/caller with its declared entry (if any), declared vs observed models, status (compliant / drift / undeclared), and risk level from the registry. High-risk entries can optionally generate IAM/SCP policy snippets to enforce the declaration — detective by default, enforcement is opt-in.',
+    why: 'The KPIs say how much shadow AI exists; this table says exactly WHO and WHAT. Risk level distinguishes "someone testing in dev" from "an unregistered app processing customer data".',
+    action: 'Work the undeclared rows first, highest risk first. For drift rows, diff declared vs observed models with the owner. Only generate enforcement policies for high-risk entries after the owner conversation — detective first, block second.',
+  },
 };
 
 export default function SectionPanel({ sectionId }) {

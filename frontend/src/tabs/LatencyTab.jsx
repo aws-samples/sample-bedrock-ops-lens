@@ -62,10 +62,12 @@ function LatencyBody({ filters, onInfo, mantleHint }) {
     const data = (byModel.data || []).filter(r => isLLM(r.modelid || r.modelId));
     const f = metric === 'e2e' ? ['p50_e2e', 'p90_e2e', 'p99_e2e']
                                 : ['p50_ttft', 'p90_ttft', 'p99_ttft'];
+    // valueFormatter drives the hover popover — raw ms floats
+    // (34078.46859812614) read as noise; fmtMs renders "34.1s" / "940ms".
     return [
-      { title: 'p50', type: 'bar', data: data.map(r => ({ x: modelShort(r.modelid || r.modelId), y: Number(r[f[0]] || 0) })) },
-      { title: 'p90', type: 'bar', data: data.map(r => ({ x: modelShort(r.modelid || r.modelId), y: Number(r[f[1]] || 0) })) },
-      { title: 'p99', type: 'bar', data: data.map(r => ({ x: modelShort(r.modelid || r.modelId), y: Number(r[f[2]] || 0) })) },
+      { title: 'p50', type: 'bar', data: data.map(r => ({ x: modelShort(r.modelid || r.modelId), y: Number(r[f[0]] || 0) })), valueFormatter: fmtMs },
+      { title: 'p90', type: 'bar', data: data.map(r => ({ x: modelShort(r.modelid || r.modelId), y: Number(r[f[1]] || 0) })), valueFormatter: fmtMs },
+      { title: 'p99', type: 'bar', data: data.map(r => ({ x: modelShort(r.modelid || r.modelId), y: Number(r[f[2]] || 0) })), valueFormatter: fmtMs },
     ];
   }, [byModel.data, metric]);
 

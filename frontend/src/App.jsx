@@ -21,6 +21,7 @@ import {
 } from '@cloudscape-design/components';
 import { applyMode, Mode } from '@cloudscape-design/global-styles';
 import { useApi, fmt, setAttributionContext } from './api.js';
+import { OPTIONAL_TABS, loadOptionalTabs, subscribeOptionalTabs } from './prefs.js';
 import SectionPanel from './components/SectionInfo.jsx';
 import { UserProvider, useUser } from './components/UserContext.jsx';
 import AuthApp from './views/AuthApp.jsx';
@@ -35,6 +36,10 @@ import CostTab from './tabs/CostTab.jsx';
 import ModelLifecycleTab from './tabs/ModelLifecycleTab.jsx';
 import ModelInsightsTab from './tabs/ModelInsightsTab.jsx';
 import WorkloadsTab from './tabs/WorkloadsTab.jsx';
+import ByUserTab from './tabs/ByUserTab.jsx';
+import AgentsTab from './tabs/AgentsTab.jsx';
+import ComplianceTab from './tabs/ComplianceTab.jsx';
+import GovernanceTab from './tabs/GovernanceTab.jsx';
 import SettingsView from './views/SettingsView.jsx';
 
 /* --- Theme management ------------------------------------------------- */
@@ -405,6 +410,10 @@ const NAV_ITEMS_DASHBOARD = [
       ),
     },
     navItem('Health & Errors',     '#/errors',     'bug'),
+    navItem('By User',             '#/by-user',    'user-profile'),
+    navItem('Agents & MCP',        '#/agents',     'gen-ai'),
+    navItem('Compliance',          '#/compliance', 'security'),
+    navItem('Governance',          '#/governance', 'check'),
     // `status-pending` is the closest Cloudscape glyph to a stopwatch /
     // timer — fits "Latency" semantically. The originally proposed
     // `caret-up-down` doesn't exist in Cloudscape's icon library and
@@ -417,16 +426,29 @@ const NAV_ITEMS_DASHBOARD = [
   ]},
 ];
 
-// Dashboard nav with the Workloads item injected only when proxy
-// per-workload telemetry exists (Task A). Hidden entirely otherwise — same
-// principle as hiding empty Mantle sub-tabs: never show an empty view.
-function navItemsDashboard(workloadsAvail) {
-  if (!workloadsAvail) return NAV_ITEMS_DASHBOARD;
+// Dashboard nav with (a) the Workloads item injected only when proxy
+// per-workload telemetry exists (Task A) and (b) the optional governance /
+// agent tabs (By User, Agents & MCP, Compliance, Governance) filtered by
+// the user's Settings preference — OFF by default, because most customers
+// don't run AgentCore or Guardrails and a nav full of empty tabs reads as
+// "this dashboard isn't for me". Same principle as hiding empty Mantle
+// sub-tabs: never show an empty view by default.
+function navItemsDashboard(workloadsAvail, optionalTabs) {
   const [group] = NAV_ITEMS_DASHBOARD;
-  const items = [...group.items];
-  const opsIdx = items.findIndex(i => i.href === '#/ops');
-  const wl = navItem('Usage · Custom Attributes', '#/workloads', 'group-active');
-  items.splice(opsIdx >= 0 ? opsIdx + 1 : items.length, 0, wl);
+  let items = group.items.filter(i => {
+    const key = Object.keys(OPTIONAL_TABS).find(k => OPTIONAL_TABS[k].href === i.href);
+    if (!key) return true;                   // not an optional tab — always show
+    return !!optionalTabs?.[key];
+  });
+  // Workloads is double-gated: user toggle AND an active attribution source
+  // (proxy or invocation-log tags). The toggle covers "I don't use attributes"
+  // (customer preference); the data gate covers "nothing to show even if on".
+  if (workloadsAvail && optionalTabs?.workloads) {
+    const opsIdx = items.findIndex(i => i.href === '#/ops');
+    const wl = navItem('Usage · Custom Attributes', '#/workloads', 'group-active');
+    items = [...items];
+    items.splice(opsIdx >= 0 ? opsIdx + 1 : items.length, 0, wl);
+  }
   return [{ ...group, items }];
 }
 
@@ -490,6 +512,12 @@ function AppShell() {
   // nav item is hidden (same principle as hiding empty Mantle sub-tabs).
   const attrCfg = useApi('/attribution/config', {}, []).data;
   const workloadsAvail = attrCfg ? attrCfg.effective_source !== 'off' : false;
+
+  // Optional governance/agent tabs (By User, Agents & MCP, Compliance,
+  // Governance) — per-user preference from Settings, off by default. The
+  // subscription keeps the sidebar live when Settings flips a toggle.
+  const [optionalTabs, setOptionalTabs] = useState(loadOptionalTabs);
+  useEffect(() => subscribeOptionalTabs(setOptionalTabs), []);
 
   // Cross-tab redirect: when an attribution source is active (proxy OR
   // invocation_logs) and the user selected attribute value(s) in the top bar,
@@ -639,7 +667,7 @@ function AppShell() {
           <SideNavigation
             activeHref={`#/${activeView}`}
             items={[
-              ...navItemsDashboard(workloadsAvail),
+              ...navItemsDashboard(workloadsAvail, optionalTabs),
               ...NAV_ADMIN_SECTION(isAdmin),
               ...NAV_FOOTER,
             ]}
@@ -704,6 +732,10 @@ function AppShell() {
                 {viewBody('quotas',     <QuotasTab       filters={filters} onInfo={onInfo} />)}
                 {viewBody('cost',       <CostTab         filters={filters} onInfo={onInfo} />)}
                 {viewBody('errors',     <ErrorsTab       filters={filters} onInfo={onInfo} />)}
+                {viewBody('by-user',    <ByUserTab       filters={filters} onInfo={onInfo} />)}
+                {viewBody('agents',     <AgentsTab       filters={filters} onInfo={onInfo} />)}
+                {viewBody('compliance', <ComplianceTab   filters={filters} onInfo={onInfo} />)}
+                {viewBody('governance', <GovernanceTab   filters={filters} onInfo={onInfo} />)}
                 {viewBody('latency',    <LatencyTab      filters={filters} onInfo={onInfo} />)}
                 {viewBody('ops',        <OpsInsightsTab     filters={filters} onInfo={onInfo} />)}
                 {viewBody('workloads',  <WorkloadsTab       filters={filters} onInfo={onInfo} />)}

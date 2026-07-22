@@ -16,6 +16,7 @@ WORKDIR /app
 COPY --from=deps /install /usr/local
 COPY backend/app /app/app
 COPY ingestion   /app/ingestion
+COPY db/registry.yaml /app/db/registry.yaml
 USER app
 EXPOSE 8000
 ENV PYTHONPATH=/app

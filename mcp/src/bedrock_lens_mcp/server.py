@@ -72,6 +72,64 @@ async def overview_summary(days: int = 14) -> str:
 
 
 @mcp.tool()
+async def by_user(days: int = 14, top_n: int = 25, group_by: str = "group") -> str:
+    """Who is calling Bedrock: per IAM caller identity (identity.arn from
+    invocation logs). Captured automatically on every invocation — works
+    even when teams don't tag their requests.
+
+    Args:
+        days: Lookback window. Default 14, max 30.
+        top_n: Max callers returned. Default 25.
+        group_by: 'group' (role = app/team/workload), 'user' (session =
+            individual caller, SSO login), or 'principal' (full identity).
+    """
+    days = max(1, min(int(days), 30))
+    top_n = max(1, min(int(top_n), 200))
+    if group_by not in ("group", "user", "principal"):
+        group_by = "group"
+    return _format(_backend.by_user(days=days, top_n=top_n, group_by=group_by))
+
+
+@mcp.tool()
+async def agents(days: int = 14) -> str:
+    """AgentCore agents & MCP tools observability: per-agent invocations,
+    sessions, errors, latency, and per-tool Gateway call counts.
+    Only covers agents on AgentCore (Runtime/Gateway); agents calling
+    Bedrock directly appear in by_user instead.
+
+    Args:
+        days: Lookback window. Default 14, max 30.
+    """
+    days = max(1, min(int(days), 30))
+    return _format(_backend.agents(days=days))
+
+
+@mcp.tool()
+async def compliance(days: int = 14) -> str:
+    """Guardrails compliance: interventions by policy type (PII, denied
+    topics, content filters, grounding), per-guardrail counts, and
+    intervention rate.
+
+    Args:
+        days: Lookback window. Default 14, max 30.
+    """
+    days = max(1, min(int(days), 30))
+    return _format(_backend.compliance(days=days))
+
+
+@mcp.tool()
+async def governance(days: int = 14) -> str:
+    """Reconciliation of OBSERVED LLM usage against the DECLARED application
+    registry (db/registry.yaml). Flags undeclared usage (shadow AI), model
+    drift, and declared-but-unused entries. Detective by default.
+
+    Args:
+        days: Lookback window. Default 14, max 30.
+    """
+    days = max(1, min(int(days), 30))
+    return _format(_backend.governance(days=days))
+
+@mcp.tool()
 async def cost_summary(days: int = 30) -> str:
     """Total Amazon Bedrock spend over the window, with daily breakdown.
 

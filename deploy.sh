@@ -131,6 +131,7 @@ echo "    sign-up: ALLOWED_EMAIL_DOMAINS=$ALLOWED_EMAIL_DOMAINS"
 # ingester reads logs from the right region (passed through to the stack).
 # -----------------------------------------------------------------------------
 BEDROCK_LOGS_REGION=""
+BEDROCK_LOGS_BUCKET="${BEDROCK_LOGS_BUCKET:-}"   # init under set -u (bugfix)
 _probe_logging() {  # $1 = region; echoes bucket name (or empty)
     local b
     b="$(aws bedrock get-model-invocation-logging-configuration \
@@ -566,7 +567,7 @@ else
         --parameters "file://$PARAMS_JSON" \
         --tags "Key=app,Value=bedrock-ops-lens" \
                "Key=stack,Value=$MAIN_STACK" \
-        --region "$REGION" 2>&1)"
+        --region "$REGION" 2>&1)" || true   # non-zero on "No updates" — must not kill the script (set -e)
     if echo "$UPDATE_OUT" | grep -q "No updates are to be performed"; then
         echo "    (no template diff — skipping wait)"
     else
@@ -580,6 +581,19 @@ SPA_BUCKET="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" --re
     --query 'Stacks[0].Outputs[?OutputKey==`SpaBucketName`].OutputValue' --output text)"
 echo "    syncing frontend to s3://$SPA_BUCKET/"
 aws s3 sync "$ROOT/frontend/dist/" "s3://$SPA_BUCKET/" --delete --quiet
+
+# Invalidate CloudFront so the new SPA (hashed asset names + index.html)
+# is served immediately. Without this, users keep getting the cached
+# index.html pointing at the OLD bundle until the TTL expires.
+DASH_DOMAIN="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`DashboardUrl`].OutputValue' --output text | sed 's|https://||')"
+DIST_ID="$(aws cloudfront list-distributions \
+    --query "DistributionList.Items[?DomainName=='$DASH_DOMAIN'].Id" --output text 2>/dev/null || true)"
+if [[ -n "$DIST_ID" && "$DIST_ID" != "None" ]]; then
+    echo "    invalidating CloudFront cache ($DIST_ID)..."
+    aws cloudfront create-invalidation --distribution-id "$DIST_ID" --paths "/*" \
+        --query 'Invalidation.Id' --output text >/dev/null || true
+fi
 
 # -----------------------------------------------------------------------------
 # Roll the Backend Lambda alias to the just-deployed image.
@@ -598,19 +612,43 @@ aws s3 sync "$ROOT/frontend/dist/" "s3://$SPA_BUCKET/" --delete --quiet
 # -----------------------------------------------------------------------------
 BACKEND_FN="${MAIN_STACK}-backend"
 echo "    publishing new Backend Lambda version + rolling 'live' alias..."
+# Same staleness problem as the ingester below: CFN resolved ":latest" to a
+# digest at create time and won't re-pull on a code-only redeploy. Refresh
+# $LATEST explicitly BEFORE publish-version, otherwise the published version
+# freezes the OLD image.
+aws lambda update-function-code \
+    --function-name "$BACKEND_FN" \
+    --image-uri "$ECR_URI:latest" \
+    --region "$REGION" \
+    --query 'CodeSha256' --output text >/dev/null 2>&1 || true
+aws lambda wait function-updated --function-name "$BACKEND_FN" --region "$REGION" 2>/dev/null || true
 NEW_VERSION="$(aws lambda publish-version \
     --function-name "$BACKEND_FN" \
     --description "Auto-published by deploy.sh on $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --region "$REGION" \
     --query Version --output text 2>/dev/null || true)"
 if [[ -n "$NEW_VERSION" && "$NEW_VERSION" != "None" ]]; then
-    aws lambda update-alias \
-        --function-name "$BACKEND_FN" \
-        --name live \
-        --function-version "$NEW_VERSION" \
-        --region "$REGION" \
-        --query 'AliasArn' --output text >/dev/null
-    echo "      → alias 'live' now points at version $NEW_VERSION"
+    # UpdateAlias fails transiently with "Invalid alias configuration for
+    # Provisioned Concurrency" while the PC allocation from a previous flip
+    # is still re-warming. Retry with backoff instead of dying.
+    for attempt in 1 2 3 4 5; do
+        if aws lambda update-alias \
+            --function-name "$BACKEND_FN" \
+            --name live \
+            --function-version "$NEW_VERSION" \
+            --routing-config '{}' \
+            --region "$REGION" \
+            --query 'AliasArn' --output text >/dev/null 2>/tmp/alias-err.txt; then
+            echo "      → alias 'live' now points at version $NEW_VERSION"
+            break
+        fi
+        if [[ $attempt -eq 5 ]]; then
+            echo "      ! alias update failed after 5 attempts:"; cat /tmp/alias-err.txt
+            exit 1
+        fi
+        echo "      alias busy (PC re-warm?), retry $attempt/5 in 30s..."
+        sleep 30
+    done
     echo "      (provisioned concurrency takes ~30s to re-warm on the new version)"
 else
     echo "    (no version change; alias 'live' unchanged)"

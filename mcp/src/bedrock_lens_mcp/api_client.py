@@ -151,7 +151,15 @@ class SigV4ApiClient:
                 "running the MCP."
             )
         self._creds = creds.get_frozen_credentials()
-        self._region = self._session.region_name or "us-east-1"
+        # Sign for the region the Function URL lives in — parsed from the
+        # hostname (…lambda-url.<region>.on.aws). Deriving it from the
+        # session/env instead breaks with InvalidSignatureException
+        # ("Credential should be scoped to a valid region") whenever the
+        # user's default profile region differs from the deploy region.
+        import re as _re
+        _m = _re.search(r"lambda-url\.([a-z0-9-]+)\.on\.aws", self.base_url)
+        self._region = (_m.group(1) if _m else None) \
+            or self._session.region_name or "us-east-1"
 
     def _sign(self, method: str, path: str,
                *, params: dict | None = None,

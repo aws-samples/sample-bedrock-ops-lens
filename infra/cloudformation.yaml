@@ -877,7 +877,8 @@ Resources:
       Code:
         ImageUri: !Ref BackendImageUri
       Role: !GetAtt BackendLambdaRole.Arn
-      Timeout: 60
+      # 120s (not 60): Ops Review synthesis via Bedrock takes 40-90s end to end.
+      Timeout: 120
       MemorySize: 1024
       Architectures: [ x86_64 ]
       VpcConfig:
@@ -1367,7 +1368,9 @@ Resources:
               OriginProtocolPolicy: https-only
               HTTPSPort: 443
               OriginSSLProtocols: [ TLSv1.2 ]
-              OriginReadTimeout: 60
+              # 120s to match the backend Lambda timeout — Ops Review synthesis
+              # runs 40-90s; at 60s CloudFront 504s before the model answers.
+              OriginReadTimeout: 120
         DefaultCacheBehavior:
           TargetOriginId: s3-spa
           ViewerProtocolPolicy: redirect-to-https

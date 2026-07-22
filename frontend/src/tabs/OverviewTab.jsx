@@ -621,11 +621,11 @@ function OverviewBody({ filters, onInfo }) {
         <Container fitHeight header={<SectionHeader title="Top models by requests" sectionId="top-models-requests" onInfo={onInfo} />}>
           {byModel.loading ? <ChartLoading height={250} /> :
             <BarChart
-              series={[{ title: 'Requests', type: 'bar', data: topReqData }]}
+              series={[{ title: 'Requests', type: 'bar', data: topReqData, valueFormatter: fmt }]}
               xScaleType="categorical"
               hideFilter
               ariaLabel="Top models by requests"
-              i18nStrings={CHART_I18N}
+              i18nStrings={{ ...CHART_I18N, yTickFormatter: fmt }}
               height={250}
             />
           }
@@ -633,11 +633,11 @@ function OverviewBody({ filters, onInfo }) {
         <Container fitHeight header={<SectionHeader title="Top models by tokens" sectionId="top-models-tokens" onInfo={onInfo} />}>
           {byModel.loading ? <ChartLoading height={250} /> :
             <BarChart
-              series={[{ title: 'Tokens', type: 'bar', data: topTokenData }]}
+              series={[{ title: 'Tokens', type: 'bar', data: topTokenData, valueFormatter: fmt }]}
               xScaleType="categorical"
               hideFilter
               ariaLabel="Top models by tokens"
-              i18nStrings={CHART_I18N}
+              i18nStrings={{ ...CHART_I18N, yTickFormatter: fmt }}
               height={250}
             />
           }

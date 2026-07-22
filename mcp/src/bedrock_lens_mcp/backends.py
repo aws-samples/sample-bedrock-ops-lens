@@ -16,6 +16,10 @@ class Backend(Protocol):
 
     def health(self) -> dict: ...
     def overview_summary(self, *, days: int) -> dict: ...
+    def by_user(self, *, days: int, top_n: int, group_by: str) -> dict: ...
+    def agents(self, *, days: int) -> dict: ...
+    def compliance(self, *, days: int) -> dict: ...
+    def governance(self, *, days: int) -> dict: ...
     def cost_summary(self, *, days: int) -> dict: ...
     def cost_by_account(self, *, days: int) -> dict: ...
     def cost_by_model(self, *, days: int, top_n: int) -> dict: ...
@@ -43,6 +47,28 @@ class HttpBackend:
     # --- volumetric / overview ---
     def overview_summary(self, *, days: int) -> dict:
         return self.c.get("/summary", params={"days": days})
+
+    def by_user(self, *, days: int, top_n: int, group_by: str = "group") -> dict:
+        return {
+            "summary": self.c.get("/by-user/summary", params={"days": days, "top_n": top_n, "group_by": group_by}),
+            "by_model": self.c.get("/by-user/by-model", params={"days": days}),
+        }
+
+    def agents(self, *, days: int) -> dict:
+        return {
+            "agents": self.c.get("/agents/summary", params={"days": days}),
+            "gateway_tools": self.c.get("/agents/gateway-tools", params={"days": days}),
+        }
+
+    def compliance(self, *, days: int) -> dict:
+        return {
+            "totals": self.c.get("/compliance/totals", params={"days": days}),
+            "by_policy": self.c.get("/compliance/summary", params={"days": days}),
+            "by_guardrail": self.c.get("/compliance/by-guardrail", params={"days": days}),
+        }
+
+    def governance(self, *, days: int) -> dict:
+        return self.c.get("/governance/reconciliation", params={"days": days})
 
     # --- cost ---
     def cost_summary(self, *, days: int) -> dict:
@@ -107,6 +133,29 @@ class DirectBackend:
 
     def overview_summary(self, *, days: int) -> dict:
         return direct_collector.overview_summary(days=days)
+
+    def by_user(self, *, days: int, top_n: int, group_by: str = "group") -> dict:
+        return {
+            "window_days": days,
+            "_note": (
+                "Tier A: per-caller attribution needs the deployed pipeline — "
+                "it is built from Bedrock model invocation logs (identity.arn), "
+                "which CloudWatch metrics don't carry. Deploy the dashboard "
+                "(Tier B) or query the invocation-logs bucket directly."
+            ),
+        }
+
+    def agents(self, *, days: int) -> dict:
+        return {"window_days": days,
+                "_note": "Tier A: AgentCore metrics need the deployed pipeline (CloudWatch history + Aurora)."}
+
+    def compliance(self, *, days: int) -> dict:
+        return {"window_days": days,
+                "_note": "Tier A: Guardrails metrics need the deployed pipeline."}
+
+    def governance(self, *, days: int) -> dict:
+        return {"window_days": days,
+                "_note": "Tier A: registry reconciliation needs the deployed pipeline."}
 
     def cost_summary(self, *, days: int) -> dict:
         return direct_collector.cost_summary(days=days)

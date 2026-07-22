@@ -19,6 +19,7 @@ import {
 import { useApi, fmt, clearCache } from '../api.js';
 import { useUser } from '../components/UserContext.jsx';
 import { InfoLink } from '../components/Common.jsx';
+import { OPTIONAL_TABS, loadOptionalTabs, saveOptionalTabs } from '../prefs.js';
 
 function K({ label, value, color }) {
   return (
@@ -50,6 +51,39 @@ export default function SettingsView({ onInfo }) {
   // [{ id, type: 'success'|'error', content }] — Cloudscape Flashbar items.
   const [flash, setFlash] = useState([]);
   const flashTimerRef = useRef(null);
+
+  // Optional governance/agent tabs — per-user (this browser), off by default.
+  // saveOptionalTabs notifies App.jsx so the sidebar updates immediately.
+  const [optTabs, setOptTabs] = useState(loadOptionalTabs);
+  const toggleTab = (key, checked) => {
+    const next = { ...optTabs, [key]: checked };
+    setOptTabs(next);
+    saveOptionalTabs(next);
+  };
+  // "Data detected" hints — cheap availability probes so a user who HAS
+  // Guardrails/identity/AgentCore data notices these tabs exist even while
+  // they're switched off. Each returns fast; empty array/null = no data.
+  const byUserProbe  = useApi('/by-user/summary',    { days: 30 }, []);
+  const agentsProbe  = useApi('/agents/summary',     { days: 30 }, []);
+  const compProbe    = useApi('/compliance/totals',  { days: 30 }, []);
+  const hasData = {
+    // Workloads: the attribution config already tells us if a source is live.
+    workloads:  !!(attrCfg.data && attrCfg.data.effective_source && attrCfg.data.effective_source !== 'off'),
+    byUser:     Array.isArray(byUserProbe.data) && byUserProbe.data.length > 0,
+    agents:     Array.isArray(agentsProbe.data) && agentsProbe.data.length > 0,
+    compliance: !!(compProbe.data && (compProbe.data.invocations || compProbe.data.intervened)),
+    // Governance reconciles a config file (registry.yaml) against usage — the
+    // registry ships with demo entries, so a "data detected" hint would always
+    // fire and mean nothing. No hint; it's a pure opt-in.
+    governance: false,
+  };
+  const TAB_DESC = {
+    workloads:  'Per-workload / custom-attribute usage (workload, environment, business unit, …). Needs an attribution source configured below (invocation-log tags or a GenAI proxy) — the tab only appears when the toggle is on AND a source is active.',
+    byUser:     'Per-caller attribution from invocation-log identity (by role/team, session, or full principal). Needs model invocation logging enabled.',
+    agents:     'AgentCore runtime + MCP gateway observability: invocations, sessions, errors, latency, real billed cost. Needs Bedrock AgentCore in use.',
+    compliance: 'Guardrails interventions by policy type, guardrail, and daily trend. Needs Bedrock Guardrails configured.',
+    governance: 'Declared AI-app registry (db/registry.yaml) reconciled against observed usage: compliant / drift / undeclared shadow AI.',
+  };
 
   useMemo(() => {
     if (prefs.data?.pinned_tag_keys) {
@@ -161,6 +195,37 @@ export default function SettingsView({ onInfo }) {
         {flash.length > 0 && <Flashbar items={flash} />}
 
         {/* ============ CONFIGURABLE ============ */}
+
+        {/* Optional tabs -------------------------------------------------- */}
+        {/* The governance/agent views only make sense for customers who run
+            AgentCore, Guardrails, or want per-caller / registry governance.
+            Off by default so a fresh deploy's nav isn't a wall of empty
+            tabs; each user opts in here (stored per browser, like the
+            theme). A "Data detected" flag nudges users who DO have data. */}
+        <Container header={<Header variant="h2"
+            description="Show or hide the governance and agent-observability tabs in the sidebar. Off by default — enable the ones relevant to your environment. Saved as your personal preference in this browser.">
+          Optional tabs
+        </Header>}>
+          <SpaceBetween size="m">
+            {Object.entries(OPTIONAL_TABS).map(([key, meta]) => (
+              <Toggle
+                key={key}
+                checked={!!optTabs[key]}
+                onChange={({ detail }) => toggleTab(key, detail.checked)}
+              >
+                <SpaceBetween direction="horizontal" size="xs">
+                  <Box variant="span" fontWeight="bold">{meta.label}</Box>
+                  {hasData[key] && !optTabs[key] && (
+                    <StatusIndicator type="info">Data detected</StatusIndicator>
+                  )}
+                </SpaceBetween>
+                <Box variant="small" color="text-body-secondary" display="block">
+                  {TAB_DESC[key]}
+                </Box>
+              </Toggle>
+            ))}
+          </SpaceBetween>
+        </Container>
 
         {/* Custom attribute attribution ---------------------------------- */}
         {/* One source powers the "Usage · Custom Attributes" tab + the top-bar

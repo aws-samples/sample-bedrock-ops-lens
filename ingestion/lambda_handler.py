@@ -117,6 +117,10 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
          ["cw_mantle_metrics", "--db-url", db_url, "--days", str(days)]),
         ("cost",            "ingestion.cost",
          ["cost",            "--db-url", db_url, "--days", str(max(days, 30))]),
+        ("cw_agentcore",    "ingestion.cw_agentcore",
+         ["cw_agentcore",    "--db-url", db_url, "--days", str(days)]),
+        ("cw_guardrails",   "ingestion.cw_guardrails",
+         ["cw_guardrails",   "--db-url", db_url, "--days", str(days)]),
     ]
     # quotas is appended LAST (after invocation_logs below) — see the
     # ordering note in the module docstring.
