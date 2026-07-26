@@ -4,7 +4,7 @@
 // aren't additive across the hourly aggregate).
 import { useEffect, useState } from 'react';
 import { Modal, Box, SpaceBetween, Alert } from '@cloudscape-design/components';
-import { api, fmt, fmtAccount, useAccountNames } from '../api.js';
+import { api, fmt, accountName, useAccountNames } from '../api.js';
 import { ChartLoading } from './Common.jsx';
 import PaginatedTable from './PaginatedTable.jsx';
 
@@ -49,7 +49,8 @@ export default function LatencyAccountsModal({ modelId, filters, onDismiss }) {
             trackBy={(r) => `${r.accountid || r.accountId}|${r.region}`}
             downloadFileName={`latency-accounts-${modelId}.csv`}
             columnDefinitions={[
-              { id: 'a',   header: 'Account ID',  cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account ID', cell: r => r.accountid || r.accountId, exportValue: r => r.accountid || r.accountId },
+              { id: 'an', header: 'Account name', cell: r => accountName(r.accountid || r.accountId) || '—', exportValue: r => accountName(r.accountid || r.accountId) },
               { id: 'r',   header: 'Region',      cell: r => r.region, exportValue: r => r.region },
               { id: 'lat', header: 'Avg latency', cell: r => fmtMs(r.avg_latency_ms), exportValue: r => r.avg_latency_ms },
               { id: 'n',   header: 'Samples',     cell: r => fmt(r.latency_samples), exportValue: r => r.latency_samples },

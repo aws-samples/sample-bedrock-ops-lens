@@ -570,7 +570,7 @@ CREATE TABLE IF NOT EXISTS ingestion_days (
 CREATE INDEX IF NOT EXISTS ix_ingestion_days_loaded ON ingestion_days (loaded_at DESC);
 
 -- ============================================================================
--- PROXY PER-WORKLOAD TELEMETRY  (proxy/gateway attribution pattern)
+-- PROXY PER-WORKLOAD TELEMETRY  (the GenAI-proxy attribution pattern)
 --
 -- A GenAI proxy fronting Bedrock signs every request with ONE IAM role, so
 -- caller identity can't attribute usage to a workload. Instead the proxy
@@ -755,7 +755,7 @@ CREATE TABLE IF NOT EXISTS f_identity_usage (
 CREATE INDEX IF NOT EXISTS ix_f_identity_usage_brin ON f_identity_usage USING BRIN (event_date);
 
 -- ----------------------------------------------------------------------------
--- dim_account — human-friendly names for accountIds (008).
+-- dim_account — account names for accountIds (008).
 -- Resolution chain: config.yaml account_names map > organizations:ListAccounts
 -- (discover-org) > account:GetAccountInformation via the reader role (works
 -- without Organizations). Unresolved accounts have no row; the UI shows the

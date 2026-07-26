@@ -234,7 +234,7 @@ function FilterBar({ filters, setFilters, hideTraffic }) {
   const accountsState = useApi('/accounts', {}, []);
   const accountOptions = (accountsState.data || []).map(a => {
     const idle = !a.total_requests;
-    // Lead with the friendly name when we know it; the 12-digit ID drops
+    // Lead with the account name when we know it; the 12-digit ID drops
     // into the description line. Falls back to the ID as label when no
     // name is mapped yet (e.g., explicit-mode accounts without org metadata).
     const label = a.name || a.accountId;

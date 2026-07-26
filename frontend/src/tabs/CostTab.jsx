@@ -17,7 +17,7 @@ import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, Box, Grid, BarChart, Alert, StatusIndicator, Link,
 } from '@cloudscape-design/components';
-import { useApi, fmt, fmtPct, fmtAccount, useAccountNames } from '../api.js';
+import { useApi, fmt, fmtPct, accountName, useAccountNames } from '../api.js';
 import { ChartLoading, KpiCard, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
@@ -53,7 +53,7 @@ function deltaCell(cur, prev) {
 }
 
 export default function CostTab({ filters, onInfo }) {
-  useAccountNames();   // resolve friendly names for Account cells
+  useAccountNames();   // resolve account names for the Account name cells
   // Cost Explorer bills Bedrock per account/service/region — it has NO
   // runtime-vs-mantle dimension. The 'all' view shows the exact CE dollars;
   // the runtime/mantle sub-tabs show that endpoint's ALLOCATED share (the real
@@ -241,7 +241,8 @@ function CostBody({ filters, endpoint, onInfo }) {
           <PaginatedTable
             items={byAcct.data || []}
             columnDefinitions={[
-              { id: 'a',    header: 'Account',  cell: r => fmtAccount(r.accountId), exportValue: r => r.accountId },
+              { id: 'a', header: 'Account ID', cell: r => r.accountId, exportValue: r => r.accountId },
+              { id: 'an', header: 'Account name', cell: r => accountName(r.accountId) || '—', exportValue: r => accountName(r.accountId) },
               { id: 'cost', header: 'Spend',    cell: r => fmtCurrency(r.total_cost, r.currency) },
               { id: 'prev', header: 'Previous window', cell: r => fmtCurrency(r.previous_cost, r.currency) },
               { id: 'wow',  header: 'WoW change',  cell: r => deltaCell(r.total_cost, r.previous_cost) },
@@ -285,7 +286,8 @@ function CostBody({ filters, endpoint, onInfo }) {
           <PaginatedTable
             items={concen.data || []}
             columnDefinitions={[
-              { id: 'a',    header: 'Account',  cell: r => fmtAccount(r.accountId), exportValue: r => r.accountId },
+              { id: 'a', header: 'Account ID', cell: r => r.accountId, exportValue: r => r.accountId },
+              { id: 'an', header: 'Account name', cell: r => accountName(r.accountId) || '—', exportValue: r => accountName(r.accountId) },
               { id: 'm',    header: 'Model',    cell: r => r.modelId },
               { id: 'cost', header: 'Spend',    cell: r => fmtCurrency(r.total_cost) },
               { id: 'prev', header: 'Previous', cell: r => fmtCurrency(r.previous_cost) },

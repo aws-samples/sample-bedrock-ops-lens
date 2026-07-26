@@ -433,10 +433,14 @@ export const SECTION_INFO = {
           </Box>
           <p style={{ margin: '4px 0' }}>
             <code>workload</code> is your attribution key; <code>endpoint</code>
-            is <code>runtime</code> or <code>mantle</code>. A working,
-            copy-paste starting point ships in the deployment package under
-            <code> tools/reference-proxy/</code>, and the full field reference
-            is in the project README under “Workloads: per-workload attribution”.
+            is <code>runtime</code> or <code>mantle</code>. <strong>Using
+            LiteLLM?</strong> A ready-made success/failure callback ships under
+            <code> tools/client-telemetry/</code> — add it to your LiteLLM
+            config and every request (Bedrock or direct-API) emits the right
+            event automatically. Building your own gateway? A copy-paste
+            starting point ships under <code> tools/reference-proxy/</code>.
+            The full field reference is in the project README under
+            “Workloads: per-workload attribution”.
           </p>
         </div>
 

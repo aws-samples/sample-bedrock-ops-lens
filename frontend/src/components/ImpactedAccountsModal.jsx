@@ -8,7 +8,7 @@
 // instead of rendering an empty table.
 import { useEffect, useState } from 'react';
 import { Modal, Box, SpaceBetween, Alert } from '@cloudscape-design/components';
-import { api, fmt, fmtAccount, useAccountNames } from '../api.js';
+import { api, fmt, accountName, useAccountNames } from '../api.js';
 import { ChartLoading } from './Common.jsx';
 import PaginatedTable from './PaginatedTable.jsx';
 
@@ -58,7 +58,8 @@ export default function ImpactedAccountsModal({ ts, scope = 'hour', filters, onD
             trackBy={(r) => `${r.accountid || r.accountId}|${r.modelid || r.modelId}|${r.region}`}
             downloadFileName={`impacted-accounts-${ts}.csv`}
             columnDefinitions={[
-              { id: 'a',   header: 'Account ID', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account ID', cell: r => r.accountid || r.accountId, exportValue: r => r.accountid || r.accountId },
+              { id: 'an', header: 'Account name', cell: r => accountName(r.accountid || r.accountId) || '—', exportValue: r => accountName(r.accountid || r.accountId) },
               { id: 'm',   header: 'Model',      cell: r => r.modelid || r.modelId, exportValue: r => r.modelid || r.modelId },
               { id: 'r',   header: 'Region',     cell: r => r.region, exportValue: r => r.region },
               { id: 'req', header: 'Requests',   cell: r => fmt(r.total_requests), exportValue: r => r.total_requests },

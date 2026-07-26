@@ -56,6 +56,8 @@ function WorkloadsSetupPanel() {
             <Box variant="p" color="text-body-secondary">
               Point the ingester at that bucket (<code>PROXY_EVENTS_BUCKET</code>
               in <code>config.yaml</code>, then re-run <code>./deploy.sh</code>).
+              <strong> Using LiteLLM?</strong> A ready-made callback ships under
+              <code> tools/client-telemetry/</code> — no custom code needed.
               Full field reference and a ready-to-copy proxy example are in the
               project README under “Workloads: per-workload attribution” (also
               shipped in the deployment package under <code>tools/reference-proxy/</code>).
@@ -148,7 +150,7 @@ export default function WorkloadsTab({ filters, onInfo }) {
     paramsEp, [JSON.stringify(paramsEp)]);
 
   // Per-value quota utilization (tokens→TPM ÷ applied limit). Proxy-derived
-  // estimate — the third commonly-requested metric alongside tokens + throttles.
+  // estimate — the third metric of the common enterprise ask alongside tokens + throttles.
   // (Quota query groups all values for the key; client-side filter applies below.)
   const quotaParams = useMemo(
     () => ({ days: filters.days, endpoint: 'all', dim_key: activeKey }),
@@ -370,7 +372,7 @@ export default function WorkloadsTab({ filters, onInfo }) {
               ariaLabel={`Tokens by ${lc}`} />}
       </Container>
 
-      {/* Quota utilization (the third per-workload metric). Proxy-derived estimate:
+      {/* Quota utilization (the third attribution metric). Proxy-derived estimate:
           peak-hour quota-tokens ÷ applied TPM limit, per dimension value.
           Only the proxy source carries the signal for this. */}
       {caps.quota && (

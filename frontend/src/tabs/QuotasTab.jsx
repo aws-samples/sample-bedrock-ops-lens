@@ -22,7 +22,7 @@ import {
   Container, Header, SpaceBetween, Box, ColumnLayout, Grid, BarChart, LineChart,
   SegmentedControl, StatusIndicator, Button, Tabs,
 } from '@cloudscape-design/components';
-import { useApi, fmt, fmtPct, fmtAccount, useAccountNames } from '../api.js';
+import { useApi, fmt, fmtPct, accountName, useAccountNames } from '../api.js';
 import { ChartLoading, SectionHeader, KpiCard, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import QuotaDrillDown from './QuotaDrillDownTab.jsx';
@@ -75,7 +75,7 @@ export default function QuotasTab({ filters, onInfo }) {
 }
 
 function QuotasBody({ filters, onInfo }) {
-  useAccountNames();   // resolve friendly names for Account cells
+  useAccountNames();   // resolve account names for the Account name cells
   const [scope, setScope] = useState('per-account');
 
   const peak = useApi('/ops-peak-rpm', filters, [JSON.stringify(filters)]);
@@ -252,7 +252,8 @@ function QuotasBody({ filters, onInfo }) {
           columnDefinitions={
             scope === 'per-account'
               ? [
-                  { id: 'a',     header: 'Account',          cell: r => fmtAccount(r.accountId), exportValue: r => r.accountId },
+                  { id: 'a', header: 'Account ID', cell: r => r.accountId, exportValue: r => r.accountId },
+                  { id: 'an', header: 'Account name', cell: r => accountName(r.accountId) || '—', exportValue: r => accountName(r.accountId) },
                   { id: 'ptpm',  header: 'Peak TPM/min',     cell: r => fmt(Math.round(r.peak_tpm)) },
                   { id: 'tlim',  header: 'TPM limit',        cell: r => r.tpm_lim ? fmt(r.tpm_lim) : '—' },
                   { id: 'tutil', header: 'TPM util %',       cell: r => r.tpm_util != null
@@ -289,7 +290,8 @@ function QuotasBody({ filters, onInfo }) {
           <PaginatedTable
             items={throttle.data || []}
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account ID', cell: r => r.accountid || r.accountId, exportValue: r => r.accountid || r.accountId },
+              { id: 'an', header: 'Account name', cell: r => accountName(r.accountid || r.accountId) || '—', exportValue: r => accountName(r.accountid || r.accountId) },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
               { id: 'rate', header: 'Throttle %', cell: r => <StatusIndicator type={(Number(r.throttle_pct) > 5) ? 'error' : (Number(r.throttle_pct) > 1) ? 'warning' : 'success'}>{fmtPct(r.throttle_pct, 3)}</StatusIndicator> },
@@ -307,7 +309,8 @@ function QuotasBody({ filters, onInfo }) {
           <PaginatedTable
             items={burndown.data || []}
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account ID', cell: r => r.accountid || r.accountId, exportValue: r => r.accountid || r.accountId },
+              { id: 'an', header: 'Account name', cell: r => accountName(r.accountid || r.accountId) || '—', exportValue: r => accountName(r.accountid || r.accountId) },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
               { id: 'p', header: 'Peak TPM (quota)',  cell: r => fmt(r.peak_tpm) },

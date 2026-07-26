@@ -57,6 +57,22 @@ ACCOUNTS = [
     "760284193570",  # tiny
     "203847561092",  # tiny
 ]
+# Account names for the accounts above (dim_account). Shape mirrors a real
+# fleet: the whales are shared prod platforms, the tail is dev/sandbox.
+ACCOUNT_NAMES = {
+    "482915037461": "genai-platform-prod",
+    "739104826355": "ml-inference-prod",
+    "108462973558": "search-services-prod",
+    "651037298144": "data-science-workbench",
+    "297461085023": "customer-support-ai",
+    "846203715699": "content-gen-staging",
+    "530918274607": "fraud-detection-prod",
+    "914725360881": "marketing-ai-dev",
+    "672038514926": "analytics-sandbox",
+    "385016749233": "sre-tools-dev",
+    "760284193570": "experimental-llm-poc",
+    "203847561092": "training-env",
+}
 REGIONS = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "eu-central-1"]
 # Model mix mirrors the real fleet: by REQUEST COUNT, Amazon Nova + "other"
 # (Nova Lite/Micro, Titan embeddings) dominate (~95%); Claude is a small slice of
@@ -1155,6 +1171,26 @@ def stamp_meta(cur) -> None:
     )
 
 
+def seed_account_names(cur) -> int:
+    # dim_account is normally maintained by the ingester's name-resolution
+    # chain (config > org > Account API); the demo has no real accounts, so
+    # give the synthetic fleet the same account-name resolution the
+    # resolver would produce. source='config' = highest-precedence source.
+    for acct_id, name in ACCOUNT_NAMES.items():
+        cur.execute(
+            """
+            INSERT INTO dim_account (accountId, account_name, source, refreshed_at)
+            VALUES (%s, %s, 'config', now())
+            ON CONFLICT (accountId) DO UPDATE SET
+                account_name = EXCLUDED.account_name,
+                source       = EXCLUDED.source,
+                refreshed_at = EXCLUDED.refreshed_at
+            """,
+            (acct_id, name),
+        )
+    return len(ACCOUNT_NAMES)
+
+
 def truncate_facts(cur) -> None:
     cur.execute(
         """
@@ -1271,6 +1307,10 @@ def main() -> int:
             if _has("f_proxy_dim_hourly"):
                 print("[7e/8] seeding f_proxy_dim_hourly (client telemetry: Workloads + By Provider)...")
                 n = seed_client_telemetry(cur, today, rng)
+                print(f"      {n:,} rows")
+            if _has("dim_account"):
+                print("[7f/8] seeding dim_account (account names)...")
+                n = seed_account_names(cur)
                 print(f"      {n:,} rows")
 
             print("[8/8] seeding f_quotas + dim_tags + meta...")

@@ -1,6 +1,6 @@
 -- 008: account-name dimension.
 --
--- Human-friendly names for the 12-digit accountIds shown all over the UI.
+-- Account names for the 12-digit accountIds shown all over the UI.
 -- Resolution chain (ingestion/accounts.py resolve_account_names):
 --   1. config.yaml `account_names` map  (source='config' — always wins)
 --   2. organizations:ListAccounts Name  (source='org' — discover-org mode)

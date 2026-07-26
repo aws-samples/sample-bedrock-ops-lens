@@ -172,9 +172,10 @@ aws lambda invoke \
 
 ## Multi-account data pipeline
 
-**Account names.** Tables and dropdowns label accounts with a friendly name
-("payments-prod (111122223333)") when one can be resolved, falling back to the
-bare ID. Resolution order: the optional `account_names` map in `config.yaml`
+**Account names.** Tables show the account ID and account name as separate
+columns (name resolves when available; CSV exports keep both fields separate
+for machine processing). Dropdown labels show "name (ID)". Resolution order:
+the optional `account_names` map in `config.yaml`
 (always wins), the AWS Organizations account name (discover-org mode), then
 `account:GetAccountInformation` asked of each account through the reader role
 (works without Organizations; the permission ships in the reader-role
@@ -266,7 +267,7 @@ For larger orgs (200+ accounts), shard by OU and run one StackSet per shard, eac
 ./setup-pipeline.sh --scope ou --ou-id ou-experimental-...
 ```
 
-For very large customers (500+ accounts) the pull architecture becomes the wrong fit. Reach out and we'll point you at the push-mode pattern (CW Metric Streams → Firehose → S3 → central ingester).
+For very large fleets (500+ accounts) the pull architecture becomes the wrong fit — the better pattern is push-mode (CW Metric Streams → Firehose → S3 → central ingester).
 
 
 ## Dashboard tabs
@@ -306,7 +307,7 @@ deliberately, because they differ in coverage and trust. Quick guide:
 |---|---|---|---|---|
 | Which **team/person** called Bedrock (audit-friendly) | **By User** tab | Invocation-log `identity.arn` | AWS-witnessed | Invocation logging on |
 | Usage by **workload / env / cost-center** (no proxy) | **Custom Attributes** tab (tags source) | Invocation-log `requestMetadata` | AWS-witnessed | Logging on + callers tag requests |
-| Usage by any attribute **incl. throttle / latency / quota** | **Custom Attributes** tab (proxy source) | Proxy / client events | Client-reported | Proxy or OTEL emitter |
+| Usage by any attribute **incl. throttle / latency / quota** | **Custom Attributes** tab (proxy source) | Proxy / client events | Client-reported | Gateway (e.g. LiteLLM callback) or OTEL emitter |
 | Per-person **throttle, TTFT, retries, est. cost** | **Custom Attributes** tab, pivot by `user` | Proxy / client events | Client-reported | Emitter sends `user` dim |
 | **Mantle** or **direct Anthropic/OpenAI API** traffic | **Custom Attributes** tab (+ By-Provider panel) | Client events only | Client-reported | Emitter (AWS-side sources can't see this) |
 | Real **dollars** by account/service | **Cost Insights** tab | Cost Explorer | AWS-billed | Nothing |
@@ -321,37 +322,26 @@ run both.
 
 ## Workloads: per-workload attribution and client telemetry (optional)
 
-The Workloads tab answers "which of my use-cases is driving Bedrock usage,
-throttling, and latency" — attribution the AWS-native metrics can't provide,
-because CloudWatch is keyed by model, not by your application's use-case.
+The Workloads tab answers **"which of my use-cases is driving usage, throttling,
+and latency"** — CloudWatch can't, because it's keyed by model, not by your
+application. It needs a shared layer in front of your model calls (LiteLLM, a
+gateway, an SDK wrapper) that emits **one metadata-only event per request** to
+S3. No proxy layer → this tab stays empty; everything else works normally.
 
-It works only if you front Bedrock with a **shared GenAI proxy / gateway**
-(LiteLLM, a Bedrock gateway, an internal SDK wrapper, etc.) that can tag each
-call with a `workload`. If your apps call Bedrock directly with no common layer,
-this tab stays empty (the rest of the dashboard is unaffected).
+**What you get:** pivot usage by any attribute you emit (`workload`, `env`,
+`team`, `cost_center`, …) with tokens, throttle rate, latency, and TPM quota
+utilization per value. Events can also cover traffic AWS-side sources can't
+see: `bedrock-mantle` latency/TTFT and direct `anthropic-api` / `openai-api`
+calls, rolled up in a "Usage by provider" view. These numbers are
+**client-reported** (the UI labels them); AWS-metered sources stay the
+billing/quota truth.
 
-**The same event pipeline also accepts client telemetry beyond Bedrock.**
-Events may carry `endpoint: "anthropic-api"` or `"openai-api"` for traffic
-that goes straight to those providers' APIs — the only way such traffic is
-observable at all, since CloudWatch, invocation logs, and Cost Explorer are
-Bedrock-scoped by definition. Optional per-request fields `ttft_ms`,
-`retry_attempts`, and `cost_usd_est` light up client-measured TTFT (including
-for `bedrock-mantle`, which publishes no latency to CloudWatch), retry
-forensics, and estimated cost. Three documented on-ramps — a LiteLLM callback
-(covers every backend the proxy fronts), an OTEL collector mapping for
-`gen_ai.*`-instrumented Anthropic/OpenAI SDKs, and Claude Code's native
-telemetry (per-developer `user.email` on every event) — live in
-[`tools/client-telemetry/`](tools/client-telemetry/). The endpoint switcher
-and a "Usage by provider (client-reported)" rollup appear automatically when
-such data exists. All of it is **self-reported**: the dashboard labels these
-surfaces client-reported and keeps AWS-metered sources as billing/quota truth.
+### Setup (3 steps)
 
-**How it works:** your proxy drops **one metadata-only event per request** to an
-S3 bucket; the dashboard reads that bucket read-only (no inbound endpoint, never
-sits in your request path). No prompt or response text ever leaves your proxy.
-
-1. **Emit an event per request.** In your proxy, after each Bedrock call, append
-   one NDJSON line to S3 under this exact layout (`.jsonl` or `.jsonl.gz`):
+1. **Emit events.** Easiest: already on LiteLLM? Drop in the ready-made
+   callback from [`tools/client-telemetry/`](tools/client-telemetry/) (also
+   has OTEL-collector and Claude Code on-ramps). Building your own? Copy
+   `tools/reference-proxy/` — one NDJSON line per request to:
 
    ```
    s3://<your-bucket>/proxy-events/<region>/<YYYY>/<MM>/<DD>/<HH>/*.jsonl
@@ -363,87 +353,50 @@ sits in your request path). No prompt or response text ever leaves your proxy.
     "input_tokens":812,"output_tokens":143,"cache_read_tokens":0,
     "status":200,"throttled":false,"latency_ms":940,"request_id":"msg_..."}
    ```
-   **`dimensions` is an arbitrary custom-attribute map** — attach whatever your
-   org slices by: `workload`, `env` (prod/dev), `business_unit`, `cost_center`,
-   `team`, feature flags, etc. The dashboard's Workloads tab lets you pivot by
-   any key you emit (the picker top-left) and computes tokens, throttle rate,
-   latency, **and per-value TPM quota utilization** for each. `workload` is just
-   the conventional default key; a bare top-level `"workload":"x"` is still
-   accepted for back-compat. `endpoint` is `runtime`, `mantle`,
-   `anthropic-api`, or `openai-api` (aliases like `anthropic` / `openai` /
-   `bedrock` are accepted). Optional fields `ttft_ms`, `retry_attempts`, and
-   `cost_usd_est` enable the client-latency, retry, and estimated-cost
-   columns. See **`tools/reference-proxy/`** for a working, copy-paste
-   starting point and **`tools/client-telemetry/`** for the LiteLLM callback,
-   Claude Code, and OTEL-collector on-ramps.
 
-2. **Grant the dashboard read access** — a bucket policy allowing the ingester
-   role `s3:GetObject` + `s3:ListBucket` on `.../proxy-events/*` (read-only,
-   cross-account supported).
+   `dimensions` holds whatever attributes you slice by. `endpoint` is
+   `runtime`, `mantle`, `anthropic-api`, or `openai-api`. Optional `ttft_ms`,
+   `retry_attempts`, `cost_usd_est` enable the TTFT, retry, and estimated-cost
+   columns. Metadata only — no prompt or response text ever leaves your proxy.
+
+2. **Grant read access** — bucket policy allowing the ingester role
+   `s3:GetObject` + `s3:ListBucket` on `.../proxy-events/*` (read-only,
+   cross-account supported; the dashboard never sits in your request path).
 
 3. **Deploy pointing at the bucket:**
    ```bash
    export PROXY_EVENTS_BUCKET=your-genai-proxy-events
-   export PROXY_EVENTS_REGIONS=us-east-1,us-west-2   # regions your proxy partitions under
+   export PROXY_EVENTS_REGIONS=us-east-1,us-west-2
    ./deploy.sh --yes
    ```
-   Leave `PROXY_EVENTS_BUCKET` unset to disable the tab entirely. The daily
-   ingester reads new events into the per-dimension views; no synthetic data is
-   ever generated — the tab shows only what your proxy emits.
+   Leave `PROXY_EVENTS_BUCKET` unset to disable the tab entirely.
 
-**Transport note (S3 vs CloudWatch).** The event *shape* above (the `dimensions`
-map + token/status/latency fields) is transport-agnostic. Today the shipped
-emitter and ingester use **S3 NDJSON** — chosen for the simplest cross-account,
-read-only access and the cheapest way to carry arbitrary high-cardinality
-attributes (no per-metric cost). Two CloudWatch alternatives are pluggable
-future readers if a customer needs near-real-time or already centralizes on CW:
-- **CloudWatch Logs (structured JSON)** — same arbitrary fields, per-GB pricing
-  (no cardinality tax), Logs-Insights queryable; would add a cross-account
-  subscription/Insights ingestion path feeding the *same* `f_proxy_dim_hourly`
-  tables. Near-real-time.
-- **CloudWatch custom metrics (`PutMetricData` Dimensions)** — true 1-minute
-  granularity, but each unique dimension-value combination is a separately
-  billed custom metric, so it only suits a *small, fixed* set of dimensions
-  (e.g. `workload` alone), not open-ended attributes like `cost_center`.
+### How this relates to AWS-native attribution
 
-Either would reuse the entire data model, aggregation, quota math, and UI built
-for the S3 path — only the reader changes. Not implemented today; S3 is the
-supported transport.
+AWS's native mechanisms ([Bedrock cost
+management](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-management.html))
+answer **dollars** by principal / inference profile / Mantle Project — and this
+dashboard uses them where they fit. What they don't emit is **throttle rate,
+latency, or TPM quota utilization per workload**, and they don't cover
+non-Bedrock traffic. The two paths are complements:
 
-**Why the proxy path, given AWS-native cost attribution exists.** AWS ships
-several native attribution mechanisms
-([Bedrock cost management](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-management.html)):
-IAM principal attribution, Application inference profiles (runtime), and
-Projects / Workspaces (mantle). We use the native building blocks where they
-fit — per-request metadata tags feed the tag-filtered views, the identity ARN
-feeds "Top callers", and the Mantle Project dimension feeds per-project
-chargeback. But every *native* method outputs **billed dollars, aggregated per
-usage-type per day** to Cost Explorer / CUR 2.0 — none of them emit **throttle
-rate** or **TPM quota utilization**, and the profile/principal methods don't
-cover the `bedrock-mantle` endpoint. The Workloads (proxy) path is the only one
-that gives per-workload **usage** — tokens, throttle %, latency, and quota
-utilization — uniformly across both endpoints and at ~hourly (not 24–48h)
-freshness. So: use native attribution for **dollars by workload** (surfacing
-inference-profile / Project cost from Cost Explorer is a planned fast-follow);
-use the proxy path for **usage / throttle / quota by workload**. The proxy event
-`dimensions` map intentionally mirrors AWS's `requestMetadata` custom-attribute
-shape (`{team, tenant, cost_center, …}`), so it's an extension of the native
-pattern, not a fork.
+| | AWS-native (`requestMetadata` tags) | Proxy / client events |
+|---|---|---|
+| Setup | Tag calls + invocation logging on — no proxy | Emitter (LiteLLM callback, OTEL, or your gateway) |
+| Coverage | `bedrock-runtime` only | runtime + mantle + direct Anthropic/OpenAI APIs |
+| Metrics | Tokens + volume | + throttle %, latency, TTFT, retries, quota %, est. cost |
+| Freshness | Daily batch | ~Hourly |
+| Trust | AWS-witnessed | Client-reported |
 
-**No-proxy path for usage-by-attribute (AWS-native).** AWS's
-[request-level usage attribution](https://aws.amazon.com/about-aws/whats-new/2026/05/amazon-bedrock-request-level-usage-attribution/)
-lets you tag each `InvokeModel` / Converse call with arbitrary
-`requestMetadata` attributes (`team`, `project`, `environment`, …) and analyze
-**token usage** by those tags in model invocation logs. **This dashboard already
-ingests it** — the invocation-log ingester parses `requestMetadata` into
-`f_daily_tagged`, and the "Pinned tag keys" setting surfaces any tag as a
-top-bar filter. So a customer who already runs invocation logging gets
-usage-by-attribute with **zero proxy work**. Its limits (the reason the proxy
-path still exists): it's `bedrock-runtime` only (no Mantle invocation logs),
-requires invocation logging enabled, is daily-batch, and exposes token counts
-but **not throttle rate or TPM quota utilization** (throttled calls are often
-not logged; quota headroom isn't in the logs). The proxy path adds those three
-and covers Mantle. Same custom-attribute model, two complementary sources.
+Already running invocation logging with tagged requests? You get
+usage-by-attribute with zero proxy work — pick "Option 1" in Settings. Want
+throttle/latency/quota per workload or non-Bedrock coverage? Emit events —
+"Option 2". Running both is normal.
+
+> **Transport note:** the event shape is transport-agnostic; S3 NDJSON is the
+> supported transport today (simplest cross-account read-only access, no
+> per-metric cardinality cost). CloudWatch Logs / custom-metric readers could
+> be added without changing the data model.
 
 
 ## Cost
@@ -498,3 +451,69 @@ Cognito User Pool and the SPA bucket survive the delete on purpose, so re-deploy
 ## License
 
 MIT License. See `LICENSE` for details.
+
+## Screenshots
+
+> **Note:** All screenshots below show **synthetic demo data** generated by
+> `db/seed.py` — every account ID, account name, application, user, and metric
+> is invented for demonstration. No real AWS accounts or customer data appear
+> in any image.
+
+### Overview
+![Fleet-wide KPIs and request volume chart broken down by model](images/screenshots/overview.png)
+Fleet-wide KPI tiles and a 7-day request volume breakdown by model across all accounts.
+
+### Quotas
+![Quota utilization charts (TPM and RPM vs. limits) with a filterable table](images/screenshots/quotas.png)
+Peak TPM/RPM vs. Service Quotas limits, plus a filterable utilization table per account and model.
+
+### Cost Insights
+![Daily spend by model family stacked chart with a sortable cost table](images/screenshots/cost-insights.png)
+Daily spend stacked by model family (Nova, Titan, Claude Haiku/Sonnet/Opus) with a per-model cost breakdown table.
+
+### Health & Errors
+![Error status code timeline, throttled vs. 4xx/5xx stacked area, and error rate trend](images/screenshots/health-errors.png)
+Status-code timeline, throttle vs. server-error stacked area, and a fleet-wide error-rate trend line.
+
+### Latency
+![Horizontal bar chart of end-to-end latency by model at p50/p90/p99](images/screenshots/latency.png)
+End-to-end latency by model (p50/p90/p99 horizontal bars) and a sortable latency details table.
+
+### Capacity & Adoption
+![CRIS vs. On-Demand capacity donut, regional distribution donut, adoption table, and adoption trend line](images/screenshots/capacity-adoption.png)
+Capacity breakdown (CRIS vs. On-Demand), regional distribution across accounts, a per-model adoption table, and adoption percentage trend over time.
+
+### Model Lifecycle
+![Lifecycle table with severity indicators for legacy/EOL models](images/screenshots/model-lifecycle.png)
+Lifecycle tracking — legacy/extended-access/EOL milestones for models still receiving traffic.
+
+### Model Insights
+![Provider share donut and spend-by-model-family donut charts](images/screenshots/model-insights.png)
+Provider share (Amazon vs. Anthropic), spend-by-model-family breakdown, and per-model deep-dive.
+
+### Usage · Custom Attributes
+![Endpoint switcher (bedrock-runtime, bedrock-mantle, anthropic-api, openai-api) with tokens-by-workload chart](images/screenshots/workloads-client-telemetry.png)
+Multi-endpoint view with per-workload token consumption broken down by custom attributes.
+
+![Throttle rate chart and usage table by workload](images/screenshots/workloads-by-provider.png)
+Throttle-rate view and detailed usage table by client-reported workload.
+
+### By User / App / Principal
+![Top callers bar chart with a paginated callers table](images/screenshots/by-user.png)
+Top callers ranked by request volume, filterable by App/Group, User, or IAM Principal.
+
+### Agents & MCP
+![AgentCore runtimes table and MCP tools inventory](images/screenshots/agents-mcp.png)
+AgentCore runtimes and MCP tool invocation inventory with request and token breakdowns.
+
+### Compliance (Guardrails)
+![Guardrails interventions-by-policy bar chart and detail table](images/screenshots/compliance.png)
+Guardrails intervention counts by policy type with a per-guardrail detail table.
+
+### Governance
+![Shadow-AI reconciliation table with status indicators](images/screenshots/governance.png)
+Shadow-AI reconciliation — surfaces unmanaged endpoints and traffic not routed through the proxy layer.
+
+### Ops Review (AI-Synthesized)
+![At-a-glance ribbon with alert counts and AI-generated executive summary](images/screenshots/ops-review.png)
+AI-synthesized operational review — at-a-glance ribbon, executive summary, and key findings generated from live fleet telemetry.

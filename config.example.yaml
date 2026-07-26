@@ -54,7 +54,7 @@ monitored_accounts:
     # - "222222222222"
 
 # -----------------------------------------------------------------------------
-# Optional: friendly names for accountIds, shown across the dashboard as
+# Optional: account names for accountIds, shown across the dashboard as
 # "name (123456789012)". Highest-precedence source — overrides names from
 # AWS Organizations and the Account API. Useful when you're not in an org,
 # or when you want labels different from the org account names. Names for

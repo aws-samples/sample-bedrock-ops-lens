@@ -173,12 +173,14 @@ export function fmtPct(n, digits = 2) {
 }
 
 // --- Account-name resolution (008) ------------------------------------------
-// Friendly names for 12-digit accountIds, resolved once from /api/accounts
+// Account names for 12-digit accountIds, resolved once from /api/accounts
 // (which merges dim_account: config.yaml map > org name > account API).
-// Components call fmtAccount(id) in cell renderers — returns
-// "name (1234…9012)" when a name exists, else the bare ID. Module-level
-// cache (not a hook) so table cell renderers can use it without prop
-// drilling; useAccountNames() triggers the fetch + re-render on arrival.
+// Tables render two separate columns via accountName(id) ("Account name",
+// blank when unresolved) next to the raw ID ("Account ID") so CSV exports
+// stay machine-readable. fmtAccount(id) → "name (id)" is for single-field
+// surfaces only (dropdown option labels). Module-level cache (not a hook)
+// so cell renderers can use it without prop drilling; useAccountNames()
+// triggers the fetch + re-render on arrival.
 let _acctNames = new Map();
 let _acctNamesPromise = null;
 

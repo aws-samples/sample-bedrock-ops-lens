@@ -268,7 +268,7 @@ export default function SettingsView({ onInfo }) {
                 {
                   value: 'proxy',
                   label: 'Option 2 — GenAI proxy events',
-                  description: `Attributes come from a proxy that emits one metadata-only event per request to S3. Covers bedrock-runtime + mantle and adds throttle rate, latency, and TPM quota utilization.${avail.proxy ? '' : '  ·  No proxy data ingested yet.'}`,
+                  description: `Attributes come from a GenAI gateway or client emitter — e.g. LiteLLM (bundled callback in tools/client-telemetry/), an OTEL collector, or Claude Code telemetry — that writes one metadata-only event per request to S3. Covers bedrock-runtime + mantle + direct Anthropic/OpenAI APIs and adds throttle rate, latency, and TPM quota utilization.${avail.proxy ? '' : '  ·  No proxy data ingested yet.'}`,
                 },
               ]}
             />

@@ -4,7 +4,7 @@ import {
   Container, Header, SpaceBetween, BarChart, LineChart, Grid, Box,
   Button, Spinner, Alert, SegmentedControl, ColumnLayout, StatusIndicator,
 } from '@cloudscape-design/components';
-import { useApi, fmt, fmtPct, api as apiCall, fmtAccount, useAccountNames } from '../api.js';
+import { useApi, fmt, fmtPct, api as apiCall, accountName, useAccountNames } from '../api.js';
 import { ChartLoading, KpiCard, SectionHeader, InfoLink, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import ImpactedAccountsModal from '../components/ImpactedAccountsModal.jsx';
@@ -193,7 +193,7 @@ function MantleHealthBody({ filters, onInfo }) {
 }
 
 function RuntimeErrorsBody({ filters, onInfo }) {
-  useAccountNames();   // resolve friendly names for Account cells
+  useAccountNames();   // resolve account names for the Account name cells
   const byModel = useApi('/errors-by-model', filters, [JSON.stringify(filters)]);
   const byAcct = useApi('/errors-by-account', filters, [JSON.stringify(filters)]);
   const trend = useApi('/errors-daily-trend', filters, [JSON.stringify(filters)]);
@@ -491,7 +491,8 @@ function RuntimeErrorsBody({ filters, onInfo }) {
           <PaginatedTable
             items={byAcct.data || []}
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account ID', cell: r => r.accountid || r.accountId, exportValue: r => r.accountid || r.accountId },
+              { id: 'an', header: 'Account name', cell: r => accountName(r.accountid || r.accountId) || '—', exportValue: r => accountName(r.accountid || r.accountId) },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
               { id: 't', header: 'Total',   cell: r => fmt(r.total_requests) },
