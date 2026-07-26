@@ -54,6 +54,19 @@ monitored_accounts:
     # - "222222222222"
 
 # -----------------------------------------------------------------------------
+# Optional: friendly names for accountIds, shown across the dashboard as
+# "name (123456789012)". Highest-precedence source — overrides names from
+# AWS Organizations and the Account API. Useful when you're not in an org,
+# or when you want labels different from the org account names. Names for
+# unlisted accounts are auto-resolved (org ListAccounts in discover-org mode,
+# else account:GetAccountInformation via the reader role) when permissions
+# allow; otherwise the bare ID is shown.
+# -----------------------------------------------------------------------------
+account_names: {}
+  # "111111111111": "payments-prod"
+  # "222222222222": "data-science-sandbox"
+
+# -----------------------------------------------------------------------------
 # Monitored regions — which AWS regions the ingester scrapes per-account.
 # Three named presets plus an escape hatch:
 #

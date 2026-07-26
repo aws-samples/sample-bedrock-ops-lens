@@ -344,6 +344,12 @@ CREATE TABLE IF NOT EXISTS f_hourly_status (
     status_500_count BIGINT,
     status_503_count BIGINT,
 
+    -- Per-account latency on the same grain (007): sum + count from the
+    -- per-request latencyMs in invocation logs. avg = sum/count; powers the
+    -- "accounts impacted" drill-downs on the Errors and Latency tabs.
+    latency_sum_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+    latency_count  BIGINT NOT NULL DEFAULT 0,
+
     PRIMARY KEY (event_date, hour, accountId, modelId, region, endpoint)
 );
 
@@ -564,7 +570,7 @@ CREATE TABLE IF NOT EXISTS ingestion_days (
 CREATE INDEX IF NOT EXISTS ix_ingestion_days_loaded ON ingestion_days (loaded_at DESC);
 
 -- ============================================================================
--- PROXY PER-WORKLOAD TELEMETRY  (shared proxy/gateway pattern)
+-- PROXY PER-WORKLOAD TELEMETRY  (proxy/gateway attribution pattern)
 --
 -- A GenAI proxy fronting Bedrock signs every request with ONE IAM role, so
 -- caller identity can't attribute usage to a workload. Instead the proxy
@@ -595,7 +601,9 @@ CREATE TABLE IF NOT EXISTS f_request_events (
     event_date     DATE NOT NULL,
     dimensions     JSONB NOT NULL DEFAULT '{}'::jsonb,
     modelId        TEXT NOT NULL,
-    endpoint       TEXT NOT NULL DEFAULT 'runtime',  -- 'runtime' | 'mantle'
+    -- 'runtime' | 'mantle' | 'anthropic-api' | 'openai-api' — the last two are
+    -- direct-API paths only client telemetry can see (client-reported tier).
+    endpoint       TEXT NOT NULL DEFAULT 'runtime',
     region         TEXT NOT NULL,
     accountId      TEXT NOT NULL DEFAULT '__none__',
     input_tokens   BIGINT NOT NULL DEFAULT 0,
@@ -604,6 +612,12 @@ CREATE TABLE IF NOT EXISTS f_request_events (
     status         INTEGER NOT NULL DEFAULT 200,
     throttled      BOOLEAN NOT NULL DEFAULT false,
     latency_ms     DOUBLE PRECISION,
+    -- Client-telemetry extras (006): all optional. cost_usd_est is the
+    -- EMITTER'S estimate (e.g. Claude Code api_request.cost_usd) — reconcile
+    -- against CUR, never treat as billing truth.
+    ttft_ms        DOUBLE PRECISION,
+    retry_attempts INTEGER,
+    cost_usd_est   DOUBLE PRECISION,
     request_id     TEXT NOT NULL,
     -- event_date is in the PK because Postgres requires a partitioned table's
     -- PK to include the partition key. (request_id, ts) alone is the logical
@@ -642,6 +656,12 @@ CREATE TABLE IF NOT EXISTS f_proxy_dim_hourly (
     p50_latency_ms DOUBLE PRECISION,
     p90_latency_ms DOUBLE PRECISION,
     p99_latency_ms DOUBLE PRECISION,
+    -- Client-telemetry extras (006): TTFT percentiles, retry volume, and the
+    -- emitters' summed cost estimate for the bucket.
+    p50_ttft_ms    DOUBLE PRECISION,
+    p90_ttft_ms    DOUBLE PRECISION,
+    retried_count  BIGINT NOT NULL DEFAULT 0,
+    cost_usd_est   DOUBLE PRECISION NOT NULL DEFAULT 0,
     PRIMARY KEY (event_date, hour, dim_key, dim_value, modelId, endpoint, region, accountId)
 );
 
@@ -733,3 +753,20 @@ CREATE TABLE IF NOT EXISTS f_identity_usage (
     PRIMARY KEY (event_date, accountId, region, identity_arn, modelId, endpoint)
 );
 CREATE INDEX IF NOT EXISTS ix_f_identity_usage_brin ON f_identity_usage USING BRIN (event_date);
+
+-- ----------------------------------------------------------------------------
+-- dim_account — human-friendly names for accountIds (008).
+-- Resolution chain: config.yaml account_names map > organizations:ListAccounts
+-- (discover-org) > account:GetAccountInformation via the reader role (works
+-- without Organizations). Unresolved accounts have no row; the UI shows the
+-- bare ID. Refreshed each ingester run. UI resolves names client-side via
+-- /api/accounts — deliberately NO per-table SQL joins.
+-- Ingester also self-creates this table (_ensure_dim_account) — both DDLs
+-- MUST stay identical.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dim_account (
+    accountId    TEXT PRIMARY KEY,
+    account_name TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT '',   -- config | org | account_api
+    refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

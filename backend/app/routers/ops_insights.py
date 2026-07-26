@@ -218,6 +218,13 @@ async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
     parts = ["h.event_date BETWEEN $1::date AND $2::date",
              "h.modelId LIKE '%anthropic.claude-%'"]
     params: list = [f.start, f.end]
+    # Honor the global provider filter. This widget is Claude-only by design
+    # (the burndown multiplier is a Claude quota concept), so any non-anthropic
+    # provider yields an EMPTY result — without this, switching the provider
+    # filter left the table stuck on the full Claude list (TAM bug report:
+    # "one metric does not update; Throttle hotspots above it does").
+    if f.provider not in ("all", "anthropic"):
+        return []
     if f.accounts:
         parts.append(f"h.accountId = ANY(${len(params)+1}::text[])")
         params.append(list(f.accounts))

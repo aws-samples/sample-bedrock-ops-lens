@@ -82,11 +82,13 @@ export async function api(path, params = {}, { signal, useCache = true } = {}) {
   }
   const res = await fetch(url, { signal, credentials: 'include' });
   if (res.status === 401) {
-    // Auth-enabled deploy: backend says we're not signed in. The App-level
-    // UserProvider notices via /me's 401 and renders <AuthApp/> instead of
-    // the dashboard, so all we need to do here is surface the 401 — no
-    // redirect, no reload. Throw a sentinel so calling components don't
-    // try to render partial state.
+    // Not signed in — either never was (initial /me probe) or the session
+    // EXPIRED mid-use. UserProvider only checks /me once on mount, so a
+    // mid-session expiry used to leave the dashboard mounted with every
+    // fetch failing → blank charts that read as "no data" until a manual
+    // refresh. Broadcast the expiry so UserProvider can flip to the sign-in
+    // screen immediately.
+    notifyAuthExpired();
     throw new Error('unauthenticated');
   }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${url}`);
@@ -96,6 +98,21 @@ export async function api(path, params = {}, { signal, useCache = true } = {}) {
 }
 
 export function clearCache() { cache.clear(); }
+
+// --- Session-expiry broadcast ----------------------------------------------
+// UserProvider registers a listener; any 401 from any fetch triggers it, so
+// an expired session lands on the sign-in screen instead of a dashboard full
+// of blank charts. Debounced: a page renders many panels, each of whose
+// fetches will 401 at once.
+let _authExpiredHandler = null;
+let _authExpiredFired = false;
+export function onAuthExpired(fn) { _authExpiredHandler = fn; _authExpiredFired = false; }
+function notifyAuthExpired() {
+  if (_authExpiredFired) return;
+  _authExpiredFired = true;
+  cache.clear();                      // stale data must not survive re-login
+  if (_authExpiredHandler) _authExpiredHandler();
+}
 
 // React hook — kept tiny; full state machine is overkill for this app.
 //
@@ -153,4 +170,49 @@ export function fmtMs(n) {
 export function fmtPct(n, digits = 2) {
   if (n === null || n === undefined) return '—';
   return Number(n).toFixed(digits) + '%';
+}
+
+// --- Account-name resolution (008) ------------------------------------------
+// Friendly names for 12-digit accountIds, resolved once from /api/accounts
+// (which merges dim_account: config.yaml map > org name > account API).
+// Components call fmtAccount(id) in cell renderers — returns
+// "name (1234…9012)" when a name exists, else the bare ID. Module-level
+// cache (not a hook) so table cell renderers can use it without prop
+// drilling; useAccountNames() triggers the fetch + re-render on arrival.
+let _acctNames = new Map();
+let _acctNamesPromise = null;
+
+export function primeAccountNames() {
+  if (_acctNamesPromise) return _acctNamesPromise;
+  _acctNamesPromise = api('/accounts', {}, { useCache: true })
+    .then(rows => {
+      const m = new Map();
+      for (const r of rows || []) {
+        if (r.accountId && r.name) m.set(String(r.accountId), r.name);
+      }
+      _acctNames = m;
+      return m;
+    })
+    .catch(() => _acctNames);
+  return _acctNamesPromise;
+}
+
+export function accountName(id) {
+  return _acctNames.get(String(id)) || '';
+}
+
+export function fmtAccount(id) {
+  if (!id) return '—';
+  const name = _acctNames.get(String(id));
+  return name ? `${name} (${String(id)})` : String(id);
+}
+
+export function useAccountNames() {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    primeAccountNames().then(() => { if (!cancelled) setTick(t => t + 1); });
+    return () => { cancelled = true; };
+  }, []);
+  return fmtAccount;
 }

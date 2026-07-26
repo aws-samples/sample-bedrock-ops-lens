@@ -23,9 +23,17 @@ export const OPTIONAL_TABS = {
   governance: { href: '#/governance', label: 'Governance',   default: false },
 };
 
+// Build-time override for DEMO deployments only: building with
+// VITE_DEFAULT_OPTIONAL_TABS=on flips every optional tab's default to
+// visible, so demo audiences see the full experience without touching
+// Settings. Absent (every normal build/deploy), defaults stay OFF —
+// deployment behavior is unchanged. A user's own toggles always win
+// over the default either way (loadOptionalTabs merges stored values).
+const _DEFAULT_ON = import.meta.env?.VITE_DEFAULT_OPTIONAL_TABS === 'on';
+
 function _defaults() {
   const d = {};
-  for (const [k, v] of Object.entries(OPTIONAL_TABS)) d[k] = v.default;
+  for (const [k, v] of Object.entries(OPTIONAL_TABS)) d[k] = _DEFAULT_ON || v.default;
   return d;
 }
 

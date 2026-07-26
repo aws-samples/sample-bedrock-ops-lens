@@ -27,7 +27,7 @@ async def _safe_fetch(sql: str, *params):
 async def agents_summary(f: FilterSet = Depends(parse_filters)):
     """Per runtime/agent resource: invocations, sessions, errors, latency.
     Pivots the metric-per-row table into one row per resource."""
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_model=False, has_endpoint=False)
     return await _safe_fetch(
         f"""
         SELECT resource_type, resource_id,
@@ -50,7 +50,7 @@ async def agents_summary(f: FilterSet = Depends(parse_filters)):
 async def agents_gateway_tools(f: FilterSet = Depends(parse_filters)):
     """MCP tool call view: gateway metrics broken down by tool Name /
     TargetType dimension."""
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_model=False, has_endpoint=False)
     return await _safe_fetch(
         f"""
         SELECT resource_type, resource_id, metric_name,
@@ -92,7 +92,7 @@ async def agents_real_cost(f: FilterSet = Depends(parse_filters)):
 async def agents_metrics_inventory(f: FilterSet = Depends(parse_filters)):
     """Diagnostic: which AgentCore metrics/namespaces were discovered.
     Useful to distinguish 'no AgentCore usage' from 'wrong namespace'."""
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_model=False, has_endpoint=False)
     return await _safe_fetch(
         f"""
         SELECT namespace, resource_type, metric_name, COUNT(*)::BIGINT AS datapoints

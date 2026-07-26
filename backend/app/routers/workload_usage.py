@@ -150,7 +150,10 @@ async def workload_usage_values(dim_key: str = Query(..., min_length=1)):
 
 
 def _resolve_endpoint(endpoint: str) -> str:
-    return endpoint if endpoint in ("runtime", "mantle", "all") else "all"
+    # runtime/mantle are Bedrock paths; anthropic-api/openai-api are direct-API
+    # paths visible only in client telemetry (006).
+    return endpoint if endpoint in (
+        "runtime", "mantle", "anthropic-api", "openai-api", "all") else "all"
 
 
 @router.get("/workload-usage")
@@ -193,6 +196,10 @@ async def workload_usage(
           MAX(p50_latency_ms) AS p50_latency_ms,
           MAX(p90_latency_ms) AS p90_latency_ms,
           MAX(p99_latency_ms) AS p99_latency_ms,
+          MAX(p50_ttft_ms)    AS p50_ttft_ms,
+          MAX(p90_ttft_ms)    AS p90_ttft_ms,
+          SUM(retried_count)::BIGINT AS retried,
+          SUM(cost_usd_est)::DOUBLE PRECISION AS cost_usd_est,
           array_agg(DISTINCT endpoint) AS endpoints
         FROM f_proxy_dim_hourly
         WHERE {w}
@@ -202,6 +209,61 @@ async def workload_usage(
         LIMIT 500
         """,
         *params,
+    )
+    return db.rows_to_dicts(rows)
+
+
+# Provider = model family (whose model answered), rolled up ACROSS paths —
+# "all my Anthropic usage (Bedrock + direct API) vs all my OpenAI usage".
+# Distinct from `endpoint`, which is the PATH the request traveled.
+_PROVIDER_SQL = """
+    CASE
+      WHEN modelId ILIKE '%anthropic%' OR modelId ILIKE 'claude%' THEN 'anthropic'
+      WHEN modelId ILIKE '%openai%' OR modelId ILIKE 'gpt-%'
+           OR modelId ILIKE 'o1%' OR modelId ILIKE 'o3%' OR modelId ILIKE 'o4%' THEN 'openai'
+      WHEN modelId ILIKE 'amazon.%' OR modelId ILIKE '%titan%' OR modelId ILIKE '%nova%' THEN 'amazon'
+      WHEN modelId ILIKE 'meta.%' OR modelId ILIKE '%llama%' THEN 'meta'
+      WHEN modelId ILIKE 'mistral%' THEN 'mistral'
+      WHEN modelId ILIKE 'cohere%' THEN 'cohere'
+      ELSE 'other'
+    END
+"""
+
+
+@router.get("/workload-usage/by-provider")
+async def workload_usage_by_provider(days: int = Query(14, ge=1, le=90)):
+    """Client-telemetry usage rolled up by PROVIDER (model family) × PATH
+    (endpoint). Answers "Anthropic everywhere vs OpenAI everywhere", including
+    direct-API traffic no AWS-side source can see. dim_key is pinned to one
+    key per the fan-out rule; any key covers 100% of requests, so we pick the
+    highest-volume key in the window for correct totals."""
+    rows = await db.fetch(
+        f"""
+        WITH pinned AS (
+          SELECT dim_key FROM f_proxy_dim_hourly
+          WHERE event_date >= current_date - $1::int
+          GROUP BY dim_key ORDER BY SUM(total_requests) DESC LIMIT 1
+        )
+        SELECT
+          {_PROVIDER_SQL} AS provider,
+          endpoint,
+          SUM(total_requests)::BIGINT    AS total_requests,
+          SUM(input_tokens)::BIGINT      AS input_tokens,
+          SUM(output_tokens)::BIGINT     AS output_tokens,
+          SUM(cache_read_tokens)::BIGINT AS cache_read_tokens,
+          SUM(error_count)::BIGINT       AS errors,
+          SUM(retried_count)::BIGINT     AS retried,
+          SUM(cost_usd_est)::DOUBLE PRECISION AS cost_usd_est,
+          MAX(p90_latency_ms) AS p90_latency_ms,
+          MAX(p90_ttft_ms)    AS p90_ttft_ms,
+          COUNT(DISTINCT modelId)::BIGINT AS distinct_models
+        FROM f_proxy_dim_hourly
+        WHERE event_date >= current_date - $1::int
+          AND dim_key = (SELECT dim_key FROM pinned)
+        GROUP BY 1, endpoint
+        ORDER BY total_requests DESC
+        """,
+        days,
     )
     return db.rows_to_dicts(rows)
 
@@ -247,7 +309,7 @@ async def workload_usage_quota(
 ):
     """Per-value TPM quota-utilization ESTIMATE for one dimension key.
 
-    Answers a common customer ask: "quota utilization by workload." Quota limits are
+    Answers the common enterprise ask: "quota utilization by workload." Quota limits are
     set per (account, model, region) — never per workload — so we attribute a
     share of that ceiling to each dimension value:
 

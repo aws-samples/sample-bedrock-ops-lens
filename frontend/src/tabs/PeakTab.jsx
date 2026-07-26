@@ -1,7 +1,7 @@
 // Peak Hours tab — single container with auto-detected timezone.
 import { useMemo } from 'react';
 import { Container, BarChart } from '@cloudscape-design/components';
-import { useApi } from '../api.js';
+import { useApi, fmt } from '../api.js';
 import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 
 export default function PeakTab({ filters, onInfo }) {
@@ -46,7 +46,7 @@ export default function PeakTab({ filters, onInfo }) {
           stackedBars
           hideFilter
           ariaLabel="Hour-of-day request volume"
-          i18nStrings={CHART_I18N}
+          i18nStrings={{ ...CHART_I18N, yTickFormatter: fmt }}
           height={300}
           xTitle={`Hour (${tzAbbr})`}
           yTitle="Requests"

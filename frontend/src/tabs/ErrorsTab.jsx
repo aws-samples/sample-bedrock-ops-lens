@@ -4,9 +4,10 @@ import {
   Container, Header, SpaceBetween, BarChart, LineChart, Grid, Box,
   Button, Spinner, Alert, SegmentedControl, ColumnLayout, StatusIndicator,
 } from '@cloudscape-design/components';
-import { useApi, fmt, fmtPct, api as apiCall } from '../api.js';
+import { useApi, fmt, fmtPct, api as apiCall, fmtAccount, useAccountNames } from '../api.js';
 import { ChartLoading, KpiCard, SectionHeader, InfoLink, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
+import ImpactedAccountsModal from '../components/ImpactedAccountsModal.jsx';
 import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
 
 // Per-code palette + render order for the "Status Codes" stacked chart.
@@ -137,6 +138,7 @@ function MantleHealthBody({ filters, onInfo }) {
                 ariaLabel="Mantle request volume by day"
                 i18nStrings={{
                   ...CHART_I18N,
+                  yTickFormatter: fmt,
                   xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
                 }}
                 xTitle="Day" yTitle="Requests"
@@ -191,6 +193,7 @@ function MantleHealthBody({ filters, onInfo }) {
 }
 
 function RuntimeErrorsBody({ filters, onInfo }) {
+  useAccountNames();   // resolve friendly names for Account cells
   const byModel = useApi('/errors-by-model', filters, [JSON.stringify(filters)]);
   const byAcct = useApi('/errors-by-account', filters, [JSON.stringify(filters)]);
   const trend = useApi('/errors-daily-trend', filters, [JSON.stringify(filters)]);
@@ -201,6 +204,8 @@ function RuntimeErrorsBody({ filters, onInfo }) {
   // code into an invisible sliver). Default to errors-only — this is an
   // errors view, after all.
   const [statusView, setStatusView] = useState('errors');
+  // "Accounts impacted" drill-down: {ts, scope} for the clicked chart bucket.
+  const [impact, setImpact] = useState(null);
 
   // Real per-code hourly series from invocation logs. Drop all-zero series so
   // the legend stays readable when a code never occurs in the window.
@@ -323,6 +328,14 @@ function RuntimeErrorsBody({ filters, onInfo }) {
 
   return (
     <SpaceBetween size="l">
+      {impact && (
+        <ImpactedAccountsModal
+          ts={impact.ts}
+          scope={impact.scope}
+          filters={filters}
+          onDismiss={() => setImpact(null)}
+        />
+      )}
       <Container header={
         <SectionHeader
           title="Status Codes"
@@ -358,10 +371,17 @@ function RuntimeErrorsBody({ filters, onInfo }) {
               ariaLabel="Request status codes by hour"
               i18nStrings={{
                 ...CHART_I18N,
+                yTickFormatter: fmt,
                 xTickFormatter: d => new Date(d).toLocaleString(undefined, {
                   month: 'short', day: 'numeric', hour: 'numeric',
                 }),
               }}
+              detailPopoverFooter={(xValue) => (
+                <Button variant="inline-link"
+                        onClick={() => setImpact({ ts: new Date(xValue).toISOString(), scope: 'hour' })}>
+                  Drill accounts
+                </Button>
+              )}
               xTitle="Hour (UTC)"
               yTitle={statusView === 'errors' ? 'Error requests' : 'Requests'}
               height={300}
@@ -384,15 +404,22 @@ function RuntimeErrorsBody({ filters, onInfo }) {
               ariaLabel="Errors by status code"
               i18nStrings={{
                 ...CHART_I18N,
+                yTickFormatter: fmt,
                 xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
               }}
               detailPopoverFooter={(xValue) => {
                 const d = new Date(xValue);
                 return (
-                  <Button variant="inline-link"
-                          onClick={() => loadHourly(d.getFullYear(), d.getMonth() + 1, d.getDate())}>
-                    Drill into hourly
-                  </Button>
+                  <SpaceBetween direction="horizontal" size="m">
+                    <Button variant="inline-link"
+                            onClick={() => loadHourly(d.getFullYear(), d.getMonth() + 1, d.getDate())}>
+                      Drill into hourly
+                    </Button>
+                    <Button variant="inline-link"
+                            onClick={() => setImpact({ ts: d.toISOString(), scope: 'day' })}>
+                      Drill accounts
+                    </Button>
+                  </SpaceBetween>
                 );
               }}
               height={260}
@@ -425,7 +452,7 @@ function RuntimeErrorsBody({ filters, onInfo }) {
                   stackedBars
                   hideFilter
                   ariaLabel="Hourly errors"
-                  i18nStrings={CHART_I18N}
+                  i18nStrings={{ ...CHART_I18N, yTickFormatter: fmt }}
                   height={220}
                   xTitle="Hour (UTC)" yTitle="Failed requests"
                 />
@@ -464,7 +491,7 @@ function RuntimeErrorsBody({ filters, onInfo }) {
           <PaginatedTable
             items={byAcct.data || []}
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
               { id: 't', header: 'Total',   cell: r => fmt(r.total_requests) },

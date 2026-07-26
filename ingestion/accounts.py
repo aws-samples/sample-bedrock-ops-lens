@@ -276,3 +276,73 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# ---------------------------------------------------------------------------
+# Account-name resolution (008) — feeds dim_account
+# ---------------------------------------------------------------------------
+def resolve_account_names(accounts: list[MonitoredAccount],
+                          config_names: dict | None = None) -> list[tuple[str, str, str]]:
+    """Resolve a friendly name for each monitored account.
+
+    Chain (first hit wins), per account:
+      1. config.yaml `account_names` map        → source 'config'
+      2. name already carried on MonitoredAccount (org ListAccounts in
+         discover-org mode, or the accounts-file `name` field) → 'org'
+      3. account:GetAccountInformation via the reader role (works WITHOUT
+         Organizations — each account reports its own name; requires the
+         permission in the reader role, present in new deployments) → 'account_api'
+      4. unresolved → omitted (UI shows the bare ID)
+
+    Returns [(accountId, name, source)] for resolved accounts only.
+    Failures are per-account and non-fatal — name resolution must never
+    break ingestion.
+    """
+    config_names = config_names or {}
+    out: list[tuple[str, str, str]] = []
+    sc = session_cache()
+    for a in accounts:
+        if a.accountId in config_names:
+            out.append((a.accountId, config_names[a.accountId], "config"))
+            continue
+        if a.name and a.name != "(running creds)":
+            out.append((a.accountId, a.name, "org"))
+            continue
+        try:
+            sess = sc.session_for(a.accountId)
+            info = sess.client("account").get_account_information()
+            name = (info.get("AccountName") or "").strip()
+            if name:
+                out.append((a.accountId, name, "account_api"))
+        except Exception:  # noqa: BLE001 — missing permission / no role: skip
+            pass
+    return out
+
+
+async def upsert_dim_account(conn, resolved: list[tuple[str, str, str]]) -> int:
+    """Write resolved names into dim_account (self-creating for existing
+    stacks — DDL must stay identical to db/schema.sql)."""
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dim_account (
+            accountId    TEXT PRIMARY KEY,
+            account_name TEXT NOT NULL,
+            source       TEXT NOT NULL DEFAULT '',
+            refreshed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    if not resolved:
+        return 0
+    await conn.executemany(
+        """
+        INSERT INTO dim_account (accountId, account_name, source, refreshed_at)
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (accountId) DO UPDATE SET
+            account_name = EXCLUDED.account_name,
+            source       = EXCLUDED.source,
+            refreshed_at = now()
+        """,
+        resolved,
+    )
+    return len(resolved)

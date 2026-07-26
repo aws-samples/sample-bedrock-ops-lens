@@ -1,7 +1,7 @@
 """Latency tab endpoints. Reads f_latency_daily (pre-computed percentiles)."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from .. import db
 from ..filters import FilterSet, build_where, parse_filters
@@ -122,3 +122,45 @@ async def operation_latency(f: FilterSet = Depends(parse_filters)):
         *w.params,
     )
     return db.rows_to_dicts(rows)
+
+
+@router.get("/latency-impacted-accounts")
+async def latency_impacted_accounts(
+    f: FilterSet = Depends(parse_filters),
+    model_id: str = Query(..., min_length=1),
+):
+    """Per-account latency drill for one model over the filter window
+    (Latency tab: click a model bar → which accounts experienced what).
+    Source: f_hourly_status latency_sum/count (invocation logs) — the only
+    account-grain latency in the store. avg only (percentiles aren't
+    additive across the aggregate)."""
+    parts = ["event_date BETWEEN $1::date AND $2::date", "modelId = $3"]
+    params: list = [f.start, f.end, model_id]
+    if f.accounts:
+        parts.append(f"accountId = ANY(${len(params)+1}::text[])")
+        params.append(list(f.accounts))
+    if f.region != "all":
+        parts.append(f"region = ${len(params)+1}")
+        params.append(f.region)
+    if f.endpoint != "all":
+        parts.append(f"endpoint = ${len(params)+1}")
+        params.append(f.endpoint)
+    rows = await db.fetch(
+        f"""
+        SELECT accountId, region,
+          SUM(total_requests)::BIGINT AS total_requests,
+          CASE WHEN SUM(latency_count) > 0
+               THEN SUM(latency_sum_ms) / SUM(latency_count) END AS avg_latency_ms,
+          SUM(latency_count)::BIGINT AS latency_samples,
+          SUM(COALESCE(status_429_count,0))::BIGINT AS throttled,
+          SUM(COALESCE(status_500_count,0) + COALESCE(status_503_count,0))::BIGINT AS errors_5xx
+        FROM f_hourly_status
+        WHERE {' AND '.join(parts)}
+        GROUP BY accountId, region
+        HAVING SUM(latency_count) > 0
+        ORDER BY avg_latency_ms DESC NULLS LAST
+        LIMIT 500
+        """,
+        *params,
+    )
+    return {"model_id": model_id, "rows": db.rows_to_dicts(rows)}

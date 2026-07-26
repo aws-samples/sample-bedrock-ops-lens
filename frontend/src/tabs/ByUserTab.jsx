@@ -22,6 +22,20 @@ function labelShort(label, max = 42) {
   return s.length <= max ? s : '…' + s.slice(-(max - 1));
 }
 
+// Categorical-axis label for a caller. Full assumed-role ARNs
+// (arn:aws:sts::123…:assumed-role/role/session) are far too long for an
+// X axis — with 6+ bars the ticks collide and most vanish (only 2 of 6
+// rendered). Reduce to the human part: "role/session". The table below
+// the chart still carries the full ARN.
+function axisShort(label) {
+  const s = label || 'unknown';
+  const m = s.match(/assumed-role\/(.+)$/);
+  if (m) return labelShort(m[1], 28);
+  // IAM users / other ARNs: keep everything after the last ':'
+  const tail = s.includes(':') ? s.slice(s.lastIndexOf(':') + 1) : s;
+  return labelShort(tail.replace(/^(user|role)\//, ''), 28);
+}
+
 export default function ByUserTab({ filters, onInfo }) {
   // Axis: 'group' = role (app / team / workload), 'user' = session
   // (individual, SSO login), 'principal' = full role/session identity.
@@ -33,7 +47,8 @@ export default function ByUserTab({ filters, onInfo }) {
   const chartSeries = useMemo(() => {
     const data = (summary.data || []).slice(0, 10);
     return [
-      { title: 'Requests', type: 'bar', data: data.map(r => ({ x: labelShort(r.caller || r.principal_label), y: Number(r.total_requests || 0) })) },
+      { title: 'Requests', type: 'bar', valueFormatter: fmt,
+        data: data.map(r => ({ x: axisShort(r.caller || r.principal_label), y: Number(r.total_requests || 0) })) },
     ];
   }, [summary.data]);
 
@@ -72,7 +87,7 @@ export default function ByUserTab({ filters, onInfo }) {
             xScaleType="categorical"
             hideFilter
             ariaLabel="Requests by caller identity"
-            i18nStrings={CHART_I18N}
+            i18nStrings={{ ...CHART_I18N, yTickFormatter: fmt }}
             height={300}
             xTitle="Caller (role/session)" yTitle="Requests"
           />

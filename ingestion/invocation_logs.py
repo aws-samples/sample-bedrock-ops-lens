@@ -324,6 +324,10 @@ async def main() -> int:
                 # it feeds f_hourly_status and the dashboard's "Status Codes" chart.
                 status_buckets: dict[tuple, dict[int, int]] = defaultdict(
                     lambda: {c: 0 for c in STATUS_CODES})
+                # Parallel per-bucket latency accumulator (sum, count) from the
+                # per-request latencyMs — powers the per-account latency in
+                # the accounts-impacted drill-downs (007).
+                status_latency: dict[tuple, list] = defaultdict(lambda: [0.0, 0])
                 # Per (date, account, model, region, principal_arn) → per-caller
                 # aggregates. This is what the "By User" tab reads
                 # (f_daily_by_identity): the IAM identity is captured
@@ -385,6 +389,9 @@ async def main() -> int:
                         sb[status if status in sb else (
                             400 if 400 <= status < 500 else
                             500 if 500 <= status < 600 else 200)] += 1
+                        if latency_ms is not None and latency_ms >= 0:
+                            sl = status_latency[(d, hr, a, mid, r, endpoint)]
+                            sl[0] += latency_ms; sl[1] += 1
                         # Fan out to one row per tag_key. If no tags, write a single
                         # row with sentinel '__none__'.
                         if not metadata:
@@ -489,10 +496,12 @@ async def main() -> int:
                         total = sum(sc.values())
                         if total <= 0:
                             continue
+                        lat = status_latency.get((d, hr, a, mid, r, endpoint), [0.0, 0])
                         status_rows.append((
                             d, hr, a, mid, r, endpoint, total,
                             sc[200], sc[400], sc[403], sc[404], sc[408],
                             sc[424], sc[429], sc[500], sc[503],
+                            lat[0], lat[1],
                         ))
                     if status_rows:
                         await conn.executemany(
@@ -502,8 +511,9 @@ async def main() -> int:
                                 total_requests,
                                 status_200_count, status_400_count, status_403_count,
                                 status_404_count, status_408_count, status_424_count,
-                                status_429_count, status_500_count, status_503_count
-                            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                                status_429_count, status_500_count, status_503_count,
+                                latency_sum_ms, latency_count
+                            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                             ON CONFLICT (event_date, hour, accountId, modelId, region, endpoint)
                             DO UPDATE SET
                                 total_requests   = f_hourly_status.total_requests   + EXCLUDED.total_requests,
@@ -515,7 +525,9 @@ async def main() -> int:
                                 status_424_count = COALESCE(f_hourly_status.status_424_count,0) + EXCLUDED.status_424_count,
                                 status_429_count = COALESCE(f_hourly_status.status_429_count,0) + EXCLUDED.status_429_count,
                                 status_500_count = COALESCE(f_hourly_status.status_500_count,0) + EXCLUDED.status_500_count,
-                                status_503_count = COALESCE(f_hourly_status.status_503_count,0) + EXCLUDED.status_503_count
+                                status_503_count = COALESCE(f_hourly_status.status_503_count,0) + EXCLUDED.status_503_count,
+                                latency_sum_ms = COALESCE(f_hourly_status.latency_sum_ms,0) + EXCLUDED.latency_sum_ms,
+                                latency_count  = COALESCE(f_hourly_status.latency_count,0)  + EXCLUDED.latency_count
                             """,
                             status_rows,
                         )

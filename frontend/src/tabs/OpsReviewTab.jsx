@@ -14,7 +14,7 @@ import {
   Container, Header, SpaceBetween, Box, Button, Alert, Spinner,
   ColumnLayout, ExpandableSection, StatusIndicator, Link, Grid,
 } from '@cloudscape-design/components';
-import { useApi, fmt, fmtPct, api as apiCall, buildUrl } from '../api.js';
+import { useApi, fmt, fmtPct, api as apiCall, buildUrl, fmtAccount, useAccountNames } from '../api.js';
 import { ChartLoading, SectionHeader } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import LifecycleTimeline from '../components/LifecycleTimeline.jsx';
@@ -139,6 +139,7 @@ function KpiRibbon({ counts }) {
 }
 
 export default function OpsReviewTab({ filters, onInfo }) {
+  useAccountNames();   // resolve friendly names for Account cells
   const findings = useApi('/ops-review', filters, [JSON.stringify(filters)]);
   useOrangeActionButtons([findings.data, findings.loading]);
 
@@ -384,7 +385,7 @@ export default function OpsReviewTab({ filters, onInfo }) {
                 pageSize={15}
                 columnDefinitions={[
                   { id: 'sev', header: 'Severity', cell: r => <StatusIndicator type={severityType(r.severity)}>{r.severity}</StatusIndicator> },
-                  { id: 'a',   header: 'Account',  cell: r => r.accountId },
+                  { id: 'a',   header: 'Account',  cell: r => fmtAccount(r.accountId), exportValue: r => r.accountId },
                   { id: 'm',   header: 'Model',    cell: r => r.modelId },
                   { id: 'r',   header: 'Region',   cell: r => r.region },
                   { id: 't',   header: 'Requests', cell: r => fmt(r.total_requests) },
@@ -407,7 +408,7 @@ export default function OpsReviewTab({ filters, onInfo }) {
                 pageSize={10}
                 columnDefinitions={[
                   { id: 'sev', header: 'Trend', cell: r => <StatusIndicator type={severityType(r.severity)}>{r.trend_label}</StatusIndicator> },
-                  { id: 'a', header: 'Account', cell: r => r.accountId },
+                  { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountId), exportValue: r => r.accountId },
                   { id: 'pct', header: 'WoW change', cell: r => `${r.growth_pct >= 0 ? '+' : ''}${r.growth_pct}%` },
                   { id: 'rec', header: 'Recent avg tokens/day', cell: r => fmt(r.recent_avg_tokens_per_day) },
                   { id: 'old', header: 'Earlier avg tokens/day', cell: r => fmt(r.older_avg_tokens_per_day) },
@@ -427,7 +428,7 @@ export default function OpsReviewTab({ filters, onInfo }) {
                 pageSize={10}
                 columnDefinitions={[
                   { id: 'sev', header: 'Severity', cell: r => <StatusIndicator type={severityType(r.severity)}>{r.severity}</StatusIndicator> },
-                  { id: 'a',   header: 'Account', cell: r => r.accountId },
+                  { id: 'a',   header: 'Account', cell: r => fmtAccount(r.accountId), exportValue: r => r.accountId },
                   { id: 'm',   header: 'Model',   cell: r => r.modelId },
                   { id: 'r',   header: 'Region',  cell: r => r.region },
                   { id: 'avg', header: 'Avg output / req', cell: r => fmt(r.avg_output_tokens) },
@@ -450,7 +451,7 @@ export default function OpsReviewTab({ filters, onInfo }) {
                 pageSize={10}
                 columnDefinitions={[
                   { id: 'sev', header: 'Severity', cell: r => <StatusIndicator type={severityType(r.severity)}>{r.severity}</StatusIndicator> },
-                  { id: 'a', header: 'Account', cell: r => r.accountId },
+                  { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountId), exportValue: r => r.accountId },
                   { id: 'm', header: 'Model',   cell: r => r.modelId },
                   { id: 'r', header: 'Region',  cell: r => r.region },
                   { id: 'i', header: 'Avg input',  cell: r => fmt(r.avg_input_tokens) },
@@ -478,7 +479,7 @@ export default function OpsReviewTab({ filters, onInfo }) {
                 items={breakdown}
                 pageSize={20}
                 columnDefinitions={[
-                  { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
+                  { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
                   { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
                   { id: 'r', header: 'Region',  cell: r => r.region },
                   { id: 'op', header: 'Operation', cell: r => r.operation },

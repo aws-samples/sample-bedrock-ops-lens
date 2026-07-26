@@ -216,8 +216,53 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
         _set_argv(argv)
         results.append(await _run_module(name, mod.main))
 
+    # Account-name refresh (008): config map > org name > GetAccountInformation.
+    # Best-effort — a name failure must never fail the ingest run.
+    try:
+        await _refresh_account_names()
+    except Exception as e:  # noqa: BLE001
+        print(f"[dim_account] refresh skipped: {type(e).__name__}: {e}")
+
     _bump_cache_generation()
     return {"runs": results}
+
+
+async def _refresh_account_names() -> None:
+    """Resolve + upsert friendly names for every monitored account."""
+    import asyncpg
+    try:
+        from ingestion.accounts import (discover_accounts, resolve_account_names,
+                                        upsert_dim_account)
+        from ingestion.config import load_config
+    except ImportError:
+        from accounts import (discover_accounts, resolve_account_names,  # type: ignore
+                              upsert_dim_account)
+        from config import load_config  # type: ignore
+
+    class _A:
+        accounts = None
+        accounts_config = None
+        discover_org = False
+
+    accounts = discover_accounts(_A())
+    cfg_names = load_config().account_names
+    resolved = resolve_account_names(accounts, cfg_names)
+
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        try:
+            from app.config import _compose_database_url  # type: ignore
+        except ImportError:
+            from backend.app.config import _compose_database_url  # type: ignore
+        db_url = _compose_database_url() or ""
+    conn = await asyncpg.connect(db_url)
+    try:
+        n = await upsert_dim_account(conn, resolved)
+        print(f"[dim_account] {n} names resolved "
+              f"({', '.join(sorted(set(s for _, _, s in resolved))) or 'none'})")
+    finally:
+        await conn.close()
+
 
 
 async def _purge_proxy() -> dict:

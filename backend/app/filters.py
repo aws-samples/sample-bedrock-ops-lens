@@ -144,14 +144,18 @@ def build_where(
     has_traffic_type: bool = True,
     has_account: bool = True,
     has_endpoint: bool = True,
+    has_model: bool = True,
 ) -> Where:
     """Build a WHERE-clause fragment from the FilterSet.
 
-    `has_traffic_type`, `has_account`, `has_endpoint` let you turn off
-    filters when the target table doesn't have those columns (e.g.,
+    `has_traffic_type`, `has_account`, `has_endpoint`, `has_model` let you
+    turn off filters when the target table doesn't have those columns (e.g.,
     f_daily_cost has no `endpoint` column — Cost Explorer is endpoint-
     agnostic, so passing `has_endpoint=False` makes the cost router
-    immune to UI endpoint switches).
+    immune to UI endpoint switches). `has_model=False` is for tables with
+    no modelId column (f_daily_guardrails, f_daily_agentcore) — otherwise
+    the global provider filter generates SQL against a missing column and
+    the route 500s, which the UI shows as stale data.
     """
     a = (table_alias + ".") if table_alias else ""
     parts: list[str] = []
@@ -161,7 +165,7 @@ def build_where(
     parts.append(f"{a}event_date BETWEEN ${len(params)+1}::date AND ${len(params)+2}::date")
     params.extend([f.start, f.end])
 
-    if f.provider != "all":
+    if has_model and f.provider != "all":
         parts.append(f"{a}modelId LIKE ${len(params)+1}")
         params.append(PROVIDER_PREFIX[f.provider] + "%")
 

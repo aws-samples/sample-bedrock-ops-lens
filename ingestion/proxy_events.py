@@ -170,11 +170,26 @@ def _extract_dimensions(e: dict) -> dict:
     return dims
 
 
+# Recognized endpoint paths. runtime/mantle are Bedrock; the direct-API values
+# exist ONLY in client telemetry (nothing AWS-side can see that traffic). A few
+# aliases map emitter vocab (gen_ai.provider.name, LiteLLM provider names) onto
+# our enum; anything unrecognized falls back to runtime rather than dropping.
+_ENDPOINTS = ("runtime", "mantle", "anthropic-api", "openai-api")
+_ENDPOINT_ALIASES = {
+    "bedrock": "runtime", "bedrock-runtime": "runtime",
+    "bedrock-mantle": "mantle",
+    "anthropic": "anthropic-api", "anthropic_api": "anthropic-api",
+    "openai": "openai-api", "openai_api": "openai-api",
+    "azure-openai": "openai-api", "azure_openai": "openai-api",
+}
+
+
 def _parse_event(e: dict):
     """Normalize one proxy event. Returns a tuple or None if unusable.
 
     (ts, event_date, hour, dimensions_dict, modelId, endpoint, region, accountId,
-     in_tok, out_tok, cache_read, status, throttled, latency_ms, request_id)
+     in_tok, out_tok, cache_read, status, throttled, latency_ms,
+     ttft_ms, retry_attempts, cost_usd_est, request_id)
     """
     ts_raw = e.get("ts") or e.get("timestamp")
     model = (e.get("model") or e.get("modelId") or "").strip()
@@ -187,8 +202,9 @@ def _parse_event(e: dict):
 
     dimensions = _extract_dimensions(e)
 
-    endpoint = (e.get("endpoint") or "runtime").lower()
-    if endpoint not in ("runtime", "mantle"):
+    endpoint = (e.get("endpoint") or "runtime").strip().lower()
+    endpoint = _ENDPOINT_ALIASES.get(endpoint, endpoint)
+    if endpoint not in _ENDPOINTS:
         endpoint = "runtime"
     region = (e.get("region") or "").strip() or "unknown"
     account = (e.get("accountId") or e.get("account_id") or "__none__").strip() or "__none__"
@@ -204,11 +220,18 @@ def _parse_event(e: dict):
     cache_read = _int(e.get("cache_read_tokens"))
     status = _int(e.get("status")) or 200
     throttled = bool(e.get("throttled")) or status == 429
-    latency = e.get("latency_ms")
-    try:
-        latency_ms = float(latency) if latency is not None else None
-    except (TypeError, ValueError):
-        latency_ms = None
+    def _float(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    latency_ms = _float(e.get("latency_ms") or e.get("duration_ms"))
+    # Client-telemetry extras (all optional; emitter vocab aliases accepted).
+    ttft_ms = _float(e.get("ttft_ms") or e.get("time_to_first_token_ms")
+                     or e.get("time_to_first_chunk_ms"))
+    retry_attempts = _int(e.get("retry_attempts") or e.get("attempt")) or None
+    cost_usd_est = _float(e.get("cost_usd_est") or e.get("cost_usd"))
     # Idempotency key. Fall back to a synthetic one if the proxy omitted it,
     # combining the fields so identical re-reads dedupe but distinct calls don't.
     request_id = (e.get("request_id") or e.get("id") or "").strip()
@@ -217,7 +240,8 @@ def _parse_event(e: dict):
         request_id = f"{dim_sig}:{model}:{ts_raw}:{in_tok}:{out_tok}"
 
     return (dt, dt.date(), dt.hour, dimensions, model, endpoint, region, account,
-            in_tok, out_tok, cache_read, status, throttled, latency_ms, request_id)
+            in_tok, out_tok, cache_read, status, throttled, latency_ms,
+            ttft_ms, retry_attempts, cost_usd_est, request_id)
 
 
 def _pct(sorted_vals: list[float], p: float):
@@ -253,7 +277,7 @@ async def main() -> int:
         rollup: dict[tuple, dict] = defaultdict(lambda: {
             "total_requests": 0, "input_tokens": 0, "output_tokens": 0,
             "cache_read_tokens": 0, "throttled_count": 0, "error_count": 0,
-            "latencies": [],
+            "latencies": [], "ttfts": [], "retried_count": 0, "cost_usd_est": 0.0,
         })
         raw_rows: list[tuple] = []
         raw_cutoff = (end - timedelta(days=RAW_RETENTION_DAYS)).date()
@@ -274,7 +298,7 @@ async def main() -> int:
                         continue
                     (ts, ev_date, hr, dimensions, model, endpoint, region_v, account,
                      in_tok, out_tok, cache_read, status, throttled, latency_ms,
-                     request_id) = parsed
+                     ttft_ms, retry_attempts, cost_usd_est, request_id) = parsed
                     obj_rows += 1
 
                     # Fan out: one rollup bucket per (dim_key, dim_value).
@@ -291,12 +315,19 @@ async def main() -> int:
                             b["error_count"] += 1
                         if latency_ms is not None and latency_ms >= 0:
                             b["latencies"].append(latency_ms)
+                        if ttft_ms is not None and ttft_ms >= 0:
+                            b["ttfts"].append(ttft_ms)
+                        if retry_attempts is not None and retry_attempts > 1:
+                            b["retried_count"] += 1
+                        if cost_usd_est:
+                            b["cost_usd_est"] += cost_usd_est
 
                     if ev_date >= raw_cutoff:
                         raw_rows.append((
                             ts, ev_date, json.dumps(dimensions), model, endpoint,
                             region_v, account, in_tok, out_tok, cache_read, status,
-                            throttled, latency_ms, request_id,
+                            throttled, latency_ms, ttft_ms, retry_attempts,
+                            cost_usd_est, request_id,
                         ))
 
                 new_keys.append((key, obj_rows))
@@ -309,8 +340,9 @@ async def main() -> int:
                 INSERT INTO f_request_events (
                     ts, event_date, dimensions, modelId, endpoint, region, accountId,
                     input_tokens, output_tokens, cache_read_tokens,
-                    status, throttled, latency_ms, request_id
-                ) VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    status, throttled, latency_ms,
+                    ttft_ms, retry_attempts, cost_usd_est, request_id
+                ) VALUES ($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
                 ON CONFLICT (event_date, request_id, ts) DO NOTHING
                 """,
                 raw_rows,
@@ -321,11 +353,14 @@ async def main() -> int:
             roll_rows = []
             for (ev_date, hr, dim_key, dim_value, model, endpoint, region_v, account), m in rollup.items():
                 lat = sorted(m["latencies"])
+                ttf = sorted(m["ttfts"])
                 roll_rows.append((
                     ev_date, hr, dim_key, dim_value, model, endpoint, region_v, account,
                     m["total_requests"], m["input_tokens"], m["output_tokens"],
                     m["cache_read_tokens"], m["throttled_count"], m["error_count"],
                     _pct(lat, 0.50), _pct(lat, 0.90), _pct(lat, 0.99),
+                    _pct(ttf, 0.50), _pct(ttf, 0.90),
+                    m["retried_count"], round(m["cost_usd_est"], 6),
                 ))
             await conn.executemany(
                 """
@@ -333,8 +368,9 @@ async def main() -> int:
                     event_date, hour, dim_key, dim_value, modelId, endpoint, region, accountId,
                     total_requests, input_tokens, output_tokens, cache_read_tokens,
                     throttled_count, error_count,
-                    p50_latency_ms, p90_latency_ms, p99_latency_ms
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                    p50_latency_ms, p90_latency_ms, p99_latency_ms,
+                    p50_ttft_ms, p90_ttft_ms, retried_count, cost_usd_est
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
                 ON CONFLICT (event_date, hour, dim_key, dim_value, modelId, endpoint, region, accountId)
                 DO UPDATE SET
                     total_requests   = f_proxy_dim_hourly.total_requests   + EXCLUDED.total_requests,
@@ -348,7 +384,11 @@ async def main() -> int:
                     -- for the reporting use case worst-of is acceptable and honest).
                     p50_latency_ms = GREATEST(COALESCE(f_proxy_dim_hourly.p50_latency_ms,0), COALESCE(EXCLUDED.p50_latency_ms,0)),
                     p90_latency_ms = GREATEST(COALESCE(f_proxy_dim_hourly.p90_latency_ms,0), COALESCE(EXCLUDED.p90_latency_ms,0)),
-                    p99_latency_ms = GREATEST(COALESCE(f_proxy_dim_hourly.p99_latency_ms,0), COALESCE(EXCLUDED.p99_latency_ms,0))
+                    p99_latency_ms = GREATEST(COALESCE(f_proxy_dim_hourly.p99_latency_ms,0), COALESCE(EXCLUDED.p99_latency_ms,0)),
+                    p50_ttft_ms = GREATEST(COALESCE(f_proxy_dim_hourly.p50_ttft_ms,0), COALESCE(EXCLUDED.p50_ttft_ms,0)),
+                    p90_ttft_ms = GREATEST(COALESCE(f_proxy_dim_hourly.p90_ttft_ms,0), COALESCE(EXCLUDED.p90_ttft_ms,0)),
+                    retried_count = f_proxy_dim_hourly.retried_count + EXCLUDED.retried_count,
+                    cost_usd_est  = f_proxy_dim_hourly.cost_usd_est  + EXCLUDED.cost_usd_est
                 """,
                 roll_rows,
             )

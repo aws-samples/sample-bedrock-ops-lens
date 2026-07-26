@@ -92,6 +92,14 @@ Resources:
               - bedrock:GetFoundationModel
               - bedrock:ListInferenceProfiles
             Resource: '*'
+          # Account name — lets the dashboard label this account with its
+          # friendly name instead of the bare 12-digit ID. Self-scoped
+          # read-only; works without AWS Organizations. See dim_account.
+          - Sid: AccountNameRead
+            Effect: Allow
+            Action:
+              - account:GetAccountInformation
+            Resource: '*'
 
 Outputs:
   RoleArn:

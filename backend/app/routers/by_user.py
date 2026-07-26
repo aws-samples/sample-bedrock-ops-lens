@@ -49,7 +49,7 @@ async def by_user_summary(
       user      — the session name: individual caller (SSO login)
     """
     col = GROUP_BY_COL[group_by]
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_endpoint=False)
     rows = await db.fetch(
         f"""
         SELECT
@@ -76,7 +76,7 @@ async def by_user_summary(
 @router.get("/by-user/by-model")
 async def by_user_by_model(f: FilterSet = Depends(parse_filters)):
     """Principal × model split — which models each caller uses."""
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_endpoint=False)
     rows = await db.fetch(
         f"""
         SELECT
@@ -102,7 +102,7 @@ async def by_user_daily_trend(
     top_n: int = Query(8, ge=1, le=30),
 ):
     """Daily request trend for the top-N principals in the window."""
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_endpoint=False)
     rows = await db.fetch(
         f"""
         WITH top AS (

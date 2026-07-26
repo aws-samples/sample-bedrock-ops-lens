@@ -4,7 +4,7 @@ import {
   Container, Header, SpaceBetween, ColumnLayout, PieChart, LineChart,
   Box, Badge, Spinner, StatusIndicator,
 } from '@cloudscape-design/components';
-import { useApi, fmt, fmtPct } from '../api.js';
+import { useApi, fmt, fmtPct, fmtAccount, useAccountNames } from '../api.js';
 import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
@@ -20,6 +20,7 @@ function severityType(p) {
 }
 
 export default function OpsInsightsTab({ filters, onInfo }) {
+  useAccountNames();   // resolve friendly names for Account cells
   // CRIS adoption is a bedrock-runtime concept (Mantle is in-region only,
   // no CRIS aggregation). Keep coverage='full' for runtime; for Mantle
   // we still render the body but several charts will simply be empty
@@ -192,7 +193,7 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
           <PaginatedTable
             items={(crisGaps.data || []).filter(r => Number(r.od_requests) > 0 && Number(r.cris_requests || 0) === 0)}
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'o', header: 'OD requests', cell: r => fmt(r.od_requests) },
             ]}
@@ -225,7 +226,7 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
           <PaginatedTable
             items={throttle.data || []}
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
               { id: 'rate', header: 'Throttle %', cell: r => <StatusIndicator type={severityType(Number(r.throttle_pct || 0))}>{fmtPct(r.throttle_pct, 3)}</StatusIndicator> },
@@ -242,7 +243,7 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
           <PaginatedTable
             items={shape.data || []}
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
               { id: 'i', header: 'Avg input',  cell: r => fmt(r.avg_input) },
@@ -273,7 +274,7 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
             items={peak.data || []}
             downloadFileName="bedrock-rpm-tpm.csv"
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
               { id: 'rpm', header: 'Peak RPM (hr × 60)', cell: r => <Box fontWeight="bold">{fmt(Number(r.peak_requests_hour || 0))}</Box> },
@@ -290,7 +291,7 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
           <PaginatedTable
             items={burndown.data || []}
             columnDefinitions={[
-              { id: 'a', header: 'Account', cell: r => r.accountid || r.accountId },
+              { id: 'a', header: 'Account', cell: r => fmtAccount(r.accountid || r.accountId), exportValue: r => r.accountid || r.accountId },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
               { id: 'p', header: 'Peak TPM (quota)',  cell: r => fmt(r.peak_tpm) },

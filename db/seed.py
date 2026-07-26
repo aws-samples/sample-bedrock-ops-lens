@@ -519,9 +519,16 @@ def seed_hourly_status(cur, today: date, rng: random.Random) -> int:
                             s503 = int(total * rng.uniform(0.0, 0.004))
                             errs = s429 + s400 + s403 + s404 + s408 + s424 + s500 + s503
                             s200 = max(0, total - errs)
+                            # Per-account latency (007): plausible avg per model
+                            # tier × sample count — powers the accounts-impacted
+                            # and per-account latency drill-downs.
+                            t = LATENCY_TIERS[latency_tier(model)]
+                            lat_avg = t["p50"] * rng.uniform(0.8, 1.3)
+                            lat_n = max(1, int(total * rng.uniform(0.6, 1.0)))
                             rows.append((
                                 d, hour, acct, model, region, endpoint, total,
                                 s200, s400, s403, s404, s408, s424, s429, s500, s503,
+                                lat_avg * lat_n, lat_n,
                             ))
     cur.executemany(
         """
@@ -529,8 +536,9 @@ def seed_hourly_status(cur, today: date, rng: random.Random) -> int:
             event_date, hour, accountId, modelId, region, endpoint, total_requests,
             status_200_count, status_400_count, status_403_count,
             status_404_count, status_408_count, status_424_count,
-            status_429_count, status_500_count, status_503_count
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            status_429_count, status_500_count, status_503_count,
+            latency_sum_ms, latency_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         rows,
     )
@@ -760,6 +768,358 @@ def seed_quotas(cur, rng: random.Random) -> int:
     return len(rows)
 
 
+# ---------------------------------------------------------------------------
+# Pierre's governance/agent tabs — By User, Compliance, Agents & MCP
+# ---------------------------------------------------------------------------
+# Per-account caller fleets. Roles model teams/apps (the trustworthy "group"
+# axis); sessions model SSO logins or service instances (the "user" axis).
+# Human-session roles (adhoc/notebook) rotate through people; service roles
+# keep one stable session per day — matches the real identity.arn shape.
+_ROLE_POOL = [
+    # (role name, [sessions], relative weight, is_human)
+    ("ml-platform-prod",       ["genai-gateway"],                       1.00, False),
+    ("search-reco-svc",        ["reco-ranker", "query-expand"],         0.55, False),
+    ("genai-chatbot-prod",     ["chat-orchestrator"],                   0.40, False),
+    ("data-science-adhoc",     ["jsmith", "achen", "mgarcia", "tpatel"], 0.18, True),
+    ("batch-eval-pipeline",    ["nightly-eval"],                        0.12, False),
+    ("sagemaker-notebook-role", ["priyak", "dwilliams"],                0.06, True),
+]
+
+
+def _principals_for(acct: str) -> list[tuple[str, str, str, str, float]]:
+    """Stable per-account principal set: (arn, label, group, user, weight).
+    Whales run the full role fleet; small accounts just a couple — so the
+    By User tab's top-N is dominated by whale principals, matching f_daily."""
+    idx = ACCOUNTS.index(acct)
+    n_roles = 6 if idx < 2 else (4 if idx < 5 else 2)
+    out = []
+    for role, sessions, weight, is_human in _ROLE_POOL[:n_roles]:
+        for sess in sessions:
+            arn = f"arn:aws:sts::{acct}:assumed-role/{role}/{sess}"
+            out.append((arn, f"{role}/{sess}", role, sess,
+                        weight / len(sessions)))
+    return out
+
+
+def seed_by_identity(cur, today: date, rng: random.Random) -> int:
+    """f_daily_by_identity — per IAM caller attribution (By User tab).
+    Volumes reuse account_weight() and MODEL_REQ_WEIGHT so per-caller totals
+    aggregate back up consistent with f_daily's account/model shape."""
+    rows = []
+    for d_offset in range(DAYS):
+        d = today - timedelta(days=d_offset)
+        wd_mult = weekday_curve(d)
+        for acct in ACCOUNTS:
+            acct_factor = account_weight(acct)
+            for arn, label, group, user, p_weight in _principals_for(acct):
+                # Each principal sticks to a small stable model set (teams
+                # standardize on 1-3 models) — stable hash pick, not rng, so
+                # the set survives call-order changes.
+                import hashlib
+                h = int.from_bytes(hashlib.sha256(arn.encode()).digest()[:4], "big")
+                models = [MODELS[(h + i * 3) % len(MODELS)] for i in range(1 + h % 3)]
+                for model in set(models):
+                    m_factor = model_size_factor(model)
+                    for region in rng.sample(REGIONS, k=rng.choice([1, 2])):
+                        base = 90000 * acct_factor * p_weight * m_factor * wd_mult
+                        total = max(1, int(base * rng.uniform(0.6, 1.4)))
+                        failed = int(total * rng.uniform(0.001, 0.02))
+                        in_tok, out_tok, _cr, _cw = tokens_for(model, total, rng)
+                        rows.append((d, acct, model, region, arn, label,
+                                     group, user, total, failed, in_tok, out_tok))
+    cur.executemany(
+        """
+        INSERT INTO f_daily_by_identity (
+            event_date, accountId, modelId, region, principal_arn,
+            principal_label, principal_group, principal_user,
+            total_requests, failed_requests,
+            total_input_tokens, total_output_tokens
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (event_date, accountId, modelId, region, principal_arn)
+        DO UPDATE SET total_requests = EXCLUDED.total_requests
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+def seed_client_telemetry(cur, today: date, rng: random.Random) -> int:
+    """f_proxy_dim_hourly — client-reported telemetry (Workloads tab + the
+    By-Provider panel). Seeds per-user events across all four paths so the
+    demo shows what only client telemetry can: direct anthropic-api /
+    openai-api traffic, client TTFT on mantle, retries, and estimated cost.
+
+    Fleet shape mirrors an enterprise (Adobe/Salesforce scale): ~1,500
+    distinct users on a power law — a heavy head with daily activity and a
+    long tail of occasional users — WITHOUT exploding the hourly table
+    (tail users get a handful of sparse buckets, not a dense grid)."""
+    first = ["priya", "david", "jane", "alex", "maria", "wei", "raj", "sofia",
+             "tom", "nina", "omar", "lena", "carlos", "yuki", "ivan", "amara",
+             "sam", "kate", "leo", "zara"]
+    last = ["k", "williams", "smith", "chen", "garcia", "patel", "nguyen",
+            "mueller", "silva", "tanaka", "brown", "rossi", "kim", "lopez",
+            "singh", "dubois", "novak", "haddad", "olsen", "costa"]
+    teams = [f"{t}" for t in (
+        "ml-platform", "search-reco", "chat-platform", "data-science",
+        "fraud-detection", "content-gen", "sales-assist", "doc-intel",
+        "code-assist", "support-ai", "marketing-ai", "risk-analytics",
+        "personalization", "voice-ai", "translation", "summarization",
+        "qa-automation", "knowledge-base", "billing-ai", "hr-assist",
+        "legal-review", "catalog-ai", "logistics-ai", "growth-ml", "sec-ops")]
+    N_USERS = 1500
+    users = []
+    # Workload/BU axes ride along with team (stable mapping team → workload/BU
+    # so the numbers agree when pivoting between axes).
+    _WORKLOADS = ["search-service", "chat-assistant", "doc-summarizer",
+                  "reco-engine", "fraud-scorer", "content-pipeline",
+                  "support-triage", "code-review-bot", "sales-insights",
+                  "kb-retrieval", "voice-transcribe", "batch-eval"]
+    _BUSINESS_UNITS = ["retail", "finance", "enterprise", "consumer", "platform"]
+    for i in range(N_USERS):
+        name = f"{first[i % 20]}{last[(i // 20) % 20]}{i // 400 or ''}"
+        # Power law: user #1 weight 1.0, #100 ~0.02, #1000 ~0.002.
+        weight = 1.0 / ((i + 1) ** 0.85)
+        users.append((f"{name}@example.com", teams[i % len(teams)], weight))
+
+    # (model, endpoint, share, $/1K-ish blended, ttft base)
+    paths = [
+        ("us.anthropic.claude-sonnet-5",  "runtime",       0.55, 0.011, None),
+        ("anthropic.claude-opus-4-8",     "mantle",        0.15, 0.075, 420),
+        ("claude-sonnet-5",               "anthropic-api", 0.20, 0.012, 300),
+        ("gpt-5.2-mini",                  "openai-api",    0.10, 0.002, 140),
+    ]
+    hours = (9, 11, 14, 16, 20)
+    rows = []
+    for rank, (user, team, w) in enumerate(users):
+        # Density scales with rank: head users are active most days on most
+        # paths; tail users appear in only a few sparse buckets.
+        if rank < 50:
+            buckets = [(d, h, p) for d in range(30) for h in hours for p in paths]
+            keep = 1.0
+        elif rank < 300:
+            buckets = [(d, h, p) for d in range(30) for h in rng.sample(hours, 2)
+                       for p in rng.sample(paths, 2)]
+            keep = 0.5
+        else:
+            n = rng.randint(2, 8)
+            buckets = [(rng.randrange(30), rng.choice(hours), rng.choice(paths))
+                       for _ in range(n)]
+            keep = 1.0
+        for d_offset, hour, (model, ep, share, rate, ttft_base) in buckets:
+            if keep < 1.0 and rng.random() > keep:
+                continue
+            d = today - timedelta(days=d_offset)
+            base = 1100 * w * share * weekday_curve(d) * rng.uniform(0.6, 1.4)
+            reqs = max(1, int(base))
+            in_tok = reqs * rng.randint(3000, 12000)
+            out_tok = reqs * rng.randint(150, 700)
+            cache = int(in_tok * (0.7 if "claude" in model or "anthropic" in model else 0.2))
+            errs = int(reqs * rng.uniform(0.0, 0.02))
+            # Throttling concentrates in the heavy head (they hit limits);
+            # the tail almost never throttles — matches real fleets.
+            thr = int(reqs * rng.uniform(0.0, 0.02)) if rank < 40 and rng.random() < 0.3 else 0
+            retried = int(reqs * rng.uniform(0.0, 0.05))
+            lat = rng.uniform(1500, 4500) if "sonnet" in model else rng.uniform(3000, 9000)
+            ttft50 = ttft_base * rng.uniform(0.8, 1.1) if ttft_base else None
+            ttft90 = ttft_base * rng.uniform(1.6, 2.6) if ttft_base else None
+            cost = round((in_tok + out_tok * 4) / 1000 * rate * 0.001 * 1000, 4)
+            # Every request carries the FULL dimension map — the identity axes
+            # (user/team) AND the workload-attribution axes (workload/env/
+            # business_unit) that are the original workload-attribution story. Dropping the
+            # latter when the fleet scaled up broke the Settings key picker and
+            # the Workloads pivot (regression caught by the user 2026-07-26).
+            team_idx = teams.index(team)
+            workload = _WORKLOADS[team_idx % len(_WORKLOADS)]
+            env = "prod" if (rank + d_offset) % 5 else ("staging" if rank % 2 else "dev")
+            bu = _BUSINESS_UNITS[team_idx % len(_BUSINESS_UNITS)]
+            for dk, dv in (("user", user), ("team", team), ("workload", workload),
+                           ("env", env), ("business_unit", bu)):
+                rows.append((d, hour, dk, dv, model, ep, "us-east-1", "__none__",
+                             reqs, in_tok, out_tok, cache, thr, errs,
+                             lat, lat * 1.8, lat * 3.2, ttft50, ttft90,
+                             retried, cost))
+
+    # Pre-aggregate: many users share a team, so team rows collide on the PK
+    # (and the upsert REPLACES rather than adds). Merge duplicates in Python —
+    # sums for counts/cost, max for the percentile columns.
+    merged: dict = {}
+    for r in rows:
+        key = r[:8]
+        m = merged.get(key)
+        if m is None:
+            merged[key] = list(r)
+            continue
+        for i in (8, 9, 10, 11, 12, 13, 19):          # reqs/tokens/thr/errs/retried
+            m[i] += r[i]
+        for i in (14, 15, 16, 17, 18):                 # latency/ttft percentiles
+            a, b = m[i], r[i]
+            m[i] = max(a, b) if (a is not None and b is not None) else (a if a is not None else b)
+        m[20] = round(m[20] + r[20], 4)                # cost
+    rows = [tuple(v) for v in merged.values()]
+    cur.executemany(
+        """
+        INSERT INTO f_proxy_dim_hourly (
+            event_date, hour, dim_key, dim_value, modelId, endpoint, region, accountId,
+            total_requests, input_tokens, output_tokens, cache_read_tokens,
+            throttled_count, error_count,
+            p50_latency_ms, p90_latency_ms, p99_latency_ms,
+            p50_ttft_ms, p90_ttft_ms, retried_count, cost_usd_est
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (event_date, hour, dim_key, dim_value, modelId, endpoint, region, accountId)
+        DO UPDATE SET total_requests = EXCLUDED.total_requests
+        """,
+        rows,
+    )
+    # Refresh the dimension picker source like the real ingester does.
+    cur.execute("DELETE FROM dim_proxy_dimensions")
+    cur.execute("""
+        INSERT INTO dim_proxy_dimensions (dim_key, dim_value, first_seen, last_seen, total_requests_30d, endpoints)
+        SELECT dim_key, dim_value, MIN(event_date), MAX(event_date), SUM(total_requests),
+               array_agg(DISTINCT endpoint)
+        FROM f_proxy_dim_hourly
+        WHERE event_date >= current_date - INTERVAL '30 days'
+        GROUP BY dim_key, dim_value
+    """)
+    return len(rows)
+
+
+# Guardrails: only some accounts have them deployed (whales + one mid) —
+# realistic, and it keeps the Compliance tab's by-guardrail table readable.
+_GUARDRAILS = [
+    # (account index, guardrail id, version)
+    (0, "prod-content-safety", "3"),
+    (0, "pii-shield",          "1"),
+    (1, "prod-content-safety", "2"),
+    (3, "brand-safety-filter", "DRAFT"),
+]
+_POLICY_TYPES = ["CONTENT_FILTER", "DENIED_TOPIC", "SENSITIVE_INFORMATION", "WORD_FILTER"]
+# CONTENT_FILTER dominates interventions in real fleets.
+_POLICY_WEIGHTS = [0.62, 0.16, 0.15, 0.07]
+
+
+def seed_guardrails(cur, today: date, rng: random.Random) -> int:
+    """f_daily_guardrails — Compliance tab. Grain contract (compliance.py):
+    the '__all__'/'__all__' row carries invocations + total intervened
+    (totals / by-guardrail / daily-trend); per-policy rows carry intervened +
+    text_units with content_source='__all__' (summary excludes '__all__')."""
+    rows = []
+    for d_offset in range(DAYS):
+        d = today - timedelta(days=d_offset)
+        wd_mult = weekday_curve(d)
+        for acct_idx, gr_id, version in _GUARDRAILS:
+            acct = ACCOUNTS[acct_idx]
+            for region in ("us-east-1", "us-west-2"):
+                arn = f"arn:aws:bedrock:{region}:{acct}:guardrail/{gr_id}"
+                base = 45000 * account_weight(acct) * wd_mult
+                invocations = max(10, int(base * rng.uniform(0.7, 1.3)))
+                # Intervention rate: content-safety guardrails sit ~2-6%.
+                intervened_total = int(invocations * rng.uniform(0.02, 0.06))
+                text_units_total = invocations * rng.randint(2, 6)
+                # Per-policy split of the interventions.
+                remaining = intervened_total
+                for i, (pt, pw) in enumerate(zip(_POLICY_TYPES, _POLICY_WEIGHTS)):
+                    part = remaining if i == len(_POLICY_TYPES) - 1 \
+                        else int(intervened_total * pw * rng.uniform(0.8, 1.2))
+                    part = min(part, remaining)
+                    remaining -= part
+                    if part == 0:
+                        continue
+                    rows.append((d, acct, region, arn, version, pt, "__all__",
+                                 0, part, int(text_units_total * pw)))
+                # Rollup row: the only grain carrying Invocations.
+                rows.append((d, acct, region, arn, version, "__all__", "__all__",
+                             invocations, intervened_total, text_units_total))
+    cur.executemany(
+        """
+        INSERT INTO f_daily_guardrails (
+            event_date, accountId, region, guardrail_arn, guardrail_version,
+            policy_type, content_source, invocations, intervened, text_units
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (event_date, accountId, region, guardrail_arn,
+                     guardrail_version, policy_type, content_source)
+        DO UPDATE SET invocations = EXCLUDED.invocations
+        """,
+        rows,
+    )
+    return len(rows)
+
+
+# AgentCore fleets: whale accounts only. Runtimes feed the summary pivot;
+# tools feed the MCP gateway-tools panel (resource_type IN gateway/tool).
+_AGENT_RUNTIMES = [
+    # (account index, runtime id, invocations/day base, err rate)
+    (0, "customer-support-agent", 42000, 0.012),
+    (0, "code-assist-agent",      18000, 0.008),
+    (1, "ops-copilot",             9500, 0.020),
+    (3, "doc-summarizer-agent",    2200, 0.005),
+]
+_MCP_TOOLS = [
+    # (account index, tool name, calls/day base)
+    (0, "search_knowledge_base", 65000),
+    (0, "create_ticket",         12000),
+    (0, "lookup_order",          28000),
+    (1, "query_metrics",          7400),
+    (1, "run_diagnostic",         3100),
+]
+
+
+def seed_agentcore(cur, today: date, rng: random.Random) -> int:
+    """f_daily_agentcore — Agents & MCP tab. Metric-per-row (agents.py pivots
+    Invocations/SessionCount/SystemErrors/UserErrors/Throttles at stat='sum'
+    and Latency at stat='average'/'p99' for resource_type IN runtime/account;
+    gateway/tool rows feed /agents/gateway-tools)."""
+    ns = "bedrock-agentcore"
+    rows = []
+    for d_offset in range(DAYS):
+        d = today - timedelta(days=d_offset)
+        wd_mult = weekday_curve(d)
+        for acct_idx, rt_id, inv_base, err_rate in _AGENT_RUNTIMES:
+            acct, region = ACCOUNTS[acct_idx], "us-east-1"
+            inv = max(1, int(inv_base * wd_mult * rng.uniform(0.7, 1.3)))
+            sessions = int(inv * rng.uniform(0.10, 0.25))   # multi-turn sessions
+            sys_err = int(inv * err_rate * rng.uniform(0.2, 0.5))
+            usr_err = int(inv * err_rate) - sys_err
+            throttles = int(inv * rng.uniform(0.0, 0.004))
+            avg_lat = rng.uniform(2800, 9500)               # agent loops are slow
+            p99_lat = avg_lat * rng.uniform(3.0, 6.5)
+            for metric, stat, value in (
+                ("Invocations",  "sum",     inv),
+                ("SessionCount", "sum",     sessions),
+                ("SystemErrors", "sum",     sys_err),
+                ("UserErrors",   "sum",     max(0, usr_err)),
+                ("Throttles",    "sum",     throttles),
+                ("Latency",      "average", avg_lat),
+                ("Latency",      "p99",     p99_lat),
+            ):
+                rows.append((d, acct, region, ns, "runtime", rt_id,
+                             metric, stat, float(value)))
+        for acct_idx, tool, call_base in _MCP_TOOLS:
+            acct, region = ACCOUNTS[acct_idx], "us-east-1"
+            calls = max(1, int(call_base * wd_mult * rng.uniform(0.7, 1.3)))
+            avg_lat = rng.uniform(120, 900)                 # tool calls are fast
+            for metric, stat, value in (
+                ("Invocations", "sum",     calls),
+                ("Errors",      "sum",     int(calls * rng.uniform(0.0, 0.01))),
+                ("Latency",     "average", avg_lat),
+                ("Latency",     "p99",     avg_lat * rng.uniform(2.5, 5.0)),
+            ):
+                rows.append((d, acct, region, ns, "tool", tool,
+                             metric, stat, float(value)))
+    cur.executemany(
+        """
+        INSERT INTO f_daily_agentcore (
+            event_date, accountId, region, namespace,
+            resource_type, resource_id, metric_name, stat, value
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (event_date, accountId, region, namespace,
+                     resource_type, resource_id, metric_name, stat)
+        DO UPDATE SET value = EXCLUDED.value
+        """,
+        rows,
+    )
+    return len(rows)
+
+
 def refresh_dim_tags(cur) -> int:
     """Recompute dim_tags from f_daily_tagged."""
     cur.execute("DELETE FROM dim_tags")
@@ -806,6 +1166,14 @@ def truncate_facts(cur) -> None:
             dim_tags, ingestion_days, ingestion_meta
         """
     )
+    # Pierre's governance tables — existence-checked (no try/except: a failed
+    # TRUNCATE would abort the transaction and undo the truncate above) so
+    # seeding still works against an older DB that predates them.
+    for tbl in ("f_daily_by_identity", "f_daily_guardrails", "f_daily_agentcore",
+                "f_proxy_dim_hourly", "dim_proxy_dimensions"):
+        cur.execute("SELECT to_regclass(%s)", (tbl,))
+        if cur.fetchone()[0] is not None:
+            cur.execute(sql.SQL("TRUNCATE {}").format(sql.Identifier(tbl)))
 
 
 def main() -> int:
@@ -881,6 +1249,29 @@ def main() -> int:
             print("[7/8] seeding f_context_length...")
             n = seed_context_length(cur, today, rng)
             print(f"      {n:,} rows")
+
+            # Governance/agent tabs (By User / Compliance / Agents & MCP).
+            # Existence-guarded: an older DB without these tables still seeds.
+            def _has(tbl):
+                cur.execute("SELECT to_regclass(%s)", (tbl,))
+                return cur.fetchone()[0] is not None
+
+            if _has("f_daily_by_identity"):
+                print("[7b/8] seeding f_daily_by_identity (By User tab)...")
+                n = seed_by_identity(cur, today, rng)
+                print(f"      {n:,} rows")
+            if _has("f_daily_guardrails"):
+                print("[7c/8] seeding f_daily_guardrails (Compliance tab)...")
+                n = seed_guardrails(cur, today, rng)
+                print(f"      {n:,} rows")
+            if _has("f_daily_agentcore"):
+                print("[7d/8] seeding f_daily_agentcore (Agents & MCP tab)...")
+                n = seed_agentcore(cur, today, rng)
+                print(f"      {n:,} rows")
+            if _has("f_proxy_dim_hourly"):
+                print("[7e/8] seeding f_proxy_dim_hourly (client telemetry: Workloads + By Provider)...")
+                n = seed_client_telemetry(cur, today, rng)
+                print(f"      {n:,} rows")
 
             print("[8/8] seeding f_quotas + dim_tags + meta...")
             n = seed_quotas(cur, rng)

@@ -11,6 +11,19 @@ A Bedrock observability dashboard you can deploy in your own AWS account, plus a
 
 Cost Explorer rolls all of Bedrock into one line. CloudWatch is per-account. Invocation logs are JSON in S3. This dashboard joins those three signals so you can see per-account, per-model, per-tag attribution in one place. The MCP exposes the same data to your IDE, so you can ask the question instead of clicking through tabs.
 
+**Beyond Bedrock (optional).** Through client telemetry — an OpenTelemetry
+collector, your GenAI proxy (e.g. a LiteLLM callback), or Claude Code's
+built-in telemetry — the dashboard also ingests traffic that never touches
+Bedrock: **direct Anthropic API and direct OpenAI API calls**, with
+per-request tokens, latency, TTFT, retries, estimated cost, and per-user/team
+attribution. A "Usage by provider" view rolls it up across every path
+(bedrock-runtime, bedrock-mantle, anthropic-api, openai-api), so "all our
+Anthropic usage vs all our OpenAI usage" is one table — no AWS-side source
+can see that traffic at all. Off by default, honestly labeled as
+client-reported; see
+[Workloads & client telemetry](#workloads-per-workload-attribution-and-client-telemetry-optional)
+and [`tools/client-telemetry/`](tools/client-telemetry/).
+
 
 ## Two ways to use it
 
@@ -159,6 +172,15 @@ aws lambda invoke \
 
 ## Multi-account data pipeline
 
+**Account names.** Tables and dropdowns label accounts with a friendly name
+("payments-prod (111122223333)") when one can be resolved, falling back to the
+bare ID. Resolution order: the optional `account_names` map in `config.yaml`
+(always wins), the AWS Organizations account name (discover-org mode), then
+`account:GetAccountInformation` asked of each account through the reader role
+(works without Organizations; the permission ships in the reader-role
+template). Unresolvable accounts simply show their ID.
+
+
 The central Lambda pulls Bedrock data from every account you point it at. One script does the whole thing: it deploys a read-only `BedrockOpsLensReader` role into each account via a CloudFormation StackSet, reconfigures the central ingester to use those roles, and triggers the first ingest run synchronously so you see real data immediately.
 
 ```bash
@@ -259,7 +281,7 @@ For very large customers (500+ accounts) the pull architecture becomes the wrong
 | Capacity and Adoption | CRIS adoption, throttle rates, prompt caching opportunities, Claude 4 burndown risk |
 | Model Insights | Per-model deep dive: requests, tokens, cache hit rate, errors, accounts |
 | Model Lifecycle | Live ListFoundationModels joined with usage, timeline of legacy and EOL bands |
-| Workloads | Per-workload usage, throttle, and latency — **requires a GenAI proxy** (see below). Also per-IAM-principal callers (from invocation logs) and per-project Mantle chargeback |
+| Workloads | Per-workload / per-user usage, throttle, and latency — **requires a GenAI proxy or client telemetry** (see below). Includes direct **anthropic-api / openai-api** traffic and a "Usage by provider" rollup across all paths. Also per-IAM-principal callers (from invocation logs) and per-project Mantle chargeback |
 | By User | Per-caller attribution from invocation-log identity: by app/group (role), user (session), or full principal |
 | Agents & MCP | AgentCore runtimes and MCP gateway tools: invocations, sessions, errors, latency, real billed cost |
 | Compliance | Guardrails interventions by policy type, guardrail, and daily trend |
@@ -275,7 +297,29 @@ application changes required. The Workloads tab is opt-in and needs the setup
 below.
 
 
-## Workloads: per-workload attribution (optional)
+## Which attribution source when?
+
+The dashboard has several ways to answer "who / what is driving usage" —
+deliberately, because they differ in coverage and trust. Quick guide:
+
+| You want to know… | Look at | Data source | Trust level | Needs |
+|---|---|---|---|---|
+| Which **team/person** called Bedrock (audit-friendly) | **By User** tab | Invocation-log `identity.arn` | AWS-witnessed | Invocation logging on |
+| Usage by **workload / env / cost-center** (no proxy) | **Custom Attributes** tab (tags source) | Invocation-log `requestMetadata` | AWS-witnessed | Logging on + callers tag requests |
+| Usage by any attribute **incl. throttle / latency / quota** | **Custom Attributes** tab (proxy source) | Proxy / client events | Client-reported | Proxy or OTEL emitter |
+| Per-person **throttle, TTFT, retries, est. cost** | **Custom Attributes** tab, pivot by `user` | Proxy / client events | Client-reported | Emitter sends `user` dim |
+| **Mantle** or **direct Anthropic/OpenAI API** traffic | **Custom Attributes** tab (+ By-Provider panel) | Client events only | Client-reported | Emitter (AWS-side sources can't see this) |
+| Real **dollars** by account/service | **Cost Insights** tab | Cost Explorer | AWS-billed | Nothing |
+
+Rules of thumb: **AWS-witnessed** sources (logs, CloudWatch, Cost Explorer)
+are what finance and audits should use — they can't be spoofed, but they only
+see bedrock-runtime. **Client-reported** sources see everything the client
+experienced — retries, TTFT, Mantle, direct APIs — but only for instrumented
+traffic, and the numbers are self-reported (the UI labels them). The two are
+complements: same question, different halves of the truth. It's normal to
+run both.
+
+## Workloads: per-workload attribution and client telemetry (optional)
 
 The Workloads tab answers "which of my use-cases is driving Bedrock usage,
 throttling, and latency" — attribution the AWS-native metrics can't provide,
@@ -285,6 +329,22 @@ It works only if you front Bedrock with a **shared GenAI proxy / gateway**
 (LiteLLM, a Bedrock gateway, an internal SDK wrapper, etc.) that can tag each
 call with a `workload`. If your apps call Bedrock directly with no common layer,
 this tab stays empty (the rest of the dashboard is unaffected).
+
+**The same event pipeline also accepts client telemetry beyond Bedrock.**
+Events may carry `endpoint: "anthropic-api"` or `"openai-api"` for traffic
+that goes straight to those providers' APIs — the only way such traffic is
+observable at all, since CloudWatch, invocation logs, and Cost Explorer are
+Bedrock-scoped by definition. Optional per-request fields `ttft_ms`,
+`retry_attempts`, and `cost_usd_est` light up client-measured TTFT (including
+for `bedrock-mantle`, which publishes no latency to CloudWatch), retry
+forensics, and estimated cost. Three documented on-ramps — a LiteLLM callback
+(covers every backend the proxy fronts), an OTEL collector mapping for
+`gen_ai.*`-instrumented Anthropic/OpenAI SDKs, and Claude Code's native
+telemetry (per-developer `user.email` on every event) — live in
+[`tools/client-telemetry/`](tools/client-telemetry/). The endpoint switcher
+and a "Usage by provider (client-reported)" rollup appear automatically when
+such data exists. All of it is **self-reported**: the dashboard labels these
+surfaces client-reported and keeps AWS-metered sources as billing/quota truth.
 
 **How it works:** your proxy drops **one metadata-only event per request** to an
 S3 bucket; the dashboard reads that bucket read-only (no inbound endpoint, never
@@ -309,8 +369,13 @@ sits in your request path). No prompt or response text ever leaves your proxy.
    any key you emit (the picker top-left) and computes tokens, throttle rate,
    latency, **and per-value TPM quota utilization** for each. `workload` is just
    the conventional default key; a bare top-level `"workload":"x"` is still
-   accepted for back-compat. `endpoint` is `runtime` or `mantle`. See
-   **`tools/reference-proxy/`** for a working, copy-paste starting point.
+   accepted for back-compat. `endpoint` is `runtime`, `mantle`,
+   `anthropic-api`, or `openai-api` (aliases like `anthropic` / `openai` /
+   `bedrock` are accepted). Optional fields `ttft_ms`, `retry_attempts`, and
+   `cost_usd_est` enable the client-latency, retry, and estimated-cost
+   columns. See **`tools/reference-proxy/`** for a working, copy-paste
+   starting point and **`tools/client-telemetry/`** for the LiteLLM callback,
+   Claude Code, and OTEL-collector on-ramps.
 
 2. **Grant the dashboard read access** — a bucket policy allowing the ingester
    role `s3:GetObject` + `s3:ListBucket` on `.../proxy-events/*` (read-only,

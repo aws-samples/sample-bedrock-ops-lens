@@ -72,7 +72,7 @@ function AuthCard({ title, description, error, children, footer }) {
   );
 }
 
-function SignIn({ onSuccess, goSignUp, goForgot, prefill }) {
+function SignIn({ onSuccess, goSignUp, goForgot, prefill, notice }) {
   const [email, setEmail] = useState(prefill?.email || '');
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
@@ -102,7 +102,7 @@ function SignIn({ onSuccess, goSignUp, goForgot, prefill }) {
   return (
     <AuthCard
       title="Sign in"
-      description="Use your work email."
+      description={notice || 'Use your work email.'}
       error={error}
       footer={<>Need an account? <Link onFollow={(e) => { e?.preventDefault?.(); goSignUp(); }}>Sign up</Link></>}
     >
@@ -419,7 +419,7 @@ function NewPassword({ email, session, onSuccess, goSignIn }) {
 }
 
 // Top-level state machine. The screens call back here to navigate.
-export default function AuthApp() {
+export default function AuthApp({ sessionExpired = false }) {
   const [screen, setScreen] = useState(SCREENS.SIGNIN);
   const [carry, setCarry] = useState({});   // { email, session, ... } passed between screens
 
@@ -462,6 +462,7 @@ export default function AuthApp() {
       return (
         <SignIn
           prefill={{ email: carry.email }}
+          notice={sessionExpired ? 'Your session expired — please sign in again.' : undefined}
           onSuccess={onSignInSuccess}
           goSignUp={goSignUp}
           goForgot={(email) => goForgot(email)}

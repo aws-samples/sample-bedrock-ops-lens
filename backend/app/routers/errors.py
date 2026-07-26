@@ -4,7 +4,9 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Query
 
 from .. import db
-from ..filters import FilterSet, build_where, parse_filters
+from datetime import datetime
+
+from ..filters import PROVIDER_PREFIX, FilterSet, build_where, parse_filters
 
 router = APIRouter()
 
@@ -361,3 +363,64 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
         "available_range": available_range,
         "series": series,
     }
+
+
+@router.get("/impacted-accounts")
+async def impacted_accounts(
+    f: FilterSet = Depends(parse_filters),
+    ts: str = Query(..., description="hour bucket, ISO (e.g. 2026-07-23T05:00:00)"),
+    scope: str = Query("hour", pattern="^(hour|day)$"),
+):
+    """Accounts-impacted drill-down for a chart bar (Errors + Latency tabs).
+
+    Given the hour (or whole day) a user clicked, list every (account, model,
+    region) that had traffic in that bucket, with its per-code error counts
+    and average latency. Source: f_hourly_status (invocation logs), the only
+    table carrying account × hour × per-code grain. Empty when invocation
+    logging is off — the UI explains that instead of showing a broken modal.
+    """
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00").replace(" ", "T"))
+    except ValueError:
+        return {"rows": [], "error": "bad ts"}
+
+    parts = ["event_date = $1::date"]
+    params: list = [dt.date()]
+    if scope == "hour":
+        parts.append(f"hour = ${len(params)+1}")
+        params.append(dt.hour)
+    if f.accounts:
+        parts.append(f"accountId = ANY(${len(params)+1}::text[])")
+        params.append(list(f.accounts))
+    if f.region != "all":
+        parts.append(f"region = ${len(params)+1}")
+        params.append(f.region)
+    if f.provider != "all":
+        parts.append(f"modelId LIKE ${len(params)+1}")
+        params.append(PROVIDER_PREFIX[f.provider] + "%")
+    if f.endpoint != "all":
+        parts.append(f"endpoint = ${len(params)+1}")
+        params.append(f.endpoint)
+
+    rows = await db.fetch(
+        f"""
+        SELECT accountId, modelId, region,
+          SUM(total_requests)::BIGINT AS total_requests,
+          SUM(COALESCE(status_400_count,0) + COALESCE(status_403_count,0)
+            + COALESCE(status_404_count,0) + COALESCE(status_408_count,0)
+            + COALESCE(status_424_count,0))::BIGINT AS other_4xx,
+          SUM(COALESCE(status_429_count,0))::BIGINT AS throttled,
+          SUM(COALESCE(status_500_count,0) + COALESCE(status_503_count,0))::BIGINT AS errors_5xx,
+          CASE WHEN SUM(latency_count) > 0
+               THEN SUM(latency_sum_ms) / SUM(latency_count) END AS avg_latency_ms,
+          SUM(latency_count)::BIGINT AS latency_samples
+        FROM f_hourly_status
+        WHERE {' AND '.join(parts)}
+        GROUP BY accountId, modelId, region
+        ORDER BY (SUM(COALESCE(status_429_count,0)) + SUM(COALESCE(status_500_count,0))
+                + SUM(COALESCE(status_503_count,0))) DESC, total_requests DESC
+        LIMIT 1000
+        """,
+        *params,
+    )
+    return {"ts": ts, "scope": scope, "rows": db.rows_to_dicts(rows)}

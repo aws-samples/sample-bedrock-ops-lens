@@ -118,6 +118,18 @@ async def list_accounts():
             "in_scope":       True,
         }
 
+    # dim_account (008) — the ingester-resolved names (config map > org >
+    # account API). Overrides the live-discovery name: dim_account is where
+    # the full resolution chain lands, including config.yaml overrides.
+    try:
+        name_rows = await db.fetch("SELECT accountId, account_name FROM dim_account")
+        for r in name_rows:
+            aid = r["accountid"] if "accountid" in r else r["accountId"]
+            if aid in active and r["account_name"]:
+                active[aid]["name"] = r["account_name"]
+    except Exception:  # noqa: BLE001 — table may not exist on older stacks
+        pass
+
     # Sort: highest-volume first, idle accounts last (alphabetical within tier).
     out = list(active.values())
     out.sort(key=lambda a: (-a["total_requests"], a["accountId"]))

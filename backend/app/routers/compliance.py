@@ -27,7 +27,7 @@ async def _safe_fetch(sql: str, *params):
 async def compliance_summary(f: FilterSet = Depends(parse_filters)):
     """Interventions by policy type. Uses the PolicyType grain
     (only published for InvocationsIntervened / TextUnitCount)."""
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_model=False, has_endpoint=False)
     return await _safe_fetch(
         f"""
         SELECT policy_type,
@@ -46,7 +46,7 @@ async def compliance_summary(f: FilterSet = Depends(parse_filters)):
 async def compliance_totals(f: FilterSet = Depends(parse_filters)):
     """Overall invocations vs interventions (the __all__ grain carries
     Invocations, which is NOT published per policy type)."""
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_model=False, has_endpoint=False)
     rows = await _safe_fetch(
         f"""
         SELECT SUM(invocations)::BIGINT AS invocations,
@@ -62,7 +62,7 @@ async def compliance_totals(f: FilterSet = Depends(parse_filters)):
 
 @router.get("/compliance/by-guardrail")
 async def compliance_by_guardrail(f: FilterSet = Depends(parse_filters)):
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_model=False, has_endpoint=False)
     return await _safe_fetch(
         f"""
         SELECT guardrail_arn, guardrail_version,
@@ -79,7 +79,7 @@ async def compliance_by_guardrail(f: FilterSet = Depends(parse_filters)):
 
 @router.get("/compliance/daily-trend")
 async def compliance_daily_trend(f: FilterSet = Depends(parse_filters)):
-    w = build_where(f, has_traffic_type=False)
+    w = build_where(f, has_traffic_type=False, has_model=False, has_endpoint=False)
     return await _safe_fetch(
         f"""
         SELECT event_date,

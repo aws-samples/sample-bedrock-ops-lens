@@ -1074,6 +1074,11 @@ Resources:
               - Effect: Allow
                 Action: sts:GetCallerIdentity
                 Resource: '*'
+              # Own account's friendly name (dim_account) — self-scoped
+              # read-only; the no-Organizations fallback for account names.
+              - Effect: Allow
+                Action: account:GetAccountInformation
+                Resource: '*'
               # Bedrock model invocation logs bucket (read-only). When the
               # bucket parameter is empty, the resource list is "*" with a
               # condition that no S3 calls match — effectively a no-op grant.

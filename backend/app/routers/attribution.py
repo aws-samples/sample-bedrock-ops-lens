@@ -230,7 +230,10 @@ async def attribution_usage(
     vals = [v for v in (dim_value or []) if v and v != "all"]
 
     if eff == "proxy":
-        ep = endpoint if endpoint in ("runtime", "mantle", "all") else "all"
+        # runtime/mantle are Bedrock paths; anthropic-api/openai-api are
+        # direct-API paths that exist only in client telemetry (006).
+        ep = endpoint if endpoint in (
+            "runtime", "mantle", "anthropic-api", "openai-api", "all") else "all"
         where = ["event_date >= current_date - $1::int", "dim_key = $2"]
         params: list = [days, dim_key]
         if ep != "all":
@@ -250,6 +253,10 @@ async def attribution_usage(
               MAX(p50_latency_ms) AS p50_latency_ms,
               MAX(p90_latency_ms) AS p90_latency_ms,
               MAX(p99_latency_ms) AS p99_latency_ms,
+              MAX(p50_ttft_ms)    AS p50_ttft_ms,
+              MAX(p90_ttft_ms)    AS p90_ttft_ms,
+              SUM(retried_count)::BIGINT AS retried,
+              SUM(cost_usd_est)::DOUBLE PRECISION AS cost_usd_est,
               array_agg(DISTINCT endpoint) AS endpoints
             FROM f_proxy_dim_hourly WHERE {" AND ".join(where)}
             GROUP BY dim_value HAVING SUM(total_requests) > 0
@@ -283,6 +290,63 @@ async def attribution_usage(
         return db.rows_to_dicts(rows)
 
     return []
+
+
+# Provider = model family (whose model answered), rolled up ACROSS paths.
+# Distinct from `endpoint` (the path the request traveled). Includes the
+# direct-API paths only client telemetry can see — so this view answers
+# "all my Anthropic usage (Bedrock + direct) vs all my OpenAI usage".
+_PROVIDER_SQL = """
+    CASE
+      WHEN modelId ILIKE '%anthropic%' OR modelId ILIKE 'claude%' THEN 'anthropic'
+      WHEN modelId ILIKE '%openai%' OR modelId ILIKE 'gpt-%'
+           OR modelId ILIKE 'o1%' OR modelId ILIKE 'o3%' OR modelId ILIKE 'o4%' THEN 'openai'
+      WHEN modelId ILIKE 'amazon.%' OR modelId ILIKE '%titan%' OR modelId ILIKE '%nova%' THEN 'amazon'
+      WHEN modelId ILIKE 'meta.%' OR modelId ILIKE '%llama%' THEN 'meta'
+      WHEN modelId ILIKE 'mistral%' THEN 'mistral'
+      WHEN modelId ILIKE 'cohere%' THEN 'cohere'
+      ELSE 'other'
+    END
+"""
+
+
+@router.get("/attribution/by-provider")
+async def attribution_by_provider(days: int = Query(14, ge=1, le=90)):
+    """Provider × path rollup from client telemetry (proxy source only —
+    the other sources can't see direct-API traffic, so the panel self-gates).
+    dim_key is pinned to the highest-volume key: every key covers 100% of
+    requests (fan-out invariant), so any single key gives correct totals."""
+    if await _effective_source() != "proxy":
+        return []
+    rows = await db.fetch(
+        f"""
+        WITH pinned AS (
+          SELECT dim_key FROM f_proxy_dim_hourly
+          WHERE event_date >= current_date - $1::int
+          GROUP BY dim_key ORDER BY SUM(total_requests) DESC LIMIT 1
+        )
+        SELECT
+          {_PROVIDER_SQL} AS provider,
+          endpoint,
+          SUM(total_requests)::BIGINT    AS total_requests,
+          SUM(input_tokens)::BIGINT      AS input_tokens,
+          SUM(output_tokens)::BIGINT     AS output_tokens,
+          SUM(cache_read_tokens)::BIGINT AS cache_read_tokens,
+          SUM(error_count)::BIGINT       AS errors,
+          SUM(retried_count)::BIGINT     AS retried,
+          SUM(cost_usd_est)::DOUBLE PRECISION AS cost_usd_est,
+          MAX(p90_latency_ms) AS p90_latency_ms,
+          MAX(p90_ttft_ms)    AS p90_ttft_ms,
+          COUNT(DISTINCT modelId)::BIGINT AS distinct_models
+        FROM f_proxy_dim_hourly
+        WHERE event_date >= current_date - $1::int
+          AND dim_key = (SELECT dim_key FROM pinned)
+        GROUP BY 1, endpoint
+        ORDER BY total_requests DESC
+        """,
+        days,
+    )
+    return db.rows_to_dicts(rows)
 
 
 @router.get("/attribution/quota")

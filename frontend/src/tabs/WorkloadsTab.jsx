@@ -127,14 +127,25 @@ export default function WorkloadsTab({ filters, onInfo }) {
     description: `${fmt(v.total_requests_30d)} req`,
   }));
 
-  const params = useMemo(
+  // The endpoint switcher RE-QUERIES with the endpoint pinned, so every
+  // number on the page re-slices (a client-side row filter only removed
+  // users who never touched the endpoint — with multi-endpoint users the
+  // totals never changed, which read as "the switcher does nothing").
+  // We ALSO always fetch the 'all' set: it drives which endpoint options
+  // exist and keeps the value picker/empty-state stable.
+  const paramsAll = useMemo(
     () => ({ days: filters.days, endpoint: 'all', dim_key: activeKey,
              dim_value: selectedValues.length ? selectedValues : undefined }),
     [filters.days, activeKey, selectedValues]);
   // Skip until activeKey resolves so we never query with a null/absent dim_key.
-  const usage = useApi(activeKey ? '/attribution/usage' : null, params,
-    [JSON.stringify(params)]);
-  const allRows = usage.data || [];
+  const usageAll = useApi(activeKey ? '/attribution/usage' : null, paramsAll,
+    [JSON.stringify(paramsAll)]);
+  const allRows = usageAll.data || [];
+
+  const paramsEp = useMemo(
+    () => ({ ...paramsAll, endpoint: ep }), [paramsAll, ep]);
+  const usageEp = useApi(activeKey && ep !== 'all' ? '/attribution/usage' : null,
+    paramsEp, [JSON.stringify(paramsEp)]);
 
   // Per-value quota utilization (tokens→TPM ÷ applied limit). Proxy-derived
   // estimate — the third commonly-requested metric alongside tokens + throttles.
@@ -150,32 +161,40 @@ export default function WorkloadsTab({ filters, onInfo }) {
       : quotaRowsAll
   ), [quotaRowsAll, selectedValues]);
 
-  // Which endpoints does the proxy data actually contain?
+  // Which endpoints does the proxy data actually contain? (from the 'all'
+  // set, so switching a slice never changes which options are offered)
   const endpointsPresent = useMemo(() => {
     const s = new Set();
     for (const r of allRows) for (const e of (r.endpoints || [])) s.add(e);
     return s;
   }, [allRows]);
-  const hasRuntime = endpointsPresent.has('runtime');
-  const hasMantle = endpointsPresent.has('mantle');
-  const canSplit = hasRuntime && hasMantle;
+  // The switcher renders when there's more than one endpoint to switch among.
+  const canSplit = endpointsPresent.size > 1;
 
   // If the selected slice isn't available, fall back to 'all' so the view
   // never renders an empty state just because of a stale toggle selection.
-  const effectiveEp = (ep === 'mantle' && !hasMantle) || (ep === 'runtime' && !hasRuntime) ? 'all' : ep;
+  const effectiveEp = (ep !== 'all' && !endpointsPresent.has(ep)) ? 'all' : ep;
 
-  // Client-side filter of the full set by the selected endpoint.
-  const rows = useMemo(() => {
-    if (effectiveEp === 'all') return allRows;
-    return allRows.filter(r => (r.endpoints || []).includes(effectiveEp));
-  }, [allRows, effectiveEp]);
+  // Rows come from the endpoint-pinned query: KPIs, charts, and tables all
+  // genuinely re-slice when the switcher changes.
+  // While an endpoint slice is still loading, keep showing the previous rows
+  // (soft update) — a full-page spinner on every switcher click would make
+  // the control feel broken.
+  const usage = usageAll;
+  const rows = (effectiveEp === 'all' ? usageAll.data : usageEp.data)
+    || usageAll.data || [];
 
   // Identity usage (G) — per-IAM-principal attribution from invocation logs.
   // Complements tag-based workloads; empty when logging is off.
-  const identity = useApi('/identity-usage', params, [JSON.stringify(params)]);
+  const identity = useApi('/identity-usage', paramsAll, [JSON.stringify(paramsAll)]);
   const identityRows = identity.data || [];
 
   // Mantle per-project usage (B) — chargeback by the Mantle Project dimension.
+  // Provider × path rollup (client telemetry only; [] from other sources).
+  const byProvider = useApi('/attribution/by-provider', { days: filters.days },
+    [filters.days]);
+  const providerRows = byProvider.data || [];
+
   const mantleProjects = useApi('/mantle-projects', { days: filters.days, endpoint: 'mantle' },
     [filters.days]);
   const projectRows = mantleProjects.data || [];
@@ -206,6 +225,11 @@ export default function WorkloadsTab({ filters, onInfo }) {
     };
   }, [rows]);
 
+  // TRUE distinct count for the KPI. `rows` is capped at the API's top-500,
+  // so rows.length under-counts a big fleet (1,000s of users at enterprise
+  // scale); dim_proxy_dimensions carries every value seen in 30 days.
+  const totalValues = valueOptions.length || kpis.workloads;
+
   // Peak quota utilization across values (worst offender) for the KPI ribbon.
   const peakUtil = useMemo(() => {
     let m = null;
@@ -217,19 +241,36 @@ export default function WorkloadsTab({ filters, onInfo }) {
 
   const tokenSeries = useMemo(() => {
     const top = rows.slice(0, 12);
+    // valueFormatter drives the hover popover — raw counts (64000000) read
+    // as noise; fmt renders "64.0M" (matches the Overview charts).
     return [
-      { title: 'Input tokens',  type: 'bar', data: top.map(r => ({ x: r.workload, y: Number(r.input_tokens || 0) })) },
-      { title: 'Output tokens', type: 'bar', data: top.map(r => ({ x: r.workload, y: Number(r.output_tokens || 0) })) },
+      { title: 'Input tokens',  type: 'bar', valueFormatter: fmt, data: top.map(r => ({ x: r.workload, y: Number(r.input_tokens || 0) })) },
+      { title: 'Output tokens', type: 'bar', valueFormatter: fmt, data: top.map(r => ({ x: r.workload, y: Number(r.output_tokens || 0) })) },
     ];
   }, [rows]);
 
   const throttleSeries = useMemo(() => {
-    const top = [...rows].sort((a, b) => Number(b.throttle_pct || 0) - Number(a.throttle_pct || 0)).slice(0, 12);
+    // Only values that actually throttled — a zero-throttle value in a
+    // "worst offenders" chart is noise (renders as a labeled empty slot).
+    const top = rows
+      .filter(r => Number(r.throttle_pct || 0) > 0)
+      .sort((a, b) => Number(b.throttle_pct || 0) - Number(a.throttle_pct || 0))
+      .slice(0, 12);
     return [{ title: 'Throttle %', type: 'bar', color: '#ef4444',
+      valueFormatter: v => `${Number(v).toFixed(2)}%`,
       data: top.map(r => ({ x: r.workload, y: Number(r.throttle_pct || 0) })) }];
   }, [rows]);
+  const throttledCount = throttleSeries[0].data.length;
 
-  if (usage.loading) return <ChartLoading height={320} label="Loading per-workload usage…" />;
+  // No attribution data AT ALL (fresh account, no proxy/tags): dims resolve
+  // to an empty list, activeKey stays null, and the usage fetch never fires —
+  // usage.loading would be true FOREVER (eternal spinner instead of the
+  // setup panel; found on a real-data stack). Fall through to the setup
+  // panel once dims have resolved empty.
+  const dimsResolvedEmpty = !dimsMeta.loading && dimKeys.length === 0;
+  if (usage.loading && !dimsResolvedEmpty) {
+    return <ChartLoading height={320} label="Loading per-workload usage…" />;
+  }
 
   // Enabled-but-empty: the tab was surfaced (admin toggle or expecting data)
   // but no proxy telemetry exists. Show the onboarding panel instead of a
@@ -278,6 +319,13 @@ export default function WorkloadsTab({ filters, onInfo }) {
                   { id: 'all',     text: 'All endpoints' },
                   { id: 'runtime', text: 'bedrock-runtime' },
                   { id: 'mantle',  text: 'bedrock-mantle' },
+                  // Direct-API paths exist only in client telemetry — the
+                  // options self-gate on data presence (same pattern as the
+                  // Mantle sub-tab elsewhere): no data → no button.
+                  ...(endpointsPresent.has('anthropic-api')
+                    ? [{ id: 'anthropic-api', text: 'anthropic-api' }] : []),
+                  ...(endpointsPresent.has('openai-api')
+                    ? [{ id: 'openai-api', text: 'openai-api' }] : []),
                 ]}
               />
             )}
@@ -297,7 +345,7 @@ export default function WorkloadsTab({ filters, onInfo }) {
       )}
 
       <Grid gridDefinition={[{ colspan: 3 }, { colspan: 3 }, { colspan: 3 }, { colspan: 3 }]}>
-        <KpiCard title={`${dimLabel}s`} value={fmt(kpis.workloads)} />
+        <KpiCard title={`${dimLabel}s`} value={fmt(totalValues)} />
         <KpiCard title="Total requests" value={fmt(kpis.requests)} />
         {caps.throttle
           ? <KpiCard title="Fleet throttle rate" value={fmtPct(kpis.throttlePct)} />
@@ -309,13 +357,17 @@ export default function WorkloadsTab({ filters, onInfo }) {
           : <KpiCard title="Failed requests" value={fmt(kpis.errors)} invert />}
       </Grid>
 
-      <Container header={<SectionHeader title={`Tokens by ${lc}`} sectionId="wl-tokens" onInfo={onInfo} />}>
+      <Container header={<SectionHeader
+          title={`Tokens by ${lc}${totalValues > 12 ? ` — top 12 of ${fmt(totalValues)}` : ''}`}
+          sectionId="wl-tokens" onInfo={onInfo} />}>
         {rows.length === 0
           ? <Box textAlign="center" color="text-body-secondary" padding="l">
               No per-{lc} data yet. Point your proxy at an S3 bucket and tag each request with its {lc} — see the deployment guide.
             </Box>
           : <BarChart series={tokenSeries} xScaleType="categorical" height={280}
-              hideFilter stackedBars i18nStrings={CHART_I18N} ariaLabel={`Tokens by ${lc}`} />}
+              hideFilter stackedBars
+              i18nStrings={{ ...CHART_I18N, yTickFormatter: fmt }}
+              ariaLabel={`Tokens by ${lc}`} />}
       </Container>
 
       {/* Quota utilization (the third per-workload metric). Proxy-derived estimate:
@@ -359,9 +411,14 @@ export default function WorkloadsTab({ filters, onInfo }) {
       )}
 
       {caps.throttle && rows.length > 0 && (
-        <Container header={<SectionHeader title={`Throttle rate by ${lc}`} sectionId="wl-throttle" onInfo={onInfo} />}>
+        <Container header={<SectionHeader
+          title={`Throttle rate by ${lc}${throttledCount >= 12 ? ' — top 12 offenders' : ''}`}
+          description={`Only ${lc} values with throttled requests appear; ${lc} values with zero throttles are omitted.`}
+          sectionId="wl-throttle" onInfo={onInfo} />}>
           <BarChart series={throttleSeries} xScaleType="categorical" height={260}
-            hideFilter i18nStrings={CHART_I18N} ariaLabel={`Throttle % by ${lc}`} />
+            hideFilter
+            i18nStrings={{ ...CHART_I18N, yTickFormatter: v => `${Number(v).toFixed(1)}%` }}
+            ariaLabel={`Throttle % by ${lc}`} />
         </Container>
       )}
 
@@ -385,6 +442,43 @@ export default function WorkloadsTab({ filters, onInfo }) {
           empty={`No per-${lc} data.`}
         />
       </Container>
+
+      {/* Usage by provider × path — client telemetry only, so the section
+          self-gates on data presence (nothing renders for CW-only stacks).
+          Provider = model family across ALL paths, including direct
+          anthropic-api / openai-api traffic no AWS-side source can see.
+          cost_usd_est is the EMITTERS' estimate — labeled, never billing. */}
+      {providerRows.length > 0 && (
+        <Container header={
+          <SectionHeader
+            title="Usage by provider (client-reported)"
+            description="Rolled up by model family across every path — bedrock-runtime, bedrock-mantle, and direct anthropic-api / openai-api traffic reported by client telemetry. Cost is the emitters' estimate; reconcile against Cost Explorer for billing truth."
+            sectionId="wl-by-provider"
+            onInfo={onInfo}
+          />
+        }>
+          <PaginatedTable
+            items={providerRows}
+            downloadFileName="usage-by-provider.csv"
+            trackBy={(r) => `${r.provider}:${r.endpoint}`}
+            columnDefinitions={[
+              { id: 'prov', header: 'Provider', cell: r => r.provider, exportValue: r => r.provider },
+              { id: 'ep',   header: 'Path',     cell: r => r.endpoint, exportValue: r => r.endpoint },
+              { id: 'req',  header: 'Requests', cell: r => fmt(r.total_requests), exportValue: r => r.total_requests },
+              { id: 'in',   header: 'Input tokens',  cell: r => fmt(r.input_tokens), exportValue: r => r.input_tokens },
+              { id: 'out',  header: 'Output tokens', cell: r => fmt(r.output_tokens), exportValue: r => r.output_tokens },
+              { id: 'cache', header: 'Cache read',   cell: r => fmt(r.cache_read_tokens), exportValue: r => r.cache_read_tokens },
+              { id: 'err',  header: 'Errors',   cell: r => fmt(r.errors), exportValue: r => r.errors },
+              { id: 'rty',  header: 'Retried',  cell: r => fmt(r.retried), exportValue: r => r.retried },
+              { id: 'p90',  header: 'p90 latency', cell: r => r.p90_latency_ms != null ? fmtMs(r.p90_latency_ms) : '—', exportValue: r => r.p90_latency_ms },
+              { id: 'ttft', header: 'p90 TTFT',    cell: r => r.p90_ttft_ms != null ? fmtMs(r.p90_ttft_ms) : '—', exportValue: r => r.p90_ttft_ms },
+              { id: 'cost', header: 'Est. cost',   cell: r => r.cost_usd_est ? `$${Number(r.cost_usd_est).toFixed(2)}` : '—', exportValue: r => r.cost_usd_est },
+              { id: 'mdl',  header: 'Models',   cell: r => fmt(r.distinct_models), exportValue: r => r.distinct_models },
+            ]}
+            empty="No client-reported provider data."
+          />
+        </Container>
+      )}
 
       {/* Top callers by IAM principal (G) — invocation-log-derived, so empty
            when model invocation logging is off. Complements tag-based

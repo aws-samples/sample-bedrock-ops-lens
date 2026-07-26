@@ -9,7 +9,7 @@
 // `bedrock-lens-admins` Cognito group.
 
 import { createContext, useContext, useEffect, useState } from 'react';
-import { api } from '../api.js';
+import { api, onAuthExpired } from '../api.js';
 
 const UserContext = createContext({
   user: null,
@@ -32,6 +32,16 @@ export function UserProvider({ children }) {
 
   useEffect(() => {
     let cancelled = false;
+    // Mid-session expiry: any API 401 (not just the mount-time /me probe)
+    // flips the app back to the sign-in screen instead of leaving blank
+    // charts up. Registered before the /me call so even IT can trigger it.
+    onAuthExpired(() => {
+      if (cancelled) return;
+      setState(s => ({
+        ...s, user: null, loading: false, isAdmin: false,
+        authEnabled: true, isAuthenticated: false, sessionExpired: true,
+      }));
+    });
     api('/me', {}, { useCache: false })
       .then(d => {
         if (cancelled) return;

@@ -1,12 +1,13 @@
 // Latency tab — 4 containers, with E2E ↔ TTFT segmented control.
 import { useMemo, useState } from 'react';
 import {
-  Container, Header, SpaceBetween, BarChart, SegmentedControl, Box,
+  Container, Header, SpaceBetween, BarChart, SegmentedControl, Box, Button,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtMs } from '../api.js';
 import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import EndpointSubTabs, { EndpointNotAvailable } from '../components/EndpointSubTabs.jsx';
+import LatencyAccountsModal from '../components/LatencyAccountsModal.jsx';
 
 function isLLM(modelId) {
   const m = (modelId || '').toLowerCase();
@@ -54,9 +55,20 @@ export default function LatencyTab({ filters, onInfo }) {
 
 function LatencyBody({ filters, onInfo, mantleHint }) {
   const [metric, setMetric] = useState('e2e');
+  // Per-account drill for a clicked model bar (invocation-log derived).
+  const [drillModel, setDrillModel] = useState(null);
   const byModel = useApi('/latency-by-model', filters, [JSON.stringify(filters)]);
   const cris = useApi('/latency-cris-vs-od', filters, [JSON.stringify(filters)]);
   const ops = useApi('/operation-latency', filters, [JSON.stringify(filters)]);
+
+  const shortToFull = useMemo(() => {
+    const m = new Map();
+    for (const r of (byModel.data || [])) {
+      const mid = r.modelid || r.modelId;
+      m.set(modelShort(mid), mid);
+    }
+    return m;
+  }, [byModel.data]);
 
   const chartSeries = useMemo(() => {
     const data = (byModel.data || []).filter(r => isLLM(r.modelid || r.modelId));
@@ -73,6 +85,13 @@ function LatencyBody({ filters, onInfo, mantleHint }) {
 
   return (
     <SpaceBetween size="l">
+      {drillModel && (
+        <LatencyAccountsModal
+          modelId={drillModel}
+          filters={filters}
+          onDismiss={() => setDrillModel(null)}
+        />
+      )}
       <Container header={
         <SectionHeader
           title="Latency by model (ms)"
@@ -97,6 +116,12 @@ function LatencyBody({ filters, onInfo, mantleHint }) {
             hideFilter
             ariaLabel="Latency by model"
             i18nStrings={{ ...CHART_I18N, yTickFormatter: v => `${v >= 1000 ? (v / 1000).toFixed(1) + 's' : Math.round(v) + 'ms'}` }}
+            detailPopoverFooter={(xValue) => (
+              <Button variant="inline-link"
+                      onClick={() => setDrillModel(shortToFull.get(xValue) || xValue)}>
+                Drill accounts
+              </Button>
+            )}
             height={300}
             xTitle="Model" yTitle="Latency"
           />

@@ -103,6 +103,11 @@ class IamConfig:
 @dataclass(frozen=True)
 class Config:
     deploy_region: str = "us-east-1"
+    # Optional accountId -> friendly-name overrides from config.yaml
+    # (`account_names:` map). Highest-precedence source for dim_account —
+    # zero IAM, works in every deployment mode, and lets a customer label
+    # accounts however they like regardless of the org name.
+    account_names: dict = field(default_factory=dict)
     monitored_accounts: MonitoredAccountsConfig = field(default_factory=MonitoredAccountsConfig)
     monitored_regions: MonitoredRegionsConfig = field(default_factory=MonitoredRegionsConfig)
     invocation_logging: InvocationLoggingConfig = field(default_factory=InvocationLoggingConfig)
@@ -197,8 +202,14 @@ def load_config(path: str | Path | None = None) -> Config:
         external_id=      _env_str("BEDROCK_OPS_LENS_EXTERNAL_ID", iam_raw.get("external_id", "")),
     )
 
+    names_raw = raw.get("account_names") or {}
+    account_names = {str(k).strip(): str(v).strip()
+                     for k, v in names_raw.items()
+                     if str(k).strip().isdigit() and len(str(k).strip()) == 12 and str(v).strip()}
+
     return Config(
         deploy_region=deploy_region,
+        account_names=account_names,
         monitored_accounts=accts,
         monitored_regions=regs,
         invocation_logging=log,

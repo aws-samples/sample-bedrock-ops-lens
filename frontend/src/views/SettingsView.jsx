@@ -37,9 +37,14 @@ export default function SettingsView({ onInfo }) {
   const prefs     = useApi('/preferences', {}, []);
   const accounts  = useApi('/accounts', {}, []);
   const config    = useApi('/system-config', {}, []);
-  const attrCfg   = useApi('/attribution/config', {}, []);
+  // Bumped after a successful source change so config + keys REFETCH.
+  // Without this the "Active source" line and the key dropdown kept
+  // rendering the pre-click source (e.g. proxy keys listed while
+  // invocation-log tags were already active) — stale-UI bug.
+  const [cfgVersion, setCfgVersion] = useState(0);
+  const attrCfg   = useApi('/attribution/config', {}, [cfgVersion]);
   // Available attribute KEYS for the effective source (proxy dims or tag keys).
-  const attrKeys  = useApi('/attribution/keys', {}, []);
+  const attrKeys  = useApi('/attribution/keys', {}, [cfgVersion]);
 
   // Surfaced keys per source — independent lists so switching source keeps both.
   const [pinnedTag, setPinnedTag] = useState([]);
@@ -160,6 +165,7 @@ export default function SettingsView({ onInfo }) {
         : next === 'invocation_logs' ? 'Bedrock invocation-log tags'
         : 'disabled';
       showFlash('success', `Attribution source set to ${label}. The "Usage · Custom Attributes" tab and top-bar filter now reflect this source.`);
+      setCfgVersion(v => v + 1);   // refetch config + keys for the new source
     } catch (err) {
       setAttrSource(prev);
       showFlash('error', `Couldn't update attribution source: ${err.message}`);
@@ -170,18 +176,11 @@ export default function SettingsView({ onInfo }) {
 
   if (userLoading) return <Spinner size="large" />;
 
-  if (!isAdmin) {
-    return (
-      <ContentLayout header={<Header variant="h1">Settings</Header>}>
-        <Alert type="warning" header="Admin access required">
-          The Settings page is only visible to members of the
-          <strong> bedrock-lens-admins </strong> Cognito group. Ask the
-          dashboard administrator if you need a configuration change.
-        </Alert>
-      </ContentLayout>
-    );
-  }
-
+  // One page, two zones: "Your preferences" (per-browser, every signed-in
+  // user — optional tabs) renders for everyone; the stack-wide admin
+  // sections (attribution source, pinned keys, diagnostics) render only for
+  // bedrock-lens-admins. Previously the whole page was admin-gated, which
+  // made the per-user toggles unreachable for regular users.
   const meta = status.data?.meta || {};
   const cfg = config.data || {};
   const avail = attrCfg.data?.available || {};
@@ -189,12 +188,17 @@ export default function SettingsView({ onInfo }) {
 
   return (
     <ContentLayout
-      header={<Header variant="h1" description="Configure how the dashboard behaves. Read-only status is under System information at the bottom.">Settings</Header>}
+      header={<Header variant="h1"
+        description={isAdmin
+          ? "Your personal preferences, plus stack-wide admin configuration. Read-only status is under System information at the bottom."
+          : "Your personal preferences — saved in this browser. Stack-wide configuration is managed by dashboard administrators."}>
+        Settings
+      </Header>}
     >
       <SpaceBetween size="l">
         {flash.length > 0 && <Flashbar items={flash} />}
 
-        {/* ============ CONFIGURABLE ============ */}
+        {/* ============ PER-USER PREFERENCES (everyone) ============ */}
 
         {/* Optional tabs -------------------------------------------------- */}
         {/* The governance/agent views only make sense for customers who run
@@ -220,12 +224,23 @@ export default function SettingsView({ onInfo }) {
                   )}
                 </SpaceBetween>
                 <Box variant="small" color="text-body-secondary" display="block">
-                  {TAB_DESC[key]}
+                  {key === 'workloads' && !isAdmin
+                    ? 'Per-workload / custom-attribute usage (workload, environment, business unit, …). The tab appears when this toggle is on AND an administrator has configured an attribution source.'
+                    : TAB_DESC[key]}
                 </Box>
               </Toggle>
             ))}
           </SpaceBetween>
         </Container>
+
+        {/* ============ ADMIN: STACK-WIDE CONFIGURATION ============ */}
+        {!isAdmin && (
+          <Box variant="small" color="text-body-secondary">
+            Attribution sources, surfaced attribute keys, and system diagnostics
+            are managed by members of the <strong>bedrock-lens-admins</strong> group.
+          </Box>
+        )}
+        {isAdmin && <>
 
         {/* Custom attribute attribution ---------------------------------- */}
         {/* One source powers the "Usage · Custom Attributes" tab + the top-bar
@@ -357,6 +372,7 @@ export default function SettingsView({ onInfo }) {
             </Box>
           </SpaceBetween>
         </ExpandableSection>
+        </>}
       </SpaceBetween>
     </ContentLayout>
   );

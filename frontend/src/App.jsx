@@ -452,12 +452,17 @@ function navItemsDashboard(workloadsAvail, optionalTabs) {
   return [{ ...group, items }];
 }
 
-const NAV_ADMIN_SECTION = (isAdmin) => isAdmin ? [
+// Settings is visible to EVERYONE: the page itself renders per-user
+// preferences (optional tabs) for all users, and adds the admin-only
+// stack-wide sections (attribution source, pinned keys, diagnostics)
+// only for bedrock-lens-admins. Non-admins being unable to reach the
+// optional-tabs toggles was a real gap — demo users couldn't self-serve.
+const NAV_ADMIN_SECTION = (isAdmin) => [
   { type: 'divider' },
-  { type: 'section-group', title: 'Admin', items: [
+  { type: 'section-group', title: isAdmin ? 'Admin' : 'Preferences', items: [
     navItem('Settings', '#/settings', 'settings'),
   ]},
-] : [];
+];
 
 const NAV_FOOTER = [
   { type: 'divider' },
@@ -627,9 +632,7 @@ function AppShell() {
             // user-facing noise. The user already knows they're signed in.
             iconName: 'user-profile',
             items: [
-              ...(isAdmin
-                ? [{ id: 'settings', text: 'Settings', href: '#/settings' }]
-                : []),
+              { id: 'settings', text: 'Settings', href: '#/settings' },
               {
                 id: 'signout',
                 text: authEnabled ? 'Sign out' : 'Sign out (disabled in local dev)',
@@ -780,9 +783,9 @@ function LoadingSplash() {
 }
 
 function AppRouter() {
-  const { loading, isAuthenticated } = useUser();
+  const { loading, isAuthenticated, sessionExpired } = useUser();
   if (loading) return <LoadingSplash />;
-  if (!isAuthenticated) return <AuthApp />;
+  if (!isAuthenticated) return <AuthApp sessionExpired={!!sessionExpired} />;
   return <AppShell />;
 }
 

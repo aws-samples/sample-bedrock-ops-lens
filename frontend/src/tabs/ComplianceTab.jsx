@@ -73,7 +73,7 @@ export default function ComplianceTab({ filters, onInfo }) {
               xScaleType="categorical"
               hideFilter
               ariaLabel="Interventions by policy type"
-              i18nStrings={CHART_I18N}
+              i18nStrings={{ ...CHART_I18N, yTickFormatter: fmt }}
               height={280}
               xTitle="Policy" yTitle="Interventions"
             />
