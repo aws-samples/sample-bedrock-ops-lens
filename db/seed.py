@@ -1322,6 +1322,37 @@ def main() -> int:
 
         conn.commit()
 
+    # Findings (009): run the REAL threshold evaluator over the freshly-seeded
+    # data so the bell menu / notifications UI have authentic content — the
+    # same code path the ingester runs after every ingest. Never invents
+    # findings: whatever the synthetic data actually trips is what shows.
+    # Guarded: asyncpg or the ingestion package may be absent in a minimal
+    # local setup, and seeding must still succeed without them.
+    try:
+        import asyncio
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+        import asyncpg  # noqa: F401
+        from ingestion.findings import evaluate_and_notify
+
+        async def _findings():
+            c = await asyncpg.connect(args.db_url)
+            try:
+                return await evaluate_and_notify(c)
+            finally:
+                await c.close()
+
+        # If seed.main() is invoked in-process from inside an already-running
+        # event loop, asyncio.run() would raise. Run the evaluator on its own
+        # loop in a worker thread instead; works standalone and nested.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            summary = ex.submit(lambda: asyncio.run(_findings())).result(timeout=120)
+        print(f"[findings] evaluated over seeded data: {summary}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[findings] skipped ({type(e).__name__}: {e}) — run the ingester "
+              "or ingestion/findings.py to populate the bell menu")
+
     print("DONE.")
     return 0
 

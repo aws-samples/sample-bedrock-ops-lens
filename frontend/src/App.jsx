@@ -26,6 +26,7 @@ import SectionPanel from './components/SectionInfo.jsx';
 import { UserProvider, useUser } from './components/UserContext.jsx';
 import AuthApp from './views/AuthApp.jsx';
 import { useAttributeFilterFields } from './components/AttributeFilters.jsx';
+import FindingsPanel from './components/FindingsPanel.jsx';
 import OverviewTab from './tabs/OverviewTab.jsx';
 import ErrorsTab from './tabs/ErrorsTab.jsx';
 import LatencyTab from './tabs/LatencyTab.jsx';
@@ -410,10 +411,6 @@ const NAV_ITEMS_DASHBOARD = [
       ),
     },
     navItem('Health & Errors',     '#/errors',     'bug'),
-    navItem('By User',             '#/by-user',    'user-profile'),
-    navItem('Agents & MCP',        '#/agents',     'gen-ai'),
-    navItem('Compliance',          '#/compliance', 'security'),
-    navItem('Governance',          '#/governance', 'check'),
     // `status-pending` is the closest Cloudscape glyph to a stopwatch /
     // timer — fits "Latency" semantically. The originally proposed
     // `caret-up-down` doesn't exist in Cloudscape's icon library and
@@ -423,6 +420,15 @@ const NAV_ITEMS_DASHBOARD = [
     navItem('Model Insights',      '#/insights',    'suggestions'),
     navItem('Model Lifecycle',     '#/lifecycle',   'calendar'),
     navItem('Ops Review',          '#/ops-review', 'gen-ai'),
+    // Optional tabs LAST (below a divider) — the always-on views keep stable
+    // positions regardless of which optional tabs a user enables, so muscle
+    // memory survives Settings changes. Filtered by the user's preference in
+    // navItemsDashboard(); the divider is dropped when none are enabled.
+    { type: 'divider' },
+    navItem('By User',             '#/by-user',    'user-profile'),
+    navItem('Agents & MCP',        '#/agents',     'gen-ai'),
+    navItem('Compliance',          '#/compliance', 'security'),
+    navItem('Governance',          '#/governance', 'check'),
   ]},
 ];
 
@@ -443,12 +449,17 @@ function navItemsDashboard(workloadsAvail, optionalTabs) {
   // Workloads is double-gated: user toggle AND an active attribution source
   // (proxy or invocation-log tags). The toggle covers "I don't use attributes"
   // (customer preference); the data gate covers "nothing to show even if on".
+  // Injected right after the divider so it sits with the other optional tabs.
   if (workloadsAvail && optionalTabs?.workloads) {
-    const opsIdx = items.findIndex(i => i.href === '#/ops');
+    const divIdx = items.findIndex(i => i.type === 'divider');
     const wl = navItem('Usage · Custom Attributes', '#/workloads', 'group-active');
     items = [...items];
-    items.splice(opsIdx >= 0 ? opsIdx + 1 : items.length, 0, wl);
+    items.splice(divIdx >= 0 ? divIdx + 1 : items.length, 0, wl);
   }
+  // No optional tabs enabled → nothing below the divider → drop the divider
+  // (a trailing rule with nothing under it reads as a rendering glitch).
+  const last = items[items.length - 1];
+  if (last?.type === 'divider') items = items.slice(0, -1);
   return [{ ...group, items }];
 }
 
@@ -506,6 +517,11 @@ function AppShell() {
   const [infoSection, setInfoSection] = useState(null);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [navOpen, setNavOpen] = useState(true);
+  // Findings bell (009): count polls with the normal cache; the modal is the
+  // in-dashboard delivery surface for the alerting pipeline.
+  const [findingsOpen, setFindingsOpen] = useState(false);
+  const findingCounts = useApi('/notifications/findings?limit=1', {}, [findingsOpen])
+    .data?.counts || {};
 
   // Lazy-mount visited views; keep them mounted for cache survival.
   const [visited, setVisited] = useState(() => new Set([activeView]));
@@ -625,6 +641,16 @@ function AppShell() {
             ariaLabel: theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode',
             onClick: () => setTheme(theme === 'dark' ? 'light' : 'dark'),
           },
+          // Findings bell — active-findings count from the alerting pipeline.
+          // Plain button (no per-severity styling: TopNavigation utilities
+          // don't support custom badges); the count in the label is the cue.
+          {
+            type: 'button',
+            iconName: 'notification',
+            text: findingCounts.active ? String(findingCounts.active) : undefined,
+            ariaLabel: `Findings${findingCounts.active ? ` (${findingCounts.active} active)` : ''}`,
+            onClick: () => setFindingsOpen(true),
+          },
           {
             type: 'menu-dropdown',
             text: user?.email || user?.sub || 'Account',
@@ -661,6 +687,9 @@ function AppShell() {
           <FreshnessPill />
         </SpaceBetween>
       </div>
+      {findingsOpen && (
+        <FindingsPanel visible={findingsOpen} onDismiss={() => setFindingsOpen(false)} />
+      )}
       <AppLayout
         navigationOpen={navOpen}
         onNavigationChange={({ detail }) => setNavOpen(detail.open)}
@@ -684,7 +713,8 @@ function AppShell() {
             <p>
               <strong>Bedrock Ops Lens</strong> gives you fleet-wide
               observability for Amazon Bedrock — usage, errors, latency,
-              capacity insights, cost, and an AI-synthesized ops review.
+              capacity insights, cost, proactive notifications, and an ops
+              review written by an AI agent.
             </p>
             <p>
               Click the <strong>Info</strong> link on any container header

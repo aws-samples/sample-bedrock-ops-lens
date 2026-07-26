@@ -223,8 +223,38 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
     except Exception as e:  # noqa: BLE001
         print(f"[dim_account] refresh skipped: {type(e).__name__}: {e}")
 
+    # Findings evaluation + notification dispatch (009): threshold checks over
+    # the freshly-ingested data, finding lifecycle upkeep, and SNS delivery on
+    # state transitions. Best-effort — never fails the ingest run.
+    findings_summary = None
+    try:
+        findings_summary = await _evaluate_findings()
+        print(f"[findings] {findings_summary}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[findings] evaluation skipped: {type(e).__name__}: {e}")
+
     _bump_cache_generation()
-    return {"runs": results}
+    out = {"runs": results}
+    if findings_summary is not None:
+        out["findings"] = findings_summary
+    return out
+
+
+async def _evaluate_findings() -> dict:
+    import asyncpg
+    try:
+        from ingestion.findings import evaluate_and_notify
+    except ImportError:
+        from findings import evaluate_and_notify  # type: ignore
+    try:
+        from app.config import _compose_database_url  # type: ignore
+    except ImportError:
+        from backend.app.config import _compose_database_url  # type: ignore
+    conn = await asyncpg.connect(_compose_database_url(), timeout=30)
+    try:
+        return await evaluate_and_notify(conn)
+    finally:
+        await conn.close()
 
 
 async def _refresh_account_names() -> None:

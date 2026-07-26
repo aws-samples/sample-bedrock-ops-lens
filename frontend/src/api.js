@@ -97,6 +97,28 @@ export async function api(path, params = {}, { signal, useCache = true } = {}) {
   return data;
 }
 
+// JSON write helper (POST/PUT/DELETE). Same auth-expiry broadcast as api();
+// never cached. Throws with the server's `detail` when present so forms can
+// surface validation messages verbatim.
+export async function apiSend(path, { method = 'POST', body } = {}) {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (res.status === 401) {
+    notifyAuthExpired();
+    throw new Error('unauthenticated');
+  }
+  let data = null;
+  try { data = await res.json(); } catch { /* empty body */ }
+  if (!res.ok) {
+    throw new Error(data?.detail || `${res.status} ${res.statusText}`);
+  }
+  return data;
+}
+
 export function clearCache() { cache.clear(); }
 
 // --- Session-expiry broadcast ----------------------------------------------

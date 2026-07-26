@@ -27,10 +27,15 @@ async def system_config():
     """Read-only view of the deploy-time config so the Settings page can
     surface what's currently active."""
     try:
+        import os
         from ingestion.config import load_config
         cfg = load_config()
+        # The baked config.yaml can be stale (image built from a repo whose
+        # config points at another stack). The Lambda runtime's own region is
+        # ground truth for where this stack ACTUALLY runs — prefer it.
+        runtime_region = os.environ.get("AWS_REGION", "")
         return {
-            "deploy_region":            cfg.deploy_region,
+            "deploy_region":            runtime_region or cfg.deploy_region,
             "monitored_accounts_mode":  cfg.monitored_accounts.mode,
             "monitored_accounts_ids":   list(cfg.monitored_accounts.ids),
             "monitored_regions_preset": cfg.monitored_regions.preset,

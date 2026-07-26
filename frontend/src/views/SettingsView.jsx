@@ -20,6 +20,7 @@ import { useApi, fmt, clearCache } from '../api.js';
 import { useUser } from '../components/UserContext.jsx';
 import { InfoLink } from '../components/Common.jsx';
 import { OPTIONAL_TABS, loadOptionalTabs, saveOptionalTabs } from '../prefs.js';
+import { AdminNotificationSettings, UserNotificationSubscribe } from '../components/NotificationSettings.jsx';
 
 function K({ label, value, color }) {
   return (
@@ -83,7 +84,7 @@ export default function SettingsView({ onInfo }) {
     governance: false,
   };
   const TAB_DESC = {
-    workloads:  'Per-workload / custom-attribute usage (workload, environment, business unit, …). Needs an attribution source configured below (invocation-log tags or a GenAI proxy) — the tab only appears when the toggle is on AND a source is active.',
+    workloads:  'Per-workload / custom-attribute usage (workload, environment, business unit, …). Needs an attribution source configured below (invocation-log tags or a GenAI proxy) - the tab only appears when the toggle is on AND a source is active.',
     byUser:     'Per-caller attribution from invocation-log identity (by role/team, session, or full principal). Needs model invocation logging enabled.',
     agents:     'AgentCore runtime + MCP gateway observability: invocations, sessions, errors, latency, real billed cost. Needs Bedrock AgentCore in use.',
     compliance: 'Guardrails interventions by policy type, guardrail, and daily trend. Needs Bedrock Guardrails configured.',
@@ -138,7 +139,7 @@ export default function SettingsView({ onInfo }) {
       const count = sel.length;
       showFlash('success', count
         ? `Saved. ${count} attribute key${count === 1 ? '' : 's'} will surface in the top-bar filter.`
-        : 'Saved. No attribute keys surfaced — top-bar attribute filters are hidden.');
+        : 'Saved. No attribute keys surfaced - top-bar attribute filters are hidden.');
     } catch (err) {
       showFlash('error', `Couldn't save preferences: ${err.message}`);
     } finally {
@@ -191,7 +192,7 @@ export default function SettingsView({ onInfo }) {
       header={<Header variant="h1"
         description={isAdmin
           ? "Your personal preferences, plus stack-wide admin configuration. Read-only status is under System information at the bottom."
-          : "Your personal preferences — saved in this browser. Stack-wide configuration is managed by dashboard administrators."}>
+          : "Your personal preferences - saved in this browser. Stack-wide configuration is managed by dashboard administrators."}>
         Settings
       </Header>}
     >
@@ -207,7 +208,7 @@ export default function SettingsView({ onInfo }) {
             tabs; each user opts in here (stored per browser, like the
             theme). A "Data detected" flag nudges users who DO have data. */}
         <Container header={<Header variant="h2"
-            description="Show or hide the governance and agent-observability tabs in the sidebar. Off by default — enable the ones relevant to your environment. Saved as your personal preference in this browser.">
+            description="Show or hide the governance and agent-observability tabs in the sidebar. Off by default - enable the ones relevant to your environment. Saved as your personal preference in this browser.">
           Optional tabs
         </Header>}>
           <SpaceBetween size="m">
@@ -233,22 +234,29 @@ export default function SettingsView({ onInfo }) {
           </SpaceBetween>
         </Container>
 
+        {/* Email notifications (per-user; needs the admin channel) --------- */}
+        <UserNotificationSubscribe userEmail={user?.email} flash={showFlash} />
+
         {/* ============ ADMIN: STACK-WIDE CONFIGURATION ============ */}
         {!isAdmin && (
           <Box variant="small" color="text-body-secondary">
-            Attribution sources, surfaced attribute keys, and system diagnostics
-            are managed by members of the <strong>bedrock-lens-admins</strong> group.
+            Attribution sources, surfaced attribute keys, alert thresholds, and
+            system diagnostics are managed by members of the{' '}
+            <strong>bedrock-lens-admins</strong> group.
           </Box>
         )}
         {isAdmin && <>
 
+        {/* Notifications (admin: channel + thresholds) --------------------- */}
+        <AdminNotificationSettings onInfo={onInfo} flash={showFlash} />
+
         {/* Custom attribute attribution ---------------------------------- */}
         {/* One source powers the "Usage · Custom Attributes" tab + the top-bar
-            attribute filter. Two mutually-exclusive sources — the admin's
+            attribute filter. Two mutually-exclusive sources - the admin's
             choice wins. Both surface the same UX; they differ in reach. */}
         <Container header={<Header variant="h2"
             info={<InfoLink sectionId="workloads-setup" onInfo={onInfo} />}
-            description="Break down usage by your own custom attributes (workload, environment, business unit, team, …). Pick ONE source — both drive the same 'Usage · Custom Attributes' tab and the top-bar attribute filter.">
+            description="Break down usage by your own custom attributes (workload, environment, business unit, team, …). Pick ONE source - both drive the same 'Usage · Custom Attributes' tab and the top-bar attribute filter.">
           Custom attribute attribution
         </Header>}>
           <SpaceBetween size="m">
@@ -262,25 +270,25 @@ export default function SettingsView({ onInfo }) {
                 },
                 {
                   value: 'invocation_logs',
-                  label: 'Option 1 — Bedrock invocation-log tags',
+                  label: 'Option 1 - Bedrock invocation-log tags',
                   description: `Attributes come from per-request requestMetadata in Bedrock model invocation logs. No proxy needed, but bedrock-runtime only, and it reports volume + tokens (not throttle, latency, or quota).${avail.invocation_logs ? '' : '  ·  No tag data ingested yet.'}`,
                 },
                 {
                   value: 'proxy',
-                  label: 'Option 2 — GenAI proxy events',
-                  description: `Attributes come from a GenAI gateway or client emitter — e.g. LiteLLM (bundled callback in tools/client-telemetry/), an OTEL collector, or Claude Code telemetry — that writes one metadata-only event per request to S3. Covers bedrock-runtime + mantle + direct Anthropic/OpenAI APIs and adds throttle rate, latency, and TPM quota utilization.${avail.proxy ? '' : '  ·  No proxy data ingested yet.'}`,
+                  label: 'Option 2 - GenAI proxy events',
+                  description: `Attributes come from a GenAI gateway or client emitter - e.g. LiteLLM (bundled callback in tools/client-telemetry/), an OTEL collector, or Claude Code telemetry - that writes one metadata-only event per request to S3. Covers bedrock-runtime + mantle + direct Anthropic/OpenAI APIs and adds throttle rate, latency, and TPM quota utilization.${avail.proxy ? '' : '  ·  No proxy data ingested yet.'}`,
                 },
               ]}
             />
             <Box variant="small" color={effectiveSource === 'off' ? 'text-body-secondary' : 'text-status-success'}>
               {savingSource ? 'Saving…'
                 : effectiveSource === 'off'
-                  ? 'Currently off — no attribution tab or filter is shown.'
+                  ? 'Currently off - no attribution tab or filter is shown.'
                   : `Active source: ${effectiveSource === 'proxy' ? 'GenAI proxy events' : 'Bedrock invocation-log tags'}${
-                      (attrSource && attrSource !== effectiveSource) ? ` (selected "${attrSource}" has no data yet — falling back to what's available)` : ''}.`}
+                      (attrSource && attrSource !== effectiveSource) ? ` (selected "${attrSource}" has no data yet - falling back to what's available)` : ''}.`}
             </Box>
 
-            {/* Which attribute keys surface as top-bar filters — SAME control
+            {/* Which attribute keys surface as top-bar filters - SAME control
                 for both sources. Customers may emit many keys (30+); they pick
                 the handful worth filtering on. Key list comes from the active
                 source (proxy dimension keys or invocation-log tag keys). */}
@@ -293,7 +301,7 @@ export default function SettingsView({ onInfo }) {
               return (
                 <FormField
                   label="Attribute keys to surface in the top-bar filter"
-                  description={`Your ${isProxy ? 'proxy' : 'Bedrock requestMetadata'} may carry many ${sourceLabel} keys — pick which become top-bar attribute filters (max 10).`}>
+                  description={`Your ${isProxy ? 'proxy' : 'Bedrock requestMetadata'} may carry many ${sourceLabel} keys - pick which become top-bar attribute filters (max 10).`}>
                   <SpaceBetween size="xs">
                     <Multiselect
                       selectedOptions={sel}

@@ -15,6 +15,7 @@ from .db import close_pool, init_pool
 from .routers import (
     agents as agents_router,
     attribution as attribution_router,
+    notifications as notifications_router,
     by_user as by_user_router,
     compliance as compliance_router,
     cost as cost_router,
@@ -80,6 +81,7 @@ app.include_router(opsreview_router.router,  prefix="/api", tags=["ops-review"])
 app.include_router(quota_drilldown_router.router, prefix="/api", tags=["quota-drilldown"])
 app.include_router(workload_usage_router.router, prefix="/api", tags=["workload-usage"])
 app.include_router(attribution_router.router, prefix="/api", tags=["attribution"])
+app.include_router(notifications_router.router, prefix="/api", tags=["notifications"])
 
 # SPA static mount goes LAST so /api/* takes precedence.
 _static_dir = Path(__file__).parent.parent / "static"

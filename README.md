@@ -1,28 +1,58 @@
 # Bedrock Ops Lens
 
-A Bedrock observability dashboard you can deploy in your own AWS account, plus an MCP server that exposes the same data to Claude Code, Cursor, and Kiro (CLI or IDE).
+As organizations scale mission-critical AI workloads on Amazon Bedrock, the
+telemetry that matters ends up scattered: usage metrics in one place, spend in
+another, quota limits in a third, invocation logs in a fourth - per account,
+per region, and none of them talking to each other. Standard tools tell you
+**how much** and **how many**, but not **why**, **who**, or **what to do about
+it**. That gap between raw telemetry and operational action is where quota
+surprises, cost inefficiencies, and preventable incidents live.
 
-![Architecture](images/architecture.png)
+Bedrock Ops Lens closes that gap - proactively. It joins the scattered signals
+into one fleet-wide view, watches that view against your thresholds so
+problems surface days before users feel them, and pairs every finding with a
+remediation action ready to execute - so you optimize your AI workloads
+instead of firefighting them. It is an AI operations toolkit you deploy in
+your own AWS account, built from four parts:
 
-![Dashboard demo](images/demo.gif)
+- **A web dashboard** - per-account, per-model, per-team/workload attribution
+  across usage, cost, quota utilization, errors, latency, and model lifecycle,
+  for everyone from engineers to finance.
+- **An MCP server** - the same data in Claude Code, Cursor, or Kiro, so you
+  can ask "which account is closest to its TPM limit?" instead of clicking
+  through tabs.
+- **Proactive notifications** - after every ingest, thresholds are evaluated
+  and findings (quota headroom, throttle creep, cost jumps, models nearing
+  end-of-life) are delivered via SNS with a **prepared remediation**: a
+  ready-to-run CLI command and console link. Most AI production incidents announce
+  themselves days early - this is the part that's watching.
+- **An AI agent** - writes an operational review of the fleet: an executive
+  summary and the top issues, grounded in the same telemetry.
 
-
-## What it does
-
-Cost Explorer rolls all of Bedrock into one line. CloudWatch is per-account. Invocation logs are JSON in S3. This dashboard joins those three signals so you can see per-account, per-model, per-tag attribution in one place. The MCP exposes the same data to your IDE, so you can ask the question instead of clicking through tabs.
-
-**Beyond Bedrock (optional).** Through client telemetry — an OpenTelemetry
+**Beyond Bedrock (optional).** Through client telemetry - an OpenTelemetry
 collector, your GenAI proxy (e.g. a LiteLLM callback), or Claude Code's
-built-in telemetry — the dashboard also ingests traffic that never touches
+built-in telemetry - Bedrock Ops Lens also ingests traffic that never touches
 Bedrock: **direct Anthropic API and direct OpenAI API calls**, with
 per-request tokens, latency, TTFT, retries, estimated cost, and per-user/team
 attribution. A "Usage by provider" view rolls it up across every path
 (bedrock-runtime, bedrock-mantle, anthropic-api, openai-api), so "all our
-Anthropic usage vs all our OpenAI usage" is one table — no AWS-side source
+Anthropic usage vs all our OpenAI usage" is one table - no AWS-side source
 can see that traffic at all. Off by default, honestly labeled as
 client-reported; see
 [Workloads & client telemetry](#workloads-per-workload-attribution-and-client-telemetry-optional)
 and [`tools/client-telemetry/`](tools/client-telemetry/).
+
+The architecture is fully serverless - Lambda, Aurora Serverless v2, CloudFront, S3, EventBridge, and SNS - so there is nothing to patch and idle cost stays low:
+
+![Architecture](images/architecture.png)
+
+*Figure 1: Bedrock Ops Lens architecture - CloudFront-fronted React dashboard and Lambda backend, daily ingestion pipeline joining CloudWatch, Cost Explorer, Service Quotas, and invocation logs into Aurora, with the MCP server path for IDE access and Amazon SNS delivering findings and alerts.*
+
+And this is what the dashboard looks like (per-tab screenshots are in [Screenshots](#screenshots) at the end of this README):
+
+![Dashboard demo](images/demo.gif)
+
+*Figure 2: Dashboard walkthrough - Overview, Cost Insights, Quotas, custom-attribute usage, Governance, By User, and the Ops Review, all populated with synthetic demo data.*
 
 
 ## Two ways to use it
@@ -170,6 +200,44 @@ aws lambda invoke \
 ```
 
 
+## Notifications and findings
+
+An AI workload outage rarely starts as an outage. It starts as a quota creeping past
+80%, a throttle rate inching up on one model, spend drifting above trend, or
+traffic still running on a model that is 30 days from end-of-life. Each of
+those is visible days before users feel it - but only if something is watching
+all the accounts, all the time, and tells the right person. That is what this
+does: it turns Bedrock Ops Lens from a place you *check* into a system that
+*tells you*, so quota headroom has an owner even when nobody is looking at a
+browser tab.
+
+**What you get:** after each ingest, Bedrock Ops Lens evaluates the fresh data
+against your thresholds and raises **findings** across four leading
+indicators - quota utilization vs applied limits (burndown-weighted), throttle
+rate per account/model/region, day-over-average cost jumps, and near-EOL
+models with live traffic. Every finding arrives with a **prepared
+remediation**: what to do, a ready-to-run CLI command, and a console deep link
+(e.g. a pre-filled Service Quotas increase request). You review and execute it
+yourself - Bedrock Ops Lens never modifies monitored accounts. Findings resolve
+automatically when the condition clears, and notifications fire only on
+open/resolve transitions, so a persistent condition alerts once, not daily.
+
+**How to set it up:** findings always show in the bell menu (top navigation).
+For delivery, an admin sets an SNS topic ARN under Settings → Notifications
+and clicks "Send test notification" to verify. Email subscribers get a
+readable digest; Lambda/webhook/EventBridge subscribers get structured JSON -
+so Slack (via AWS Chatbot), PagerDuty, or ticketing hook in with no code
+changes here. Any signed-in user can subscribe their own email from the same
+page.
+
+Why not just CloudWatch alarms? Signals like "peak TPM as % of the applied
+quota" are joins across CloudWatch and Service Quotas - not single metrics -
+and cost/lifecycle findings aren't CloudWatch metrics at all. One set of
+thresholds here covers every monitored account. For minute-level thresholds on
+one metric in one account, a native CloudWatch alarm remains the right tool;
+the two are complements.
+
+
 ## Multi-account data pipeline
 
 **Account names.** Tables show the account ID and account name as separate
@@ -188,7 +256,7 @@ The central Lambda pulls Bedrock data from every account you point it at. One sc
 ./setup-pipeline.sh --scope <single|ou|org-root|accounts> [opts]
 ```
 
-For Cost Explorer, no per-account role is needed at all — the management account's Cost Explorer is org-aware natively and the central Lambda calls it once.
+For Cost Explorer, no per-account role is needed at all - the management account's Cost Explorer is org-aware natively and the central Lambda calls it once.
 
 <details>
 <summary><b>Option 1. Just my own account (single)</b></summary>
@@ -244,7 +312,7 @@ Or via file:
 
 </details>
 
-The script is idempotent — re-run any time accounts are added or removed. Use `--dry-run` to preview without touching anything, `--skip-ingest` to skip the post-rollout ingest run.
+The script is idempotent - re-run any time accounts are added or removed. Use `--dry-run` to preview without touching anything, `--skip-ingest` to skip the post-rollout ingest run.
 
 ### What `setup-pipeline.sh` does
 
@@ -267,7 +335,7 @@ For larger orgs (200+ accounts), shard by OU and run one StackSet per shard, eac
 ./setup-pipeline.sh --scope ou --ou-id ou-experimental-...
 ```
 
-For very large fleets (500+ accounts) the pull architecture becomes the wrong fit — the better pattern is push-mode (CW Metric Streams → Firehose → S3 → central ingester).
+For very large fleets (500+ accounts) the pull architecture becomes the wrong fit - the better pattern is push-mode (CW Metric Streams → Firehose → S3 → central ingester).
 
 
 ## Dashboard tabs
@@ -282,25 +350,25 @@ For very large fleets (500+ accounts) the pull architecture becomes the wrong fi
 | Capacity and Adoption | CRIS adoption, throttle rates, prompt caching opportunities, Claude 4 burndown risk |
 | Model Insights | Per-model deep dive: requests, tokens, cache hit rate, errors, accounts |
 | Model Lifecycle | Live ListFoundationModels joined with usage, timeline of legacy and EOL bands |
-| Workloads | Per-workload / per-user usage, throttle, and latency — **requires a GenAI proxy or client telemetry** (see below). Includes direct **anthropic-api / openai-api** traffic and a "Usage by provider" rollup across all paths. Also per-IAM-principal callers (from invocation logs) and per-project Mantle chargeback |
+| Workloads | Per-workload / per-user usage, throttle, and latency - **requires a GenAI proxy or client telemetry** (see below). Includes direct **anthropic-api / openai-api** traffic and a "Usage by provider" rollup across all paths. Also per-IAM-principal callers (from invocation logs) and per-project Mantle chargeback |
 | By User | Per-caller attribution from invocation-log identity: by app/group (role), user (session), or full principal |
 | Agents & MCP | AgentCore runtimes and MCP gateway tools: invocations, sessions, errors, latency, real billed cost |
 | Compliance | Guardrails interventions by policy type, guardrail, and daily trend |
 | Governance | Declarative registry (`db/registry.yaml`) reconciled against observed usage: compliant, drift, undeclared (shadow AI) |
-| Ops Review | LLM-synthesized executive brief covering the top 3 issues |
+| Ops Review | An AI agent reviews the fleet's findings and writes an executive brief covering the top 3 issues |
 | Settings | Auth identity, ingestion freshness, region and account scope, pinned tag keys |
 
-Two notes on the By User tab. The "user" axis is the `sts:AssumeRole` session name, which the caller chooses — it is audit-grade only if you enforce it (IAM condition on `sts:RoleSessionName`, or IAM Identity Center federation, which pins it to the login); the "group" axis (the role itself) cannot be faked. And since it shows person-level usage to every signed-in dashboard user, check your organization's privacy requirements before enabling broad access.
+Two notes on the By User tab. The "user" axis is the `sts:AssumeRole` session name, which the caller chooses - it is audit-grade only if you enforce it (IAM condition on `sts:RoleSessionName`, or IAM Identity Center federation, which pins it to the login); the "group" axis (the role itself) cannot be faked. And since it shows person-level usage to every signed-in user, check your organization's privacy requirements before enabling broad access.
 
 Every tab except **Workloads** populates automatically from CloudWatch, Cost
-Explorer, Service Quotas, and (optionally) model invocation logs — no
+Explorer, Service Quotas, and (optionally) model invocation logs - no
 application changes required. The Workloads tab is opt-in and needs the setup
 below.
 
 
 ## Which attribution source when?
 
-The dashboard has several ways to answer "who / what is driving usage" —
+Bedrock Ops Lens has several ways to answer "who / what is driving usage" -
 deliberately, because they differ in coverage and trust. Quick guide:
 
 | You want to know… | Look at | Data source | Trust level | Needs |
@@ -313,9 +381,9 @@ deliberately, because they differ in coverage and trust. Quick guide:
 | Real **dollars** by account/service | **Cost Insights** tab | Cost Explorer | AWS-billed | Nothing |
 
 Rules of thumb: **AWS-witnessed** sources (logs, CloudWatch, Cost Explorer)
-are what finance and audits should use — they can't be spoofed, but they only
+are what finance and audits should use - they can't be spoofed, but they only
 see bedrock-runtime. **Client-reported** sources see everything the client
-experienced — retries, TTFT, Mantle, direct APIs — but only for instrumented
+experienced - retries, TTFT, Mantle, direct APIs - but only for instrumented
 traffic, and the numbers are self-reported (the UI labels them). The two are
 complements: same question, different halves of the truth. It's normal to
 run both.
@@ -323,7 +391,7 @@ run both.
 ## Workloads: per-workload attribution and client telemetry (optional)
 
 The Workloads tab answers **"which of my use-cases is driving usage, throttling,
-and latency"** — CloudWatch can't, because it's keyed by model, not by your
+and latency"** - CloudWatch can't, because it's keyed by model, not by your
 application. It needs a shared layer in front of your model calls (LiteLLM, a
 gateway, an SDK wrapper) that emits **one metadata-only event per request** to
 S3. No proxy layer → this tab stays empty; everything else works normally.
@@ -341,7 +409,7 @@ billing/quota truth.
 1. **Emit events.** Easiest: already on LiteLLM? Drop in the ready-made
    callback from [`tools/client-telemetry/`](tools/client-telemetry/) (also
    has OTEL-collector and Claude Code on-ramps). Building your own? Copy
-   `tools/reference-proxy/` — one NDJSON line per request to:
+   `tools/reference-proxy/` - one NDJSON line per request to:
 
    ```
    s3://<your-bucket>/proxy-events/<region>/<YYYY>/<MM>/<DD>/<HH>/*.jsonl
@@ -357,11 +425,11 @@ billing/quota truth.
    `dimensions` holds whatever attributes you slice by. `endpoint` is
    `runtime`, `mantle`, `anthropic-api`, or `openai-api`. Optional `ttft_ms`,
    `retry_attempts`, `cost_usd_est` enable the TTFT, retry, and estimated-cost
-   columns. Metadata only — no prompt or response text ever leaves your proxy.
+   columns. Metadata only - no prompt or response text ever leaves your proxy.
 
-2. **Grant read access** — bucket policy allowing the ingester role
+2. **Grant read access** - bucket policy allowing the ingester role
    `s3:GetObject` + `s3:ListBucket` on `.../proxy-events/*` (read-only,
-   cross-account supported; the dashboard never sits in your request path).
+   cross-account supported; Bedrock Ops Lens never sits in your request path).
 
 3. **Deploy pointing at the bucket:**
    ```bash
@@ -375,22 +443,22 @@ billing/quota truth.
 
 AWS's native mechanisms ([Bedrock cost
 management](https://docs.aws.amazon.com/bedrock/latest/userguide/cost-management.html))
-answer **dollars** by principal / inference profile / Mantle Project — and this
-dashboard uses them where they fit. What they don't emit is **throttle rate,
+answer **dollars** by principal / inference profile / Mantle Project - and this
+toolkit uses them where they fit. What they don't emit is **throttle rate,
 latency, or TPM quota utilization per workload**, and they don't cover
 non-Bedrock traffic. The two paths are complements:
 
 | | AWS-native (`requestMetadata` tags) | Proxy / client events |
 |---|---|---|
-| Setup | Tag calls + invocation logging on — no proxy | Emitter (LiteLLM callback, OTEL, or your gateway) |
+| Setup | Tag calls + invocation logging on - no proxy | Emitter (LiteLLM callback, OTEL, or your gateway) |
 | Coverage | `bedrock-runtime` only | runtime + mantle + direct Anthropic/OpenAI APIs |
 | Metrics | Tokens + volume | + throttle %, latency, TTFT, retries, quota %, est. cost |
 | Freshness | Daily batch | ~Hourly |
 | Trust | AWS-witnessed | Client-reported |
 
 Already running invocation logging with tagged requests? You get
-usage-by-attribute with zero proxy work — pick "Option 1" in Settings. Want
-throttle/latency/quota per workload or non-Bedrock coverage? Emit events —
+usage-by-attribute with zero proxy work - pick "Option 1" in Settings. Want
+throttle/latency/quota per workload or non-Bedrock coverage? Emit events -
 "Option 2". Running both is normal.
 
 > **Transport note:** the event shape is transport-agnostic; S3 NDJSON is the
@@ -455,65 +523,80 @@ MIT License. See `LICENSE` for details.
 ## Screenshots
 
 > **Note:** All screenshots below show **synthetic demo data** generated by
-> `db/seed.py` — every account ID, account name, application, user, and metric
+> `db/seed.py` - every account ID, account name, application, user, and metric
 > is invented for demonstration. No real AWS accounts or customer data appear
 > in any image.
 
 ### Overview
 ![Fleet-wide KPIs and request volume chart broken down by model](images/screenshots/overview.png)
-Fleet-wide KPI tiles and a 7-day request volume breakdown by model across all accounts.
+
+*Figure 3: Overview tab showing fleet-wide KPI tiles and a 7-day request volume breakdown by model across all accounts*
 
 ### Quotas
 ![Quota utilization charts (TPM and RPM vs. limits) with a filterable table](images/screenshots/quotas.png)
-Peak TPM/RPM vs. Service Quotas limits, plus a filterable utilization table per account and model.
+
+*Figure 4: Quotas tab comparing peak TPM/RPM against applied Service Quotas limits, with a filterable utilization table per account and model*
 
 ### Cost Insights
 ![Daily spend by model family stacked chart with a sortable cost table](images/screenshots/cost-insights.png)
-Daily spend stacked by model family (Nova, Titan, Claude Haiku/Sonnet/Opus) with a per-model cost breakdown table.
+
+*Figure 5: Cost Insights tab with daily spend stacked by model family and a per-model cost breakdown table*
 
 ### Health & Errors
 ![Error status code timeline, throttled vs. 4xx/5xx stacked area, and error rate trend](images/screenshots/health-errors.png)
-Status-code timeline, throttle vs. server-error stacked area, and a fleet-wide error-rate trend line.
+
+*Figure 6: Health & Errors tab with status-code timeline, throttle vs. server-error stacked area, and fleet-wide error-rate trend*
 
 ### Latency
 ![Horizontal bar chart of end-to-end latency by model at p50/p90/p99](images/screenshots/latency.png)
-End-to-end latency by model (p50/p90/p99 horizontal bars) and a sortable latency details table.
+
+*Figure 7: Latency tab showing end-to-end latency by model at p50/p90/p99 with a sortable details table*
 
 ### Capacity & Adoption
 ![CRIS vs. On-Demand capacity donut, regional distribution donut, adoption table, and adoption trend line](images/screenshots/capacity-adoption.png)
-Capacity breakdown (CRIS vs. On-Demand), regional distribution across accounts, a per-model adoption table, and adoption percentage trend over time.
+
+*Figure 8: Capacity & Adoption tab with CRIS vs. On-Demand breakdown, regional distribution, per-model adoption table, and adoption trend*
 
 ### Model Lifecycle
 ![Lifecycle table with severity indicators for legacy/EOL models](images/screenshots/model-lifecycle.png)
-Lifecycle tracking — legacy/extended-access/EOL milestones for models still receiving traffic.
+
+*Figure 9: Model Lifecycle tab tracking legacy, extended-access, and end-of-life milestones for models still receiving traffic*
 
 ### Model Insights
 ![Provider share donut and spend-by-model-family donut charts](images/screenshots/model-insights.png)
-Provider share (Amazon vs. Anthropic), spend-by-model-family breakdown, and per-model deep-dive.
+
+*Figure 10: Model Insights tab with provider share, spend-by-model-family breakdown, and per-model deep-dive*
 
 ### Usage · Custom Attributes
 ![Endpoint switcher (bedrock-runtime, bedrock-mantle, anthropic-api, openai-api) with tokens-by-workload chart](images/screenshots/workloads-client-telemetry.png)
-Multi-endpoint view with per-workload token consumption broken down by custom attributes.
+
+*Figure 11: Usage · Custom Attributes tab with the endpoint switcher (bedrock-runtime, bedrock-mantle, anthropic-api, openai-api) and per-workload token consumption*
 
 ![Throttle rate chart and usage table by workload](images/screenshots/workloads-by-provider.png)
-Throttle-rate view and detailed usage table by client-reported workload.
+
+*Figure 12: Usage · Custom Attributes tab showing per-workload quota utilization and the detailed usage table from client-reported telemetry*
 
 ### By User / App / Principal
 ![Top callers bar chart with a paginated callers table](images/screenshots/by-user.png)
-Top callers ranked by request volume, filterable by App/Group, User, or IAM Principal.
+
+*Figure 13: By User tab ranking top callers by request volume, pivotable by App/Group, User, or IAM Principal*
 
 ### Agents & MCP
 ![AgentCore runtimes table and MCP tools inventory](images/screenshots/agents-mcp.png)
-AgentCore runtimes and MCP tool invocation inventory with request and token breakdowns.
+
+*Figure 14: Agents & MCP tab with AgentCore runtime inventory and MCP tool invocations, sessions, errors, and latency*
 
 ### Compliance (Guardrails)
 ![Guardrails interventions-by-policy bar chart and detail table](images/screenshots/compliance.png)
-Guardrails intervention counts by policy type with a per-guardrail detail table.
+
+*Figure 15: Compliance tab with Guardrails intervention counts by policy type and a per-guardrail detail table*
 
 ### Governance
 ![Shadow-AI reconciliation table with status indicators](images/screenshots/governance.png)
-Shadow-AI reconciliation — surfaces unmanaged endpoints and traffic not routed through the proxy layer.
 
-### Ops Review (AI-Synthesized)
-![At-a-glance ribbon with alert counts and AI-generated executive summary](images/screenshots/ops-review.png)
-AI-synthesized operational review — at-a-glance ribbon, executive summary, and key findings generated from live fleet telemetry.
+*Figure 16: Governance tab reconciling the declared AI-app registry against observed usage to surface undeclared shadow-AI traffic*
+
+### Ops Review (AI Agent)
+![At-a-glance ribbon with alert counts and an executive summary written by the Ops Review AI agent](images/screenshots/ops-review.png)
+
+*Figure 17: Ops Review tab with the at-a-glance ribbon and an executive summary written by the Ops Review AI agent, grounded in fleet telemetry*

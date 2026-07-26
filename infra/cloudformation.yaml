@@ -868,6 +868,13 @@ Resources:
               - Effect: Allow
                 Action: [ ssm:GetParameter ]
                 Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bedrock-ops-lens/*'
+              # Notifications (009): test-publish + email-subscribe against the
+              # admin-configured alerts topic. Scoped to THIS account's topics —
+              # the only AWS write in the notifications feature; monitored
+              # accounts stay read-only.
+              - Effect: Allow
+                Action: [ sns:Publish, sns:Subscribe ]
+                Resource: !Sub 'arn:${AWS::Partition}:sns:*:${AWS::AccountId}:*'
 
   BackendLambda:
     Type: AWS::Lambda::Function
@@ -1061,6 +1068,12 @@ Resources:
               - Effect: Allow
                 Action: sts:AssumeRole
                 Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/BedrockOpsLensReader'
+              # Notifications (009): publish finding transitions to the
+              # admin-configured alerts topic (central account only — the one
+              # AWS write in the notifications feature).
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Sub 'arn:${AWS::Partition}:sns:*:${AWS::AccountId}:*'
               # Organizations read for discover-org mode. Without these,
               # MONITORED_ACCOUNTS_MODE=discover-org silently degrades to
               # single-account because ListAccounts returns AccessDenied.
