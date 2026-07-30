@@ -258,7 +258,12 @@ async def _detect_model_eol(conn, th: dict) -> list[dict]:
                SUM(p.total_requests) AS reqs
         FROM dim_model_lifecycle l
         JOIN f_hourly_peak p
-          ON p.modelId = l.modelId AND p.region = l.region
+             -- CloudWatch records cross-region inference-profile traffic with a
+             -- geo prefix (us./eu./apac./us-gov.), but dim_model_lifecycle stores
+             -- the base modelId from ListFoundationModels. Strip the prefix so
+             -- profiled models still match their lifecycle row.
+          ON regexp_replace(p.modelId, '^(us|eu|apac|us-gov)\.', '') = l.modelId
+         AND p.region = l.region
          AND p.event_date >= current_date - 7
         WHERE COALESCE(l.end_of_life_time, l.legacy_time) IS NOT NULL
         GROUP BY 1,2,3,4,5
