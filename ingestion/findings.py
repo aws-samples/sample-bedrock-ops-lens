@@ -259,10 +259,13 @@ async def _detect_model_eol(conn, th: dict) -> list[dict]:
         FROM dim_model_lifecycle l
         JOIN f_hourly_peak p
              -- CloudWatch records cross-region inference-profile traffic with a
-             -- geo prefix (us./eu./apac./us-gov.), but dim_model_lifecycle stores
-             -- the base modelId from ListFoundationModels. Strip the prefix so
-             -- profiled models still match their lifecycle row.
-          ON regexp_replace(p.modelId, '^(us|eu|apac|us-gov)\.', '') = l.modelId
+             -- geo prefix (us./eu./apac./us-gov./global.), but dim_model_lifecycle
+             -- stores the base modelId from ListFoundationModels. Strip the prefix
+             -- so profiled models still match their lifecycle row.
+             -- Known limitation: CloudWatch occasionally emits a short-form id
+             -- (e.g. anthropic.claude-haiku-4-5) without the version suffix
+             -- (-20251001-v1:0); those still won't match and are not handled here.
+          ON regexp_replace(p.modelId, '^(us|eu|apac|us-gov|global)\.', '') = l.modelId
          AND p.region = l.region
          AND p.event_date >= current_date - 7
         WHERE COALESCE(l.end_of_life_time, l.legacy_time) IS NOT NULL
