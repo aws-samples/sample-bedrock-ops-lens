@@ -12,7 +12,7 @@
     "@cloudscape-design/collection-hooks": "^1.0.96",
     "@cloudscape-design/components": "^3.0.1298",
     "@cloudscape-design/global-styles": "^1.0.59",
-    "dompurify": "^3.4.6",
+    "dompurify": "^3.4.12",
     "marked": "^18.0.4",
     "mermaid": "^11.15.0",
     "react": "^18.3.1",
