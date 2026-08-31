@@ -138,6 +138,45 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
         *where.params,
     )
 
+    # Per-(model, account) drill-down for the expandable "All models" rows —
+    # same shape as the Model Lifecycle tab's accounts_detail so the UI can
+    # reuse that row-detail pattern. One extra grouped scan of the same
+    # filtered window; account NAMES are resolved client-side from
+    # /api/accounts (no join here, per the dim_account convention).
+    detail_rows = await db.fetch(
+        f"""
+        SELECT modelId, accountId,
+               SUM(total_requests)::BIGINT                 AS total_requests,
+               SUM(total_input_tokens)::BIGINT             AS input_tokens,
+               SUM(total_output_tokens)::BIGINT            AS output_tokens,
+               SUM(status_429_count)::BIGINT               AS throttled,
+               SUM(failed_requests)::BIGINT                AS failed_requests,
+               array_agg(DISTINCT region ORDER BY region)  AS regions,
+               MAX(event_date)                             AS last_accessed
+        FROM f_daily
+        WHERE {where.sql}
+        GROUP BY modelId, accountId
+        ORDER BY modelId, total_requests DESC
+        """,
+        *where.params,
+    )
+    detail_by_model: dict[str, list] = {}
+    for r in detail_rows:
+        dmid = r["modelid"] if "modelid" in r else r["modelId"]
+        aid = r["accountid"] if "accountid" in r else r["accountId"]
+        d_req = int(r["total_requests"] or 0)
+        d_failed = int(r["failed_requests"] or 0)
+        detail_by_model.setdefault(dmid, []).append({
+            "accountId":      aid,
+            "total_requests": d_req,
+            "input_tokens":   int(r["input_tokens"] or 0),
+            "output_tokens":  int(r["output_tokens"] or 0),
+            "throttled":      int(r["throttled"] or 0),
+            "error_rate":     round((d_failed / d_req * 100) if d_req else 0, 3),
+            "regions":        list(r["regions"] or []),
+            "last_accessed":  r["last_accessed"].isoformat() if r["last_accessed"] else None,
+        })
+
     out = []
     for r in rows:
         mid = r["modelid"] if "modelid" in r else r["modelId"]
@@ -177,5 +216,6 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
             "error_rate":       round(error_rate, 3),
             "unique_accounts":  int(r["unique_accounts"] or 0),
             "cost_estimate_usd": round(cost_est, 2),
+            "accounts_detail":  detail_by_model.get(mid, []),
         })
     return out

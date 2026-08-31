@@ -16,7 +16,7 @@ import {
   Container, Header, SpaceBetween, ColumnLayout, PieChart, Box, Grid,
   StatusIndicator,
 } from '@cloudscape-design/components';
-import { useApi, fmt } from '../api.js';
+import { useApi, fmt, accountName, useAccountNames } from '../api.js';
 import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import ProviderIcon from '../components/ProviderIcon.jsx';
@@ -133,6 +133,7 @@ export default function ModelInsightsTab({ filters, onInfo }) {
 }
 
 function ModelInsightsBody({ filters, onInfo, endpoint }) {
+  useAccountNames();   // resolve account names for the per-account drill-down
   // Mantle CloudWatch publishes no cache-token metric, so cache-hit % is
   // meaningless on the mantle slice — hide that stat there (thumb rule: show
   // only what the endpoint actually exposes). Requests/tokens ARE real.
@@ -218,22 +219,93 @@ function ModelInsightsBody({ filters, onInfo, endpoint }) {
     );
   }
 
-  const tableColumns = [
-    {
-      id: 'icon', header: '', minWidth: 40, width: 40,
-      cell: (m) => <ProviderIcon provider={m.provider} size={20} />,
-      exportValue: m => m.provider || '',
-    },
-    {
-      id: 'model', header: 'Model', minWidth: 240,
-      cell: (m) => (
-        <Box>
-          <Box>{m.public_name || m.modelId}</Box>
-          <Box color="text-body-secondary" fontSize="body-s"><code>{m.modelId}</code></Box>
+  // Expandable per-account drill-down, same pattern as the Model Lifecycle
+  // tab's legacy-model table. Account NAMES resolve client-side from the
+  // /api/accounts cache (useAccountNames above) — Account ID and Account name
+  // are separate columns so CSV exports stay machine-readable.
+  const renderRowDetail = (m) => {
+    const rows = m.accounts_detail || [];
+    if (rows.length === 0) {
+      return (
+        <Box color="text-body-secondary" padding={{ vertical: 's' }}>
+          No per-account usage of <code>{m.modelId}</code> in the selected window.
         </Box>
+      );
+    }
+    return (
+      // The detail renders INSIDE the parent table's first cell, so an
+      // intrinsically-wide child stretches that column and shoves the parent's
+      // own columns off-screen. Capping the wrapper and letting the nested
+      // table scroll inside it keeps the parent layout intact.
+      <Box padding={{ vertical: 's' }}>
+        <Header variant="h3">Accounts using this model</Header>
+        <div style={{ overflowX: 'auto', maxWidth: 820 }}>
+        <PaginatedTable
+          variant="embedded"
+          pageSize={5}
+          items={rows}
+          empty="No accounts"
+          searchPlaceholder="Search accounts…"
+          // No minWidths, and Regions is summarized rather than fully spelled
+          // out: this table renders INSIDE the parent table's first cell, so a
+          // wide detail table stretches that column and pushes the parent's
+          // own columns off-screen. Keep it compact. Full region list and
+          // per-account tokens are still in the CSV export.
+          columnDefinitions={[
+            { id: 'accountId', header: 'Account ID',
+              cell: r => <code>{r.accountId}</code>,
+              exportValue: r => r.accountId },
+            { id: 'accountName', header: 'Account name',
+              cell: r => accountName(r.accountId) || '—',
+              exportValue: r => accountName(r.accountId) },
+            { id: 'requests', header: 'Requests',
+              cell: r => fmt(r.total_requests), exportValue: r => r.total_requests },
+            { id: 'tokens', header: 'Tokens in / out',
+              cell: r => `${fmt(r.input_tokens)} / ${fmt(r.output_tokens)}`,
+              exportValue: r => `${r.input_tokens} / ${r.output_tokens}` },
+            { id: 'errors', header: 'Error rate',
+              cell: r => fmtPct(r.error_rate), exportValue: r => r.error_rate },
+            { id: 'throttled', header: 'Throttled',
+              cell: r => fmt(r.throttled), exportValue: r => r.throttled },
+            { id: 'regions', header: 'Regions',
+              cell: r => {
+                const rg = r.regions || [];
+                if (rg.length === 0) return '—';
+                return rg.length <= 2 ? rg.join(', ') : `${rg.slice(0, 2).join(', ')} +${rg.length - 2}`;
+              },
+              exportValue: r => (r.regions || []).join(' ') },
+            { id: 'last', header: 'Last used',
+              cell: r => r.last_accessed || '—' },
+          ]}
+        />
+        </div>
+      </Box>
+    );
+  };
+
+  const tableColumns = [
+    // Provider icon lives INSIDE the Model column rather than in its own 40px
+    // column: PaginatedTable puts the expand caret in column 0, and a 40px
+    // column-0 meant an expanded row showed only a caret and an icon while the
+    // model name got pushed out of view. Icon + name + id together keep the
+    // row identifiable when it's expanded.
+    {
+      id: 'model', header: 'Model', minWidth: 260,
+      cell: (m) => (
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+          <span style={{ flex: '0 0 auto', paddingTop: 2 }}>
+            <ProviderIcon provider={m.provider} size={20} />
+          </span>
+          <Box>
+            <Box>{m.public_name || m.modelId}</Box>
+            <Box color="text-body-secondary" fontSize="body-s"><code>{m.modelId}</code></Box>
+          </Box>
+        </div>
       ),
       exportValue: m => m.public_name ? `${m.public_name} (${m.modelId})` : m.modelId,
     },
+    // Keeps provider in the CSV export now that the icon-only column is gone.
+    { id: 'provider',     header: 'Provider',      cell: m => providerLabel(m.provider), exportValue: m => m.provider || '' },
     { id: 'requests',     header: 'Requests',      cell: m => fmt(m.total_requests), exportValue: m => m.total_requests },
     { id: 'input',        header: 'Input tokens',  cell: m => fmt(m.input_tokens),   exportValue: m => m.input_tokens },
     { id: 'output',       header: 'Output tokens', cell: m => fmt(m.output_tokens),  exportValue: m => m.output_tokens },
@@ -358,6 +430,8 @@ function ModelInsightsBody({ filters, onInfo, endpoint }) {
               empty="No models in scope."
               searchPlaceholder="Search by model id, name, provider…"
               columnDefinitions={tableColumns}
+              trackBy="modelId"
+              renderRowDetail={renderRowDetail}
             />
         }
       </Container>

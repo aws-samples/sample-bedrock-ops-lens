@@ -265,7 +265,7 @@ async def _detect_model_eol(conn, th: dict) -> list[dict]:
              -- Known limitation: CloudWatch occasionally emits a short-form id
              -- (e.g. anthropic.claude-haiku-4-5) without the version suffix
              -- (-20251001-v1:0); those still won't match and are not handled here.
-          ON regexp_replace(p.modelId, '^(us|eu|apac|us-gov|global)\.', '') = l.modelId
+          ON regexp_replace(p.modelId, '^(us|eu|apac|us-gov|global)\\.', '') = l.modelId
          AND p.region = l.region
          AND p.event_date >= current_date - 7
         WHERE COALESCE(l.end_of_life_time, l.legacy_time) IS NOT NULL
