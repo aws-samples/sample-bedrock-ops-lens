@@ -991,17 +991,61 @@ Resources:
           DB_SECRET_ARN: !Ref DbSecret
 
   # CFN custom resource — invokes SchemaInitLambda at stack-create.
-  # Stack provisioning blocks until the Lambda signals SUCCESS (or 1h timeout).
-  # ServiceTimeout caps that wait at the Lambda's own Timeout (300s) — without
-  # this, a hung schema-init could stall the stack for an hour.
+  # Stack provisioning blocks until the Lambda signals SUCCESS, or until
+  # ServiceTimeout (set below to 300s, matching the Lambda's own Timeout) rather
+  # than CloudFormation's one-hour default.
   SchemaInit:
     Type: Custom::SchemaInit
-    DependsOn: [ DbWriter ]
+    # The egress dependencies are load-bearing for stack DELETE, not create.
+    #
+    # CloudFormation deletes a resource's dependencies AFTER the resource
+    # itself, so anything this Lambda needs in order to answer must be listed
+    # here. Measured on a real teardown before this was added: SchemaInit
+    # entered DELETE_IN_PROGRESS at 02:12:02.373 and S3GatewayEndpoint reached
+    # DELETE_COMPLETE at 02:12:03.667 — 1.3 seconds later — followed by the
+    # private route table (02:12:20) and the NAT gateway (02:12:41). The Lambda
+    # lives in private subnets, so it had lost every route to AWS before it
+    # could PUT its response to the presigned S3 callback URL. Nothing was even
+    # logged, because CloudWatch Logs delivery needs the same egress. The stack
+    # then sat in DELETE_IN_PROGRESS for the full custom-resource timeout and
+    # finished DELETE_FAILED, requiring
+    # `delete-stack --retain-resources SchemaInit` by hand.
+    #
+    # The S3 gateway endpoint alone was not enough: it had no ordering
+    # relationship with this resource, so it was torn down first anyway.
+    #
+    # Nor was depending on the endpoint, the route and the NAT gateway enough.
+    # A second measured teardown showed why — the SUBNET ASSOCIATIONS are the
+    # load-bearing part, and they were not listed:
+    #
+    #     04:01:08.927  SchemaInit           DELETE_IN_PROGRESS
+    #     04:01:24.944  PrivateSubnet2Assoc  DELETE_COMPLETE
+    #     04:01:25.048  PrivateSubnet1Assoc  DELETE_COMPLETE
+    #     04:03:59      Lambda invoked (2.5 min AFTER the detach)
+    #     04:06:02      URLError: [Errno 110] Connection timed out
+    #
+    # Detaching the private subnets from PrivateRouteTable drops them onto the
+    # VPC's main route table, which has neither the NAT route nor the S3 endpoint
+    # route — so the callback had no path even though the endpoint, route and NAT
+    # all still existed. The Lambda ran and logged fine (log delivery had already
+    # been established); only the outbound TCP connect failed.
+    DependsOn:
+      - DbWriter
+      - S3GatewayEndpoint
+      - DefaultPrivateRoute
+      - NatGateway
+      - PrivateSubnet1Assoc
+      - PrivateSubnet2Assoc
     Properties:
       ServiceToken: !GetAtt SchemaInitLambda.Arn
       # Bumping this string forces re-run on stack-update (e.g. after schema
       # changes). Default value tied to stack name keeps it stable per stack.
       SchemaVersion: !Sub '${AWS::StackName}-v1'
+      # Bound the blast radius if the callback is ever lost again: CloudFormation
+      # waits this long instead of the default hour. The comment above this
+      # resource previously CLAIMED this cap was in place, but the property was
+      # never actually set — which is why the hang cost 60 minutes, not 5.
+      ServiceTimeout: 300
 
   # ===========================================================================
   # Ingester Lambda — pulls Bedrock CW metrics, invocation logs, cost,

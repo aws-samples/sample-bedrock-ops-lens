@@ -4,12 +4,17 @@ A GenAI proxy fronting Bedrock signs every request with one IAM role, so caller
 identity can't attribute usage. Instead the proxy emits one metadata-only event
 per request into S3 carrying an arbitrary `dimensions` map (workload / env /
 business_unit / cost_center / …). ingestion/proxy_events.py fans each request
-out to one row per (dim_key, dim_value) in f_proxy_dim_hourly — the same
-discipline as f_daily_tagged, so summing a single dim_key is correct.
+out to one row per (dim_key, dim_value) in f_proxy_dim_hourly - the same
+discipline as f_daily_tagged. Summing ONE dim_key therefore avoids
+multiply-counting, but it is NOT a fleet total: the maps are sparse, so a request
+that carries only `team` contributes nothing to `workload`. For a total, read the
+'__all__' accounting row, which the ingester writes once per request and which is
+excluded from the attribute pickers (audit T09).
 
 These endpoints power the "by dimension" views: tokens, throttle rate, error
-rate, latency, request volume, AND per-value quota utilization — endpoint-
-agnostic (runtime + mantle) since the proxy reports the same shape for both.
+rate, latency, request volume, AND per-value quota utilization. Quota
+utilization covers AWS-billed endpoints only (runtime + mantle); direct-provider
+calls consume no AWS quota and are reported separately (audit T08).
 `workload` is just the conventional default dimension key.
 
 Endpoints:
@@ -24,7 +29,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from .. import db
+from .. import db, proxy_quota
 from ..auth import is_admin
 from ..burndown import output_burndown_rate
 
@@ -36,6 +41,11 @@ router = APIRouter()
 _WORKLOADS_ENABLED_KEY = "workloads_tab_enabled"
 
 # The conventional default dimension key when the UI doesn't specify one.
+# Endpoints AWS bills and enforces quotas for. anthropic-api / openai-api go
+# straight to the provider, so no AWS quota or Cost Explorer line applies
+# to them (audit T07/T08).
+AWS_BILLED_ENDPOINTS = ("runtime", "mantle")
+
 _DEFAULT_DIM = "workload"
 
 
@@ -193,11 +203,18 @@ async def workload_usage(
           SUM(error_count)::BIGINT      AS errors,
           ROUND(100.0 * SUM(throttled_count) / NULLIF(SUM(total_requests),0), 3) AS throttle_pct,
           ROUND(100.0 * SUM(error_count)     / NULLIF(SUM(total_requests),0), 3) AS error_pct,
+          -- Audit T10: percentiles are not mergeable, so MAX() over hourly
+          -- buckets is the WORST BUCKET's percentile - an upper bound on the
+          -- population's. Declared so no caller can read it as a true
+          -- quantile. /attribution/xtab/latency-by-model computes real
+          -- percentiles from f_request_events when the window is inside raw
+          -- retention.
           MAX(p50_latency_ms) AS p50_latency_ms,
           MAX(p90_latency_ms) AS p90_latency_ms,
           MAX(p99_latency_ms) AS p99_latency_ms,
           MAX(p50_ttft_ms)    AS p50_ttft_ms,
           MAX(p90_ttft_ms)    AS p90_ttft_ms,
+          'worst_bucket_upper_bound' AS percentile_basis,
           SUM(retried_count)::BIGINT AS retried,
           SUM(cost_usd_est)::DOUBLE PRECISION AS cost_usd_est,
           array_agg(DISTINCT endpoint) AS endpoints
@@ -234,15 +251,24 @@ _PROVIDER_SQL = """
 async def workload_usage_by_provider(days: int = Query(14, ge=1, le=90)):
     """Client-telemetry usage rolled up by PROVIDER (model family) × PATH
     (endpoint). Answers "Anthropic everywhere vs OpenAI everywhere", including
-    direct-API traffic no AWS-side source can see. dim_key is pinned to one
-    key per the fan-out rule; any key covers 100% of requests, so we pick the
-    highest-volume key in the window for correct totals."""
+    direct-API traffic no AWS-side source can see. Reads the '__all__' accounting
+    row (one row per request). The previous claim that "any key covers 100% of
+    requests" was wrong: client-reported attributes are sparse, so pinning to the
+    busiest attribute key dropped every request that did not carry it (audit
+    T09)."""
     rows = await db.fetch(
         f"""
         WITH pinned AS (
+          -- Audit T09: prefer the '__all__' accounting row, which carries one
+          -- row per request regardless of which attributes the caller sent.
+          -- Picking the highest-volume ATTRIBUTE key instead lost every request
+          -- (and any provider) whose traffic never carries that key. Falls back
+          -- to the widest real key for data ingested before '__all__' existed.
           SELECT dim_key FROM f_proxy_dim_hourly
           WHERE event_date >= current_date - $1::int
-          GROUP BY dim_key ORDER BY SUM(total_requests) DESC LIMIT 1
+          GROUP BY dim_key
+          ORDER BY (dim_key = '__all__') DESC, SUM(total_requests) DESC
+          LIMIT 1
         )
         SELECT
           {_PROVIDER_SQL} AS provider,
@@ -254,8 +280,15 @@ async def workload_usage_by_provider(days: int = Query(14, ge=1, le=90)):
           SUM(error_count)::BIGINT       AS errors,
           SUM(retried_count)::BIGINT     AS retried,
           SUM(cost_usd_est)::DOUBLE PRECISION AS cost_usd_est,
+          -- Audit T10: percentiles are not mergeable, so MAX() over hourly
+          -- buckets is the WORST BUCKET's percentile - an upper bound on the
+          -- population's. Declared so no caller can read it as a true
+          -- quantile. /attribution/xtab/latency-by-model computes real
+          -- percentiles from f_request_events when the window is inside raw
+          -- retention.
           MAX(p90_latency_ms) AS p90_latency_ms,
           MAX(p90_ttft_ms)    AS p90_ttft_ms,
+          'worst_bucket_upper_bound' AS percentile_basis,
           COUNT(DISTINCT modelId)::BIGINT AS distinct_models
         FROM f_proxy_dim_hourly
         WHERE event_date >= current_date - $1::int
@@ -306,117 +339,60 @@ async def workload_usage_quota(
     days: int = Query(14, ge=1, le=90),
     endpoint: str = Query("all"),
     dim_key: str = Query(_DEFAULT_DIM),
+    accounts: list[str] | None = Query(None),
+    region: str = Query("all"),
 ):
     """Per-value TPM quota-utilization ESTIMATE for one dimension key.
 
-    Answers the common enterprise ask: "quota utilization by workload." Quota limits are
-    set per (account, model, region) — never per workload — so we attribute a
-    share of that ceiling to each dimension value:
+    Answers the common enterprise ask: "quota utilization by workload." Quota
+    limits are set per (account, model, region) — never per workload — so a share
+    of that ceiling is attributed to each dimension value:
 
       1. For each (dim_value, model) find the PEAK hour of quota-tokens, where
          quota_tokens = input_tokens + output_tokens * burndown_rate(model)
          (cache-read excluded per the AWS burndown doc; the proxy doesn't report
          cache-write, so this is a proxy-derived estimate that can slightly
          UNDER-count vs CloudWatch's EstimatedTPMQuotaUsage).
-      2. Convert peak-hour quota-tokens → per-minute TPM (÷60).
-      3. Divide by the applicable TPM limit from f_quotas (applied_value if set,
-         else default_value) for that model, picking the matching traffic tier.
+      2. Convert peak-hour quota-tokens → per-minute TPM.
+      3. Divide by the limit resolved for that (account, region, model, family).
       4. utilization% = peak_tpm / limit * 100, taking the worst model per value.
 
     Burndown applies only to bedrock-runtime; mantle rate is forced to 1.
     Honestly labeled `is_estimate: true` — it's a proxy-derived approximation.
-    """
-    endpoint = _resolve_endpoint(endpoint)
-    params: list = [days, dim_key]
-    ep_clause = ""
-    if endpoint != "all":
-        params.append(endpoint)
-        ep_clause = f" AND endpoint = ${len(params)}"
 
-    # Per (dim_value, model, endpoint, region, hour) sum tokens, so we can apply
-    # the per-model burndown rate before taking the peak hour.
-    rows = await db.fetch(
+    The resolution itself lives in app/proxy_quota.py, shared with
+    /attribution/quota. Previously each endpoint had its own copy and they
+    disagreed: both matched a quota row on ANY token of its name (so a Sonnet
+    model could inherit a Haiku ceiling and read 200% instead of 10%) and both
+    fell back to the region's smallest limit when nothing matched. There is now
+    one resolver, it requires every token of the quota name to match, it keys on
+    the account, and an unmatched model reports an UNKNOWN limit rather than
+    borrowing another model's.
+    """
+    rows = db.rows_to_dicts(await db.fetch(
         f"""
-        SELECT dim_value, modelId, endpoint, region, event_date, hour,
+        SELECT dim_value, modelId, endpoint, region, accountId,
           SUM(input_tokens)::BIGINT  AS input_tokens,
           SUM(output_tokens)::BIGINT AS output_tokens
         FROM f_proxy_dim_hourly
-        WHERE event_date >= current_date - $1::int AND dim_key = $2{ep_clause}
-        GROUP BY dim_value, modelId, endpoint, region, event_date, hour
-        """,
-        *params,
-    )
+        WHERE {" AND ".join(_quota_scope_parts(days, dim_key, endpoint, accounts, region)[0])}
+        GROUP BY dim_value, modelId, endpoint, region, accountId, event_date, hour
+        """, *_quota_scope_parts(days, dim_key, endpoint, accounts, region)[1]))
+    return await proxy_quota.score(rows, group_key="dim_value")
 
-    # Load TPM limits keyed by (model_name, region). We match a model id to a
-    # quota row by substring on model_name (quota model_name is a friendly name
-    # like 'Claude Sonnet 4.5'); fall back to the min TPM limit for the region.
-    quota_rows = await db.fetch(
-        "SELECT region, model_name, traffic_type, metric, applied_value, default_value "
-        "FROM f_quotas WHERE metric = 'TPM'"
-    )
-    # region -> list of (model_name_lower, limit)
-    region_quotas: dict[str, list[tuple[str, float]]] = {}
-    for q in quota_rows:
-        lim = q["applied_value"] or q["default_value"]
-        if not lim:
-            continue
-        region_quotas.setdefault(q["region"], []).append(
-            (str(q["model_name"]).lower(), float(lim)))
 
-    def _limit_for(model_id: str, region: str) -> float | None:
-        cands = region_quotas.get(region) or []
-        if not cands:
-            # region-agnostic fallback: any TPM limit for a matching model
-            cands = [c for lst in region_quotas.values() for c in lst]
-        if not cands:
-            return None
-        mid = model_id.lower()
-        # Prefer a quota whose friendly name shares a token with the model id.
-        best = None
-        for name, lim in cands:
-            toks = [t for t in name.replace("-", " ").split() if len(t) > 2]
-            if any(t in mid for t in toks):
-                best = lim if best is None else min(best, lim)
-        if best is not None:
-            return best
-        # Fallback: smallest TPM limit in scope (most conservative → highest util).
-        return min(lim for _, lim in cands)
-
-    # peak quota-TPM per (dim_value, model)
-    from collections import defaultdict
-    peak: dict[tuple, float] = defaultdict(float)
-    model_ep: dict[tuple, str] = {}
-    model_region: dict[tuple, str] = {}
-    for r in rows:
-        is_mantle = (r["endpoint"] == "mantle")
-        mid = r.get("modelid") or r.get("modelId")
-        rate = 1 if is_mantle else output_burndown_rate(mid, is_mantle=is_mantle)
-        qtok = int(r["input_tokens"] or 0) + int(r["output_tokens"] or 0) * rate
-        tpm = qtok / 60.0
-        k = (r["dim_value"], mid)
-        if tpm > peak[k]:
-            peak[k] = tpm
-            model_ep[k] = r["endpoint"]
-            model_region[k] = r["region"]
-
-    # Roll up to worst model per dim_value.
-    result: dict[str, dict] = {}
-    for (dim_value, mid), tpm in peak.items():
-        region = model_region[(dim_value, mid)]
-        limit = _limit_for(mid, region)
-        util = (tpm / limit * 100.0) if limit else None
-        cur = result.get(dim_value)
-        cand = {
-            "workload": dim_value,
-            "peak_tpm": round(tpm, 1),
-            "model": mid,
-            "region": region,
-            "tpm_limit": round(limit, 1) if limit else None,
-            "utilization_pct": round(util, 2) if util is not None else None,
-        }
-        if cur is None or (util is not None and (cur["utilization_pct"] or -1) < util):
-            result[dim_value] = cand
-
-    out = sorted(result.values(),
-                 key=lambda d: (d["utilization_pct"] or 0), reverse=True)
-    return {"is_estimate": True, "rows": out}
+def _quota_scope_parts(days, dim_key, endpoint, accounts, region):
+    parts = ["event_date >= current_date - $1::int", "dim_key = $2"]
+    params: list = [days, dim_key]
+    ep = _resolve_endpoint(endpoint)
+    if ep != "all":
+        params.append(ep); parts.append(f"endpoint = ${len(params)}")
+    accts: list[str] = []
+    for a in (accounts or []):
+        accts.extend(x.strip() for x in str(a).split(",") if x.strip())
+    accts = [a for a in accts if a and a != "all"]
+    if accts:
+        params.append(accts); parts.append(f"accountId = ANY(${len(params)}::text[])")
+    if region and region != "all":
+        params.append(region); parts.append(f"region = ${len(params)}")
+    return parts, params

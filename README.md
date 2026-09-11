@@ -37,7 +37,9 @@ per-request tokens, latency, TTFT, retries, estimated cost, and per-user/team
 attribution. A "Usage by provider" view rolls it up across every path
 (bedrock-runtime, bedrock-mantle, anthropic-api, openai-api), so "all our
 Anthropic usage vs all our OpenAI usage" is one table - no AWS-side source
-can see that traffic at all. Off by default, honestly labeled as
+can see that traffic at all. Because AWS neither bills nor rate-limits those
+calls, they are excluded from the Cost Explorer figures and from AWS quota
+utilization, and shown separately rather than folded in. Off by default, honestly labeled as
 client-reported; see
 [Workloads & client telemetry](#workloads-per-workload-attribution-and-client-telemetry-optional)
 and [`tools/client-telemetry/`](tools/client-telemetry/).
@@ -105,13 +107,17 @@ git clone https://github.com/aws-samples/sample-bedrock-ops-lens.git
 cd sample-bedrock-ops-lens
 cp config.example.yaml config.yaml      # then edit: deploy_region, monitored accounts/regions
 ALLOWED_EMAIL_DOMAINS=yourcompany.com ./deploy.sh --yes
+# ...or, for a public sign-up form gated to that domain:
+# ALLOWED_EMAIL_DOMAINS=yourcompany.com COGNITO_SELF_SIGNUP=enabled ./deploy.sh --yes
 ```
 
 `config.yaml` is required (it drives the deploy region and which accounts/regions get monitored). Copy the example and edit it before deploying; the defaults work for a single-account, single-region setup.
 
 The script handles everything: VPC, Aurora, Memcached, Cognito, CloudFront, WAF, schema, ingester, and a first ingest run. About 12 minutes. It prints the dashboard URL when done.
 
-Open the dashboard URL and sign up. Anyone whose email domain matches `ALLOWED_EMAIL_DOMAINS` can create their own account; the first verified user is auto-promoted to admin.
+Sign-in is **admin-create-only by default** (no public sign-up form). `deploy.sh` prints the exact commands for your pool when it finishes: `aws cognito-idp admin-create-user` to create the user, then `aws cognito-idp admin-add-user-to-group --group-name bedrock-lens-admins` to grant admin. Both are needed - the automatic first-admin bootstrap runs in a Cognito PostConfirmation trigger, and `admin-create-user` does not fire it. Group membership is baked into the token at sign-in, so sign out and back in if you were already signed in.
+
+If you want a public sign-up form instead, deploy with `COGNITO_SELF_SIGNUP=enabled`. Anyone whose email domain matches `ALLOWED_EMAIL_DOMAINS` can then create their own account, and the first verified user is auto-promoted to admin. `ALLOWED_EMAIL_DOMAINS` gates who may exist in either mode.
 
 
 ## Wiring up the MCP
@@ -198,6 +204,50 @@ aws lambda invoke \
   --invocation-type RequestResponse --cli-read-timeout 900 \
   /tmp/out.json
 ```
+
+
+## How quota consumption is measured
+
+Output tokens do not always burn one quota token each. On some models one output
+token consumes 10 or 15, so a dashboard that counts raw tokens can report a
+workload at 8% of its limit when it is actually at 160%. Bedrock Ops Lens picks
+its number per hour, in this order:
+
+1. **AWS's own `EstimatedTPMQuotaUsage`**, when CloudWatch published a datapoint
+   for that hour. AWS computes it with the current policy — cache-write tokens
+   and the output multiplier already included — so nothing is applied on top.
+   Reported as `aws_estimate`.
+2. **Reconstruction**, when there is no datapoint:
+   `uncached input + cache-write + output × burndown rate`. Cache *reads* never
+   count. Reported as `reconstructed`.
+3. **Nothing.** If neither is available the hour is excluded and the coverage gap
+   is stated rather than folded into a total that looks complete.
+
+Every response carries the source it used, and a series that mixes both says
+`mixed` — one AWS-measured hour does not let a mostly-reconstructed chart claim
+to be measured. Per-workload attribution from proxy telemetry always
+reconstructs, because a model-level CloudWatch aggregate has no workload
+dimension.
+
+Hourly data means these are hourly-average per-minute rates, not measured
+minute peaks. The API says so in `rate_basis`; the UI repeats it.
+
+**Editing the rates.** The multipliers are data, not code: **Settings → Quota
+burndown rates**. An admin can add a SKU or change a rate and the backend and the
+scheduled findings job pick it up within 60 seconds — no rebuild, no redeploy.
+Entries carry an *effective from* date (so a change today does not silently
+re-rate last month's charts) and a separate *doc verified* date. Models with
+traffic but no verified entry are listed on that screen, which is how a newly
+launched SKU gets noticed. Anything falling back to the bundled table is labelled
+unverified rather than presented as confirmed AWS policy.
+
+Rates are seeded from the
+[AWS token-burndown documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html)
+on first boot; "Restore AWS defaults" puts them back.
+
+Note AWS's own caveat: `EstimatedTPMQuotaUsage` is an approximation and does not
+reflect the reservation-based accounting that actually drives throttling
+decisions. Use it alongside observed throttles, not instead of them.
 
 
 ## Notifications and findings
@@ -452,7 +502,7 @@ non-Bedrock traffic. The two paths are complements:
 |---|---|---|
 | Setup | Tag calls + invocation logging on - no proxy | Emitter (LiteLLM callback, OTEL, or your gateway) |
 | Coverage | `bedrock-runtime` only | runtime + mantle + direct Anthropic/OpenAI APIs |
-| Metrics | Tokens + volume | + throttle %, latency, TTFT, retries, quota %, est. cost |
+| Metrics | Tokens + volume | + throttle %, latency, TTFT, retries, est. cost, and TPM quota utilization for Bedrock paths (AWS quotas do not apply to direct-provider calls, which are reported separately with no limit) |
 | Freshness | Daily batch | ~Hourly |
 | Trust | AWS-witnessed | Client-reported |
 
@@ -505,6 +555,25 @@ cd frontend && npm install && npm run dev
 ```
 
 Frontend at http://localhost:5173. Same FastAPI app and same ingester code that runs in Lambda runs locally under uvicorn.
+
+
+## Tests
+
+```bash
+pip install pytest pytest-asyncio
+pytest -q
+```
+
+`tests/` holds the accounting and telemetry regression suite — the rules that are easy to break silently: CloudWatch counter semantics (`Invocations` counts successes only, throttles are disjoint from errors), quota name-to-model matching, token burndown rates, cache-token accounting, and the shape of the client-telemetry payloads.
+
+Most tests are pure unit tests and need nothing running. About 50 assert against live API responses; point them at a backend and they run, otherwise they skip:
+
+```bash
+# optional — exercises the API assertions too
+cd backend && DATABASE_URL=... AUTH_ENABLED=false PYTHONPATH=.. \
+  uvicorn app.main:app --port 8001
+LENS_API=http://localhost:8001/api pytest -q
+```
 
 
 ## Tear down

@@ -9,6 +9,17 @@ import PaginatedTable from '../components/PaginatedTable.jsx';
 import EndpointSubTabs, { EndpointNotAvailable } from '../components/EndpointSubTabs.jsx';
 import LatencyAccountsModal from '../components/LatencyAccountsModal.jsx';
 
+
+// Bedrock traffic-type codes -> readable labels (same mapping as OpsReviewTab).
+function trafficLabel(tt) {
+  if (tt === 'CROSS_REGION_OD_INFERENCE_REQUEST') return 'CRIS (destination)';
+  if (tt === 'SOURCE_REGION_OD_INFERENCE_REQUEST') return 'CRIS (source)';
+  if (tt === 'ON_DEMAND_INFERENCE_REQUEST') return 'On-Demand';
+  if (tt === 'PROVISIONED_THROUGHPUT_V1') return 'Provisioned';
+  if (!tt || tt === '__none__') return 'Unknown';
+  return tt;
+}
+
 function isLLM(modelId) {
   const m = (modelId || '').toLowerCase();
   return !(m.includes('embed') || m.includes('rerank'));
@@ -158,12 +169,17 @@ function LatencyBody({ filters, onInfo, mantleHint }) {
         }
       </Container>
 
-      <Container header={<SectionHeader title="Latency by operation" sectionId="op-latency" onInfo={onInfo} />}>
+      {/* Audit finding 16: this is grouped by TRAFFIC TYPE, not by API
+          operation — AWS/Bedrock CloudWatch exposes no operation dimension, so
+          Converse/InvokeModel cannot be split here. Title and column say so. */}
+      <Container header={<SectionHeader title="Latency by traffic type" sectionId="op-latency" onInfo={onInfo}
+        description="Grouped by Bedrock traffic type (On-Demand / CRIS / Provisioned). Per-API-operation latency is not available from CloudWatch metrics." />}>
         {ops.loading ? <ChartLoading /> :
           <PaginatedTable
             items={ops.data || []}
             columnDefinitions={[
-              { id: 'o',    header: 'Operation', cell: r => r.operation },
+              { id: 'o',    header: 'Traffic type', cell: r => trafficLabel(r.traffic_type ?? r.operation),
+                exportValue: r => r.traffic_type ?? r.operation },
               { id: 'n',    header: 'Samples',   cell: r => fmt(r.sample_count) },
               { id: 'p50',  header: 'E2E p50',   cell: r => fmtMs(r.p50_e2e) },
               { id: 'p90',  header: 'E2E p90',   cell: r => fmtMs(r.p90_e2e) },

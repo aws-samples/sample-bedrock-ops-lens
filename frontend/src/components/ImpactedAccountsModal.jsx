@@ -11,6 +11,7 @@ import { Modal, Box, SpaceBetween, Alert } from '@cloudscape-design/components';
 import { api, fmt, accountName, useAccountNames } from '../api.js';
 import { ChartLoading } from './Common.jsx';
 import PaginatedTable from './PaginatedTable.jsx';
+import { fmtDayUTC, fmtDayYearUTC, utcHour } from '../dates';
 
 function fmtMs(v) {
   if (v === null || v === undefined) return '—';
@@ -35,9 +36,11 @@ export default function ImpactedAccountsModal({ ts, scope = 'hour', filters, onD
 
   if (!ts) return null;
   const when = new Date(ts);
+  // The label says UTC, so read the UTC hour: getHours() returned the browser's
+  // local hour, naming the wrong hour as the impacted one (finding 17).
   const label = scope === 'hour'
-    ? `${when.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric' })} ${String(when.getHours()).padStart(2, '0')}:00 (hour, UTC)`
-    : when.toLocaleDateString(undefined, { month: 'numeric', day: 'numeric', year: 'numeric' });
+    ? `${fmtDayUTC(when, { month: 'numeric', day: 'numeric' })} ${utcHour(when)}:00 (hour, UTC)`
+    : `${fmtDayYearUTC(when)} (day, UTC)`;
 
   return (
     <Modal visible size="max" onDismiss={onDismiss}

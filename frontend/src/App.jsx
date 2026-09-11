@@ -20,7 +20,7 @@ import {
   ExpandableSection, Spinner, Alert,
 } from '@cloudscape-design/components';
 import { applyMode, Mode } from '@cloudscape-design/global-styles';
-import { useApi, fmt, setAttributionContext } from './api.js';
+import { useApi, fmt, setAttributionContext, subscribeDisclosure, clearDisclosure } from './api.js';
 import { OPTIONAL_TABS, loadOptionalTabs, subscribeOptionalTabs } from './prefs.js';
 import SectionPanel from './components/SectionInfo.jsx';
 import { UserProvider, useUser } from './components/UserContext.jsx';
@@ -579,6 +579,16 @@ function AppShell() {
     window.location.hash = href.startsWith('#') ? href.slice(1) : href;
   };
 
+  // Audit follow-up: the xtab endpoints report when they could not honour the
+  // whole attribute selection. That was returned as JSON and never rendered, so
+  // the viewer saw broader totals under a filter that looked applied. Subscribe
+  // to the disclosure and show it prominently.
+  const [filterDisclosure, setFilterDisclosure] = useState(null);
+  useEffect(() => subscribeDisclosure(setFilterDisclosure), []);
+  useEffect(() => { clearDisclosure(); setFilterDisclosure(null); },
+            [JSON.stringify(filters.tag_filter || []), filters.days,
+             JSON.stringify(filters.accounts || []), filters.region]);
+
   const onInfo = (sectionId) => {
     setInfoSection(sectionId);
     setToolsOpen(true);
@@ -759,6 +769,17 @@ function AppShell() {
                     views are sourced from your proxy event stream (not native
                     CloudWatch) so they can break down by attribute. Clear the
                     attribute filter for the full CloudWatch-based view.
+                  </Alert>
+                )}
+                {/* Dropped-filter disclosure. A JSON flag is not disclosure:
+                    say plainly which part of the selection is NOT applied,
+                    before any number is read. */}
+                {filterDisclosure && (
+                  <Alert type="warning" header="Part of your attribute filter is not applied">
+                    Showing <strong>{filterDisclosure.applied.join(', ') || 'all traffic'}</strong>.
+                    {' '}Not applied: <strong>{filterDisclosure.dropped.join(', ')}</strong>.
+                    {' '}The totals below are therefore broader than the filter you selected.
+                    {filterDisclosure.reason ? ` ${filterDisclosure.reason}` : ''}
                   </Alert>
                 )}
                 {viewBody('overview',   <OverviewTab     filters={filters} onInfo={onInfo} />)}

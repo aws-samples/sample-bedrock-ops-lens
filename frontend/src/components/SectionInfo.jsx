@@ -137,9 +137,9 @@ export const SECTION_INFO = {
     action: 'priority/reserved tiers with non-trivial throttle → escalate or increase quota. flex tier with high throttle → expected (best-effort tier) — do not file a quota request for flex traffic.',
   },
   'cache-trend': {
-    title: 'Cache hit rate trend',
+    title: 'Cached prompt tokens trend',
     body: 'Daily fleet-wide ratio of cache_read_input_tokens / total_input_tokens. Tracks adoption growth over time.',
-    why: 'Cache hits skip reprocessing, lowering both TTFT and cost. A flat line indicates caching is not yet being used — there is adoption upside.',
+    why: 'Cached prompt tokens skip reprocessing, lowering both TTFT and cost. A flat line indicates caching is not yet being used - there is adoption upside. This is the share of prompt TOKENS read from cache (of input + cache-read + cache-write), not the fraction of requests that hit cache: Bedrock publishes no per-request cache dimension.',
     action: 'Flat line → prioritize prompt-caching outreach. Spike → find the workload that drove it and use it as an internal case study.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
   },
@@ -174,8 +174,8 @@ export const SECTION_INFO = {
   'burndown': {
     title: 'Claude burndown risk',
     body: 'Recent Anthropic Claude models burn down the TPM quota faster on output tokens: each output token counts 15× toward TPM for Claude Opus 4.8, 5× for other Claude 3.7+ models (Sonnet/Opus/Haiku 3.7, 4, 4.x), and 1× for everything else. The "Burndown" column shows the per-model rate; "Peak TPM (quota)" applies it (input − cache-read + output × rate) so the number matches how CloudWatch EstimatedTPMQuotaUsage burns down the quota; "Quota util %" is that peak against your applied TPM limit.',
-    why: 'Bedrock also reserves max_tokens × rate × RPM up-front when each request lands. A workload with max_tokens set to the model maximum but actual avg output of, say, 300 tokens still has the full max_tokens × rate × RPM reserved — so throttling can hit with 80%+ unused real capacity. For Opus 4.8 (15×) the over-reservation is 3× larger than the old 5× assumption.',
-    action: 'Set max_tokens close to actual expected output (not the model maximum). One-line code change; throttling drops without a quota increase. This peak is from hourly-averaged data, so for the true per-minute throttling ceiling confirm against CloudWatch EstimatedTPMQuotaUsage (Sum, 1-minute).',
+    why: 'At the start of a request Bedrock deducts (total input tokens + max_tokens) from your TPM quota, and if max_tokens is not set it defaults to the model maximum. The burndown rate is applied to the tokens actually generated when the request settles, not to that up-front reservation. So a workload whose max_tokens is the model maximum but whose real output averages a few hundred tokens can be throttled while most of the reserved budget goes unused, and any unused portion is replenished only after the response completes. Bedrock Ops Lens cannot see max_tokens - it is not in the CloudWatch metrics - so check it in your client configuration; the Avg output column shows what the traffic actually needs.',
+    action: 'Set max_tokens close to actual expected output (not the model maximum), which shrinks the up-front reservation on every request. This peak is from hourly-averaged data, so for the true per-minute throttling ceiling confirm against CloudWatch EstimatedTPMQuotaUsage (Sum, 1-minute). On the bedrock-mantle endpoint the same (input + max_tokens) sum is checked against a separate input-tokens-per-minute quota, with output counted against its own quota.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html',
   },
   'caching': {
@@ -292,9 +292,9 @@ export const SECTION_INFO = {
   },
   'ops-burndown': {
     title: 'Claude burndown risk',
-    body: 'Recent Anthropic Claude models count each output token as more than 1 against TPM: 15× for Claude Opus 4.8, 5× for other Claude 3.7+ (Sonnet/Opus/Haiku 3.7, 4, 4.x), 1× otherwise. Bedrock also reserves max_tokens × rate × RPM at request time, only adjusting after the request completes. "Peak TPM (quota)" applies the per-model rate to output per-hour ((input − cache-read) + output × rate) before taking the peak, and "Quota util %" is that peak against the applied TPM limit. Cache-read input tokens are excluded (they don\'t count toward the quota); hours predating the cache-read column are excluded from the peak rather than counted inflated. NOTE: this peak is from hourly-averaged data — TPM quotas are enforced per-minute, so treat CloudWatch EstimatedTPMQuotaUsage (Sum, 1-minute) as the authoritative throttling ceiling.',
-    why: 'If max_tokens is set to the model maximum but actual avg output is 300 tokens, Bedrock still reserves the full budget. The workload hits ThrottlingException with 80%+ unused real capacity — and for Opus 4.8 (15×) the over-reservation is 3× worse than the old 5× assumption. Highest-impact, zero-cost fix for Claude throttling.',
-    action: 'Set max_tokens close to actual expected output (check the Avg output column for the right ballpark — typically 200-1000), not the model maximum. One-line client change. Throttling drops without any quota increase.',
+    body: 'Recent Anthropic Claude models count each output token as more than 1 against TPM: 15× for Claude Opus 4.8, 5× for other Claude 3.7+ (Sonnet/Opus/Haiku 3.7, 4, 4.x), 1× otherwise. Bedrock also deducts (total input tokens + max_tokens) at the start of each request, adjusts as output is generated, and replenishes the unused remainder when the request completes; the burndown rate applies to the tokens actually generated, not to that reservation. "Peak TPM (quota)" applies the per-model rate to output per-hour ((input − cache-read) + output × rate) before taking the peak, and "Quota util %" is that peak against the applied TPM limit. Cache-read input tokens are excluded (they don\'t count toward the quota); hours predating the cache-read column are excluded from the peak rather than counted inflated. NOTE: this peak is from hourly-averaged data — TPM quotas are enforced per-minute, so treat CloudWatch EstimatedTPMQuotaUsage (Sum, 1-minute) as the authoritative throttling ceiling.',
+    why: 'If max_tokens is left at the model maximum but real output averages a few hundred tokens, every request still reserves (input + max_tokens) up front, so the workload can hit ThrottlingException while much of the reserved budget is never used. It is a one-line client change with no quota increase and no cost, which is why it is worth checking first. Note that Bedrock Ops Lens cannot observe max_tokens: it reads CloudWatch metrics, which do not carry it.',
+    action: 'Set max_tokens close to actual expected output - the Avg output column shows what this traffic actually produces - rather than leaving it at the model maximum. One-line client change, no quota increase needed.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html',
   },
   'ops-request-shape': {

@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import random
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -45,7 +47,7 @@ def _sq_client(region: str, session: boto3.Session | None = None):
     return s.client(
         "service-quotas",
         region_name=region,
-        config=Config(retries={"max_attempts": 5, "mode": "adaptive"}),
+        config=Config(retries={"max_attempts": 8, "mode": "adaptive"}),
     )
 
 
@@ -126,6 +128,47 @@ async def _recent_refresh(conn: asyncpg.Connection, stale_hours: int) -> set[tup
         return {(str(r["accountid"]), str(r["region"])) for r in rows}
     except Exception:
         return set()
+
+
+def _is_throttle(e: Exception) -> bool:
+    code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+    return code in ("TooManyRequestsException", "ThrottlingException",
+                    "RequestThrottled", "TooManyRequests")
+
+
+def _fetch_quotas_for_region_with_backoff(
+        region: str, session: boto3.Session | None = None,
+        attempts: int = 3, base_sleep: float = 2.0) -> list[tuple]:
+    """Retry the whole region fetch when Service Quotas throttles us.
+
+    botocore's adaptive retry mode already rate-limits, but its token bucket
+    lives on the CLIENT, and we build a fresh client per (account, region) —
+    while the Service Quotas rate limit is per ACCOUNT and shared across all of
+    them. So 18 independent clients each happily burn their own 5 attempts and
+    still collide. Observed on a real 6-account x 3-region run:
+    ListAWSDefaultServiceQuotas returned TooManyRequestsException after max
+    retries for one pair, which failed the whole module.
+
+    A missed pair is not data loss — it is deliberately NOT marked fresh, so the
+    next scheduled run picks it up (see --stale-hours). This just avoids waiting
+    a whole day for a blip. The attempt budget is small on purpose: the pass is
+    already the slowest ingester and must not run into the Lambda timeout.
+    """
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return _fetch_quotas_for_region(region, session=session)
+        except Exception as e:                       # noqa: BLE001 - re-raised below
+            last = e
+            if not _is_throttle(e) or i == attempts - 1:
+                raise
+            # Exponential backoff with jitter, so several accounts backing off
+            # at once do not resynchronise into another collision.
+            delay = base_sleep * (2 ** i) + random.uniform(0, base_sleep)
+            print(f"  [{region}] throttled by service-quotas; "
+                  f"retry {i + 1}/{attempts - 1} in {delay:.1f}s", flush=True)
+            time.sleep(delay)
+    raise last if last else RuntimeError("unreachable")
 
 
 def _fetch_quotas_for_region(region: str, session: boto3.Session | None = None) -> list[tuple]:
@@ -223,7 +266,8 @@ async def main() -> int:
                     skipped += 1
                     continue
                 try:
-                    rows = _fetch_quotas_for_region(region, session=session)
+                    rows = _fetch_quotas_for_region_with_backoff(
+                        region, session=session)
                 except Exception as e:
                     msg = f"{type(e).__name__}: {e}"
                     print(f"  [{acct}/{region}] ERROR — {msg}", flush=True)

@@ -27,11 +27,16 @@ export default function OpsInsightsTab({ filters, onInfo }) {
   // (no CRIS rows). Coverage='metric' communicates partial fit.
   const distinct = useApi('/distinct-filters', {}, []).data || {};
   const mantleAvailable = !!distinct.mantle_available?.volumetric;
-  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  // Initialise to the value the sub-tab control actually SHOWS as selected.
+  // Defaulting to 'all' while the control highlighted "bedrock-runtime"
+  // meant the header read Runtime while the data was Combined: the browser
+  // showed 23,204,626 requests where real Runtime is 22,995,921 (finding 11).
+  const [endpoint, setEndpoint] = useState(
+    filters.endpoint && filters.endpoint !== 'all' ? filters.endpoint : 'runtime');
   const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
   return (
     <EndpointSubTabs
-      selected={endpoint === 'all' ? 'runtime' : endpoint}
+      selected={endpoint}
       onChange={setEndpoint}
       runtimeCoverage="full"
       mantleCoverage="metric"
@@ -64,17 +69,33 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
   const ctx = useApi('/ops-context-length', filters, [JSON.stringify(filters)]);
 
   // CRIS pie data
+  // Finding 18: requests whose traffic_type is neither CRIS nor plain on-demand
+  // (provisioned throughput, batch, or simply not reported in the invocation
+  // log) used to be dropped from this pie, so the slices implied a routing mix
+  // for traffic we cannot classify. Show that share instead of hiding it.
   const crisPie = useMemo(() => {
     if (!cris.data) return [];
-    let crisR = 0, odR = 0;
+    let crisR = 0, odR = 0, otherR = 0;
     for (const r of cris.data) {
       crisR += Number(r.cris_requests || 0);
       odR += Number(r.od_requests || 0);
+      otherR += Number(r.unclassified_requests || 0);
     }
     return [
       { title: `CRIS (${fmt(crisR)})`, value: crisR },
       { title: `On-Demand (${fmt(odR)})`, value: odR },
+      { title: `Other / not reported (${fmt(otherR)})`, value: otherR },
     ].filter(d => d.value > 0);
+  }, [cris.data]);
+
+  // Requests we could classify, for the gaps panel's honesty note.
+  const crisCoverage = useMemo(() => {
+    let known = 0, total = 0;
+    for (const r of (cris.data || [])) {
+      known += Number(r.cris_requests || 0) + Number(r.od_requests || 0);
+      total += Number(r.total_requests || 0);
+    }
+    return { known, total, pct: total > 0 ? (100 * known) / total : null };
   }, [cris.data]);
 
   const profilePie = useMemo(() => {
@@ -87,22 +108,26 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
       }));
   }, [profile.data]);
 
-  // Cache hit-rate %. CloudWatch's InputTokenCount counts only NEW input
-  // tokens — cached reads are reported separately as CacheReadInputTokenCount.
-  // The denominator is therefore (input + cache_read), so the ratio is
-  // bounded in [0, 100] regardless of cache mix.
+  // Share of prompt tokens served from cache.
+  //
+  // Finding 14: inputTokens, cacheReadInputTokens and cacheWriteInputTokens are
+  // three disjoint counters, so the denominator is all three. Omitting writes
+  // overstated the share precisely on workloads that are populating a cache.
+  // This is a token share, not a per-request hit rate - CloudWatch publishes no
+  // per-request cache dimension, so a request hit rate is not derivable here.
   const cacheTrendSeries = useMemo(() => {
     if (!trend.data) return [];
     return [{
-      title: 'Cache hit rate %',
+      title: 'Cached prompt tokens %',
       type: 'line',
       data: trend.data.map(r => {
-        const cache = Number(r.cache_read_tokens || 0);
+        const read = Number(r.cache_read_tokens || 0);
+        const write = Number(r.cache_write_tokens || 0);
         const fresh = Number(r.input_tokens || 0);
-        const denom = cache + fresh;
+        const denom = read + write + fresh;
         return {
           x: `${r.month}/${r.day}`,
-          y: denom ? (cache * 100 / denom) : 0,
+          y: denom ? (read * 100 / denom) : 0,
         };
       }),
     }];
@@ -198,7 +223,13 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'o', header: 'OD requests', cell: r => fmt(r.od_requests) },
             ]}
-            empty="All Claude workloads use CRIS — nice."
+            empty={crisCoverage.pct === null
+              ? 'No request data in this window.'
+              : crisCoverage.known === 0
+                ? 'Routing not reported for any request in this window, so CRIS adoption cannot be determined.'
+                : crisCoverage.pct < 99.5
+                  ? `No on-demand-only workloads among the ${fmt(crisCoverage.known)} requests whose routing is reported (${crisCoverage.pct.toFixed(1)}% of traffic; the rest is provisioned throughput, batch, or not reported).`
+                  : 'Every request with reported routing uses CRIS.'}
           />
         }
       </Container>}
@@ -252,12 +283,24 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
               { id: 'i', header: 'Avg input',  cell: r => fmt(r.avg_input) },
               { id: 'o', header: 'Avg output', cell: r => fmt(r.avg_output) },
               {
-                id: 'ratio', header: 'In:Out ratio',
+                // Finding 12: this read `ratio` when the API returned
+                // output/input, so 74.7:1 input-heavy traffic rendered "0.0:1"
+                // and tripped the "output-heavy" warning - the opposite advice,
+                // and the opposite of what Ops Review said about the same rows.
+                // The thresholds below now match Ops Review exactly:
+                // > 50:1 input-heavy (prompt-caching candidate), < 2:1
+                // output-heavy (burndown amplifier on Claude 4+).
+                id: 'ratio', header: 'Input:output ratio',
                 cell: (r) => {
-                  const v = Number(r.ratio || 0);
-                  const t = v > 50 ? 'info' : v < 2 ? 'warning' : 'success';
-                  return <StatusIndicator type={t}>{v.toFixed(1)}:1</StatusIndicator>;
+                  const v = r.input_output_ratio ?? r.ratio;
+                  if (v === null || v === undefined) {
+                    return <StatusIndicator type="info">n/a</StatusIndicator>;
+                  }
+                  const n = Number(v);
+                  const t = n > 50 ? 'info' : n < 2 ? 'warning' : 'success';
+                  return <StatusIndicator type={t}>{n.toFixed(1)}:1</StatusIndicator>;
                 },
+                exportValue: r => r.input_output_ratio ?? r.ratio,
               },
             ]}
             empty="No data"
@@ -281,9 +324,18 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
               { id: 'an', header: 'Account name', cell: r => accountName(r.accountid || r.accountId) || '—', exportValue: r => accountName(r.accountid || r.accountId) },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
-              { id: 'rpm', header: 'Peak RPM (hr × 60)', cell: r => <Box fontWeight="bold">{fmt(Number(r.peak_requests_hour || 0))}</Box> },
-              { id: 'tpm-in',  header: 'Peak input TPM',  cell: r => <Box fontWeight="bold">{fmt(r.peak_input_tpm)}</Box> },
-              { id: 'tpm-out', header: 'Peak output TPM', cell: r => <Box fontWeight="bold">{fmt(r.peak_output_tpm)}</Box> },
+              // f_hourly_peak stores CloudWatch Period=3600 SUMS, so these are
+              // the busiest hour's HOURLY-AVERAGE per-minute rates (total/60),
+              // a lower bound on the true minute peak. The old "Peak RPM
+              // (hr × 60)" column rendered the raw hourly total.
+              { id: 'rpm', header: 'Busiest hr — avg RPM', cell: r => <Box fontWeight="bold">{fmt(r.busiest_hour_avg_rpm ?? r.peak_rpm)}</Box>,
+                exportValue: r => r.busiest_hour_avg_rpm ?? r.peak_rpm },
+              { id: 'tpm-in',  header: 'Busiest hr — avg input TPM',  cell: r => <Box fontWeight="bold">{fmt(r.busiest_hour_avg_input_tpm ?? r.peak_input_tpm)}</Box>,
+                exportValue: r => r.busiest_hour_avg_input_tpm ?? r.peak_input_tpm },
+              { id: 'tpm-out', header: 'Busiest hr — avg output TPM', cell: r => <Box fontWeight="bold">{fmt(r.busiest_hour_avg_output_tpm ?? r.peak_output_tpm)}</Box>,
+                exportValue: r => r.busiest_hour_avg_output_tpm ?? r.peak_output_tpm },
+              { id: 'rq', header: 'Requests in that hour', cell: r => fmt(r.requests_busiest_hour_total ?? r.peak_requests_hour),
+                exportValue: r => r.requests_busiest_hour_total ?? r.peak_requests_hour },
             ]}
             empty="No peak data"
           />
@@ -299,13 +351,41 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
               { id: 'an', header: 'Account name', cell: r => accountName(r.accountid || r.accountId) || '—', exportValue: r => accountName(r.accountid || r.accountId) },
               { id: 'm', header: 'Model',   cell: r => r.modelid || r.modelId },
               { id: 'r', header: 'Region',  cell: r => r.region },
-              { id: 'p', header: 'Peak TPM (quota)',  cell: r => fmt(r.peak_tpm) },
+              { id: 'p', header: 'Busiest hr — avg quota TPM',
+                cell: r => fmt(r.busiest_hour_avg_tpm ?? r.peak_tpm),
+                exportValue: r => r.busiest_hour_avg_tpm ?? r.peak_tpm },
               { id: 'b', header: 'Burndown', cell: r => r.burndown_rate != null ? `${r.burndown_rate}×` : '—' },
-              { id: 'q', header: 'Applied TPM',       cell: r => fmt(r.effective_tpm) },
-              { id: 'o', header: 'Quota util %',      cell: r => <Box color="text-status-error" fontWeight="bold">{fmtPct(r.overhead_pct)}</Box> },
+              // The applicable quota depends on traffic family (On-demand /
+              // Cross-region / Global CRIS) and f_hourly_peak has no family
+              // dimension, so an ambiguous match is labelled instead of
+              // silently resolving to the most generous limit.
+              { id: 'q', header: 'Quota limit (TPM)',
+                cell: r => r.effective_tpm == null
+                  ? <StatusIndicator type="info">unknown</StatusIndicator>
+                  : <span>{fmt(r.effective_tpm)}{r.quota_ambiguous ? ' *' : ''}</span>,
+                exportValue: r => r.effective_tpm ?? '' },
+              { id: 'qf', header: 'Quota family',
+                cell: r => r.quota_family
+                  ? <span>{r.quota_family}{r.quota_ambiguous ? ' (ambiguous)' : ''}</span>
+                  : '—',
+                exportValue: r => r.quota_family || '' },
+              { id: 'o', header: 'Quota util %',
+                cell: r => r.utilization_pct == null
+                  ? <StatusIndicator type="info">unknown</StatusIndicator>
+                  : <Box color={r.utilization_pct >= 80 ? 'text-status-error' : 'text-status-info'} fontWeight="bold">{fmtPct(r.utilization_pct)}</Box>,
+                exportValue: r => r.utilization_pct ?? '' },
             ]}
             empty="No burndown risk"
           />
+          <Box variant="small" color="text-body-secondary" padding={{ top: 'xs' }}>
+            Rates are the busiest hour's <b>hourly average</b> per minute
+            (hourly total ÷ 60) — CloudWatch is collected at hourly resolution
+            here, so a true minute peak is not derivable and these are lower
+            bounds. <b>*</b> marks a quota whose traffic family could not be
+            determined (On-demand / Cross-region / Global CRIS publish different
+            limits and the hourly table carries no family dimension); the
+            On-demand limit is shown where available.
+          </Box>
         </Container>
       )}
 

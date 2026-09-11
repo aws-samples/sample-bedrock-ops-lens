@@ -10,6 +10,7 @@ import {
 } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
+import { utcDayOf, utcDayFromString, fmtDayUTC } from '../dates';
 
 function modelShort(id) {
   return (id || '').replace(/^us\./, '').replace(/^eu\./, '').replace(/^global\./, '')
@@ -61,12 +62,17 @@ export default function OverviewTab({ filters, onInfo }) {
   // view) — signalled by /distinct-filters.mantle_available.
   const distinct = useApi('/distinct-filters', {}, []).data || {};
   const mantleAvailable = !!distinct.mantle_available?.volumetric;
-  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  // Initialise to the value the sub-tab control actually SHOWS as selected.
+  // Defaulting to 'all' while the control highlighted "bedrock-runtime"
+  // meant the header read Runtime while the data was Combined: the browser
+  // showed 23,204,626 requests where real Runtime is 22,995,921 (finding 11).
+  const [endpoint, setEndpoint] = useState(
+    filters.endpoint && filters.endpoint !== 'all' ? filters.endpoint : 'runtime');
   const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
   return (
     <SpaceBetween size="m">
       <EndpointSubTabs
-        selected={endpoint === 'all' ? 'runtime' : endpoint}
+        selected={endpoint}
         onChange={setEndpoint}
         runtimeCoverage="full"
         mantleCoverage="metric"
@@ -85,7 +91,11 @@ function OverviewBody({ filters, onInfo }) {
   const [spendView, setSpendView] = useState('endpoint');
 
   const summary = useApi('/summary', filters, [JSON.stringify(filters)]);
-  const wow = useApi('/wow-comparison', {}, []);
+  // Pass the SAME filters as the KPIs these deltas annotate (audit finding 10):
+  // the endpoint used to ignore filters and compare the whole fleet, so a
+  // scoped KPI carried a fleet-wide delta badge (2.81% actual vs 1.25% shown,
+  // and the error-rate delta could even flip sign).
+  const wow = useApi('/wow-comparison', filters, [JSON.stringify(filters)]);
   const trend = useApi('/daily-trend', filters, [JSON.stringify(filters)]);
   const cost  = useApi('/cost-summary', filters, [JSON.stringify(filters)]);
   const costByModel = useApi('/cost-by-model', filters, [JSON.stringify(filters)]);
@@ -140,9 +150,9 @@ function OverviewBody({ filters, onInfo }) {
     if (!trend.data) return [];
     return [
       { title: 'Successful', type: 'bar', valueFormatter: fmt,
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.successful_requests || 0) })) },
+        data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.successful_requests || 0) })) },
       { title: 'Failed', type: 'bar', valueFormatter: fmt,
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.failed_requests || 0) })) },
+        data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.failed_requests || 0) })) },
     ];
   }, [trend.data]);
 
@@ -154,11 +164,11 @@ function OverviewBody({ filters, onInfo }) {
     const mantleTotal = trend.data.reduce((a, r) => a + Number(r.mantle_requests || 0), 0);
     const series = [
       { title: 'bedrock-runtime', type: 'bar', color: '#0972d3', valueFormatter: fmt,
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.runtime_requests || 0) })) },
+        data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.runtime_requests || 0) })) },
     ];
     if (mantleTotal > 0) {
       series.push({ title: 'bedrock-mantle', type: 'bar', color: '#12cdd4', valueFormatter: fmt,
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.mantle_requests || 0) })) });
+        data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.mantle_requests || 0) })) });
     }
     return series;
   }, [trend.data]);
@@ -184,7 +194,7 @@ function OverviewBody({ filters, onInfo }) {
       type: 'bar',
       valueFormatter: fmt,
       data: byCat.get(cat)
-        .map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.total_requests) }))
+        .map(r => ({ x: utcDayOf(r), y: Number(r.total_requests) }))
         .sort((a, b) => a.x - b.x),
     }));
   }, [breakdown.data, groupBy.value]);
@@ -195,7 +205,7 @@ function OverviewBody({ filters, onInfo }) {
   const volumeXDomain = useMemo(() => {
     const src = (groupBy.value === 'endpoint' ? (trend.data || []) : (breakdown.data || []));
     const ds = new Set();
-    for (const r of src) ds.add(new Date(r.year, r.month - 1, r.day).getTime());
+    for (const r of src) ds.add(utcDayOf(r).getTime());
     return [...ds].sort((a, b) => a - b).map(t => new Date(t));
   }, [breakdown.data, trend.data, groupBy.value]);
 
@@ -234,7 +244,7 @@ function OverviewBody({ filters, onInfo }) {
       // a lexical sort scrambles the categorical x-axis (Jun 3, Jun 22, Jun 7…).
       data: [...folded.get(cat).entries()]
         .sort((a, b) => new Date(a[0]) - new Date(b[0]))
-        .map(([day, amt]) => ({ x: new Date(day), y: amt })),
+        .map(([day, amt]) => ({ x: utcDayFromString(day), y: amt })),
     }));
   }, [costByModel.data]);
 
@@ -244,7 +254,7 @@ function OverviewBody({ filters, onInfo }) {
   const costXDomain = useMemo(() => {
     const ds = new Set();
     for (const r of (costByModel.data || [])) ds.add(r.event_date);
-    return [...ds].sort((a, b) => new Date(a) - new Date(b)).map(d => new Date(d));
+    return [...ds].sort((a, b) => utcDayFromString(a) - utcDayFromString(b)).map(d => utcDayFromString(d));
   }, [costByModel.data]);
 
   // Health indicators
@@ -265,8 +275,8 @@ function OverviewBody({ filters, onInfo }) {
   const tokenSeries = useMemo(() => {
     if (!trend.data) return [];
     return [
-      { title: 'Input tokens',  type: 'bar', valueFormatter: fmt, data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.input_tokens || 0) })) },
-      { title: 'Output tokens', type: 'bar', valueFormatter: fmt, data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.output_tokens || 0) })) },
+      { title: 'Input tokens',  type: 'bar', valueFormatter: fmt, data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.input_tokens || 0) })) },
+      { title: 'Output tokens', type: 'bar', valueFormatter: fmt, data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.output_tokens || 0) })) },
     ];
   }, [trend.data]);
 
@@ -362,7 +372,7 @@ function OverviewBody({ filters, onInfo }) {
       // model, so without this the categorical x-axis renders days out of order.
       data: [...m.entries()]
         .sort((a, b) => new Date(a[0]) - new Date(b[0]))
-        .map(([d, cost]) => ({ x: new Date(d), y: cost })),
+        .map(([d, cost]) => ({ x: utcDayFromString(d), y: cost })),
     }));
   }, [costByModel.data]);
   const isCostDerived = useMemo(() => {
@@ -468,7 +478,7 @@ function OverviewBody({ filters, onInfo }) {
                 ariaLabel="Daily spend by model"
                 i18nStrings={{
                   ...CHART_I18N,
-                  xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                  xTickFormatter: d => fmtDayUTC(d),
                   yTickFormatter: v => `$${v >= 1000 ? (v/1000).toFixed(1) + 'K' : v.toFixed(0)}`,
                 }}
                 height={250}
@@ -492,7 +502,7 @@ function OverviewBody({ filters, onInfo }) {
               ariaLabel="Daily request volume by endpoint"
               i18nStrings={{
                 ...CHART_I18N,
-                xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                xTickFormatter: d => fmtDayUTC(d),
                 yTickFormatter: fmt,
               }}
               height={250}
@@ -510,7 +520,7 @@ function OverviewBody({ filters, onInfo }) {
               ariaLabel="Daily request volume by category"
               i18nStrings={{
                 ...CHART_I18N,
-                xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                xTickFormatter: d => fmtDayUTC(d),
                 yTickFormatter: fmt,
               }}
               height={250}
@@ -526,7 +536,7 @@ function OverviewBody({ filters, onInfo }) {
               ariaLabel="Daily request volume"
               i18nStrings={{
                 ...CHART_I18N,
-                xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                xTickFormatter: d => fmtDayUTC(d),
                 yTickFormatter: fmt,
               }}
               height={250}
@@ -557,7 +567,7 @@ function OverviewBody({ filters, onInfo }) {
             <BarChart
               series={stackSuccess} stackedBars hideFilter xScaleType="categorical"
               ariaLabel="Requests success/failed"
-              i18nStrings={{ ...CHART_I18N, xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), yTickFormatter: fmt }}
+              i18nStrings={{ ...CHART_I18N, xTickFormatter: d => fmtDayUTC(d), yTickFormatter: fmt }}
               height={200}
             />
           }
@@ -567,7 +577,7 @@ function OverviewBody({ filters, onInfo }) {
             <BarChart
               series={tokenSeries} stackedBars hideFilter xScaleType="categorical"
               ariaLabel="Tokens input/output"
-              i18nStrings={{ ...CHART_I18N, xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), yTickFormatter: fmt }}
+              i18nStrings={{ ...CHART_I18N, xTickFormatter: d => fmtDayUTC(d), yTickFormatter: fmt }}
               height={200}
             />
           }
@@ -676,7 +686,7 @@ function OverviewBody({ filters, onInfo }) {
             legendTitle="Model"
             i18nStrings={{
               ...CHART_I18N,
-              xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+              xTickFormatter: d => fmtDayUTC(d),
               yTickFormatter: v => `$${v >= 1000 ? (v/1000).toFixed(1) + 'K' : v.toFixed(0)}`,
             }}
             height={300}

@@ -15,6 +15,7 @@ import {
 } from '@cloudscape-design/components';
 import { api, useApi, fmt, fmtPct } from '../api.js';
 import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
+import { fmtHourUTC } from '../dates';
 
 // -- Helpers ---------------------------------------------------------------
 
@@ -22,12 +23,14 @@ function fmtAt(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  // Shape matches the screenshot: "May 26 20:40"
-  const month = d.toLocaleString(undefined, { month: 'short' });
-  const day = d.getDate();
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  return `${month} ${day} ${hh}:${mm}`;
+  // Shape matches the screenshot: "May 26 20:40". Read UTC parts: these
+  // timestamps identify a UTC hour bucket, so rendering the browser's local
+  // clock named a different hour than the one the number came from (finding 17).
+  const month = d.toLocaleString(undefined, { month: 'short', timeZone: 'UTC' });
+  const day = d.getUTCDate();
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${month} ${day} ${hh}:${mm} UTC`;
 }
 
 function utilSeverity(pct) {
@@ -180,10 +183,7 @@ function MetricCard({
                 i18nStrings={{
                   ...CHART_I18N,
                   yTickFormatter: fmtVal,
-                  xTickFormatter: d => {
-                    const dt = new Date(d);
-                    return `${dt.toLocaleString(undefined, { month: 'short', day: 'numeric' })} ${String(dt.getHours()).padStart(2,'0')}:00`;
-                  },
+                  xTickFormatter: d => fmtHourUTC(d),
                 }}
               />
         }

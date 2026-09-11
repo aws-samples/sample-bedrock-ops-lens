@@ -394,10 +394,24 @@ async def main() -> int:
                             sl[0] += latency_ms; sl[1] += 1
                         # Fan out to one row per tag_key. If no tags, write a single
                         # row with sentinel '__none__'.
+                        #
+                        # ALWAYS also write a '__all__' row. requestMetadata tags
+                        # are sparse: a request tagged only `team` contributes
+                        # nothing to tag_key='application', and an untagged
+                        # request contributes to neither. So no individual
+                        # tag_key covers the whole population, and any widget
+                        # that needs a TOTAL (e.g. the per-operation split, which
+                        # only invocation logs can provide) cannot pick one key
+                        # and call it 100% - it silently undercounts by however
+                        # much that key happens to miss (audit finding 16).
+                        # '__all__' carries exactly one row per request, so
+                        # totals read off it are exact. It is excluded from
+                        # dim_tags, so it never appears as a selectable tag.
                         if not metadata:
                             tag_pairs = [("__none__", "__none__")]
                         else:
                             tag_pairs = [(str(k)[:256], str(v)[:256]) for k, v in metadata.items()]
+                        tag_pairs = tag_pairs + [("__all__", "__all__")]
                         for tk, tv in tag_pairs:
                             key_tuple = (d, a, mid, r, op, tk, tv)
                             b = buckets[key_tuple]
@@ -633,6 +647,8 @@ async def main() -> int:
             SELECT tag_key, tag_value, MIN(event_date), MAX(event_date), SUM(total_requests)
             FROM f_daily_tagged
             WHERE event_date >= current_date - INTERVAL '30 days'
+              -- '__all__' is the whole-population accounting row, not a tag.
+              AND tag_key <> '__all__'
             GROUP BY tag_key, tag_value
         """)
 

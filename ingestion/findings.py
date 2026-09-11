@@ -33,13 +33,55 @@ import json
 import os
 from datetime import datetime, timezone
 
-# Reuse the backend's burndown table so evaluator TPM matches the Quotas tab.
+# Reuse the backend's burndown table AND its quota resolver, so the notification
+# evaluator reports exactly what the Quotas tab shows. This file used to carry
+# its own private copy of both: a substring model matcher that, on a tie,
+# preferred the LARGER limit. That is the defect the shared resolver exists to
+# prevent ("Claude Sonnet 4" matches `claude-sonnet-4-5` because "4" is a
+# substring of "4-5"), and here it meant an account at 160% of its real Sonnet
+# 4.5 limit was scored at 8% of Sonnet 4's and never alerted at all.
 try:
     from app.burndown import output_burndown_rate  # Lambda image layout
+    from app.quota_match import resolve_quota
+    from app.rate_catalog import snapshot_with_conn
 except ImportError:  # pragma: no cover - local dev layout
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
     from app.burndown import output_burndown_rate  # type: ignore
+    from app.quota_match import resolve_quota  # type: ignore
+    from app.rate_catalog import snapshot_with_conn  # type: ignore
+
+
+def quota_consumption(native: int | float | None,
+                      input_quota_tokens: int | float | None,
+                      output_tokens: int | float | None,
+                      rate: int | float) -> tuple[float | None, str]:
+    """Choose ONE quota-consumption source for a single time bucket.
+
+    Returns (value, source) where source is `aws_estimate`, `reconstructed`, or
+    `unavailable`. This is deliberately a choice and not `max(native, formula)`:
+    taking the larger lets a stale local multiplier override a live AWS
+    observation, which is backwards — the whole point of preferring the native
+    metric is that AWS computed it with the real, current policy.
+
+    `native` is AWS's EstimatedTPMQuotaUsage for the bucket. It ALREADY has
+    burndown and cache-write treatment baked in, so it is never multiplied again.
+    A native 0 is a real observation and is used; only None means "no datapoint".
+
+    The reconstruction is the documented formula:
+        uncached input + cache-write + output * burndown_rate
+    Cache READS are excluded — they do not consume quota.
+
+    Callers must apply this PER BUCKET before taking any peak. Selecting a max
+    input and a max output independently and adding them invents an hour that
+    never happened.
+    """
+    if native is not None:
+        return float(native), "aws_estimate"
+    if input_quota_tokens is None and output_tokens is None:
+        return None, "unavailable"
+    return (float(input_quota_tokens or 0)
+            + float(output_tokens or 0) * float(rate)), "reconstructed"
 
 
 DEFAULTS = {
@@ -84,81 +126,118 @@ async def _detect_quota_utilization(conn, th: dict) -> list[dict]:
     """Peak TPM (burndown-weighted) and RPM per (account, model, region) over
     the last 7 days vs the applied Service Quotas limit. Same math as the
     Quotas tab: input + cache-write + output*burndown; cache-read excluded."""
+    # Per-HOUR rows, not pre-aggregated maxima. The previous query selected
+    # MAX(input) and MAX(output) independently and the caller added them, which
+    # fabricated an hour that never happened: an account whose input peaked at
+    # 09:00 and whose output peaked at 17:00 got input_peak + output_peak*rate as
+    # its "peak", always >= the true peak, firing critical alerts for load that
+    # never existed. Consumption is now chosen and computed per bucket, and only
+    # then reduced to a peak.
     rows = await conn.fetch(
         """
-        SELECT accountId, modelId, region,
-               MAX(total_requests::float / 60.0) AS peak_rpm,
-               -- Prefer AWS's native EstimatedTPMQuotaUsage (burndown already
-               -- baked in); fall back to the reconstructed formula per row.
-               MAX(COALESCE(estimated_tpm_quota_usage,0)::float / 60.0) AS peak_native_tpm,
-               MAX((COALESCE(total_input_tokens,0)
-                    + COALESCE(total_cache_write_input_tokens,0))::float / 60.0) AS peak_in_tpm,
-               MAX(COALESCE(total_output_tokens,0)::float / 60.0)               AS peak_out_tpm
+        SELECT accountId, modelId, region, event_date, hour,
+               total_requests::float / 60.0                      AS rpm,
+               estimated_tpm_quota_usage                         AS native_hour,
+               (COALESCE(total_input_tokens,0)
+                + COALESCE(total_cache_write_input_tokens,0))    AS input_quota_tokens,
+               COALESCE(total_output_tokens,0)                   AS output_tokens
         FROM f_hourly_peak
         WHERE event_date >= current_date - 7 AND endpoint = 'runtime'
-        GROUP BY accountId, modelId, region
-        HAVING SUM(total_requests) > 0
+          AND total_requests > 0
         """)
     quotas = await conn.fetch(
         """
-        SELECT accountId, region, quota_code, model_name, metric,
+        SELECT accountId, region, quota_code, model_name, metric, traffic_type,
+               applied_value, default_value,
                COALESCE(applied_value, default_value) AS limit_value
         FROM f_quotas
         WHERE COALESCE(applied_value, default_value) > 0
         """)
-    # quota lookup: fuzz model_name vs modelId, prefer larger limit (same
-    # heuristic as quota_drilldown)
-    by_acct_region: dict[tuple, list] = {}
-    for q in quotas:
-        by_acct_region.setdefault((q["accountid"], q["region"]), []).append(q)
+    quota_rows = [dict(q) for q in quotas]
+    # One catalog read for the whole job, over this job's own connection (the
+    # ingester Lambda never initialises the API's pool). An admin's rate edit is
+    # therefore picked up by the next scheduled run with no redeploy.
+    cat = await snapshot_with_conn(conn)
+
+    # Reduce per-hour consumption to a peak per (account, model, region), keeping
+    # track of which source(s) produced it so the alert can disclose them.
+    agg: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["accountid"], r["modelid"], r["region"])
+        a = agg.get(key)
+        if a is None:
+            a = agg[key] = {"peak_tpm": None, "peak_rpm": 0.0,
+                            "sources": set(), "unknown_hours": 0}
+        rate = cat.rate_for(r["modelid"], on_date=r.get("event_date")).rate
+        value, source = quota_consumption(
+            r["native_hour"], r["input_quota_tokens"], r["output_tokens"], rate)
+        a["peak_rpm"] = max(a["peak_rpm"], r["rpm"] or 0.0)
+        if value is None:
+            a["unknown_hours"] += 1
+            continue
+        a["sources"].add(source)
+        tpm = value / 60.0        # hourly Sum -> hourly-average per-minute rate
+        if a["peak_tpm"] is None or tpm > a["peak_tpm"]:
+            a["peak_tpm"] = tpm
 
     findings = []
-    for r in rows:
-        acct, model, region = r["accountid"], r["modelid"], r["region"]
-        rate = output_burndown_rate(model)
-        formula_tpm = (r["peak_in_tpm"] or 0) + (r["peak_out_tpm"] or 0) * rate
-        peak_tpm = max(r["peak_native_tpm"] or 0, formula_tpm)
-        peak_rpm = r["peak_rpm"] or 0
-        candidates = by_acct_region.get((acct, region), [])
-        # crude fuzz: model family token from the id present in quota name
-        fam = model.split(".")[-1].split("-2")[0].replace("-v1:0", "")
-        parts = [p for p in fam.split("-") if p and not p.isdigit()]
-        for metric_name, peak in (("TPM", peak_tpm), ("RPM", peak_rpm)):
-            best = None
-            for q in candidates:
-                if q["metric"] != metric_name:
-                    continue
-                name = (q["model_name"] or "").lower()
-                if all(p in name for p in parts[:2]):
-                    if best is None or (q["limit_value"] or 0) > (best["limit_value"] or 0):
-                        best = q
-            if not best or not best["limit_value"]:
-                continue
-            util = 100.0 * peak / float(best["limit_value"])
+    for (acct, model, region), a in agg.items():
+        # Mixed-source disclosure: one native hour must not relabel a series that
+        # was mostly reconstructed, and vice versa.
+        srcs = a["sources"]
+        source_label = ("mixed" if len(srcs) > 1
+                        else (next(iter(srcs)) if srcs else "unavailable"))
+        for metric_name, peak in (("TPM", a["peak_tpm"]), ("RPM", a["peak_rpm"])):
+            if peak is None:
+                continue          # no usable consumption source for any hour
+            # The SHARED resolver — ranked canonical identity, account- and
+            # region-scoped, ambiguity reported rather than resolved by taking
+            # the larger limit.
+            res = resolve_quota(quota_rows, acct, region, model,
+                                metric=metric_name)
+            if not res.known or res.ambiguous:
+                continue          # unknown limit is not a finding, it is a gap
+            limit_value = float(res.value)
+            util = 100.0 * peak / limit_value
             if util < th["notify_quota_warn_pct"]:
                 continue
             sev = ("critical" if util >= th["notify_quota_crit_pct"] else "warning")
-            desired = float(best["limit_value"]) * 2
+            desired = limit_value * 2
+            basis = (f"{metric_name} source: {source_label}"
+                     if metric_name == "TPM" else "request count")
+            coverage = (f" {a['unknown_hours']} hour(s) had no usable "
+                        f"consumption source and were excluded."
+                        if a["unknown_hours"] else "")
             findings.append({
                 "finding_id": f"quota-{metric_name.lower()}-{acct}-{model}-{region}",
                 "type": "quota_utilization",
                 "severity": sev,
                 "accountId": acct, "model": model, "region": region,
-                "title": f"{metric_name} at {util:.0f}% of quota — {model} in {region}",
+                # One decimal below 10%: "{:.0f}" rendered 0.2% as "at 0% of
+                # quota", which reads as a bug rather than a finding. Only
+                # reachable when an operator lowers the threshold, but a title
+                # that contradicts its own metric is not worth shipping.
+                "title": (f"{metric_name} at "
+                          f"{util:.1f}% of quota — {model} in {region}"
+                          if util < 10 else
+                          f"{metric_name} at {util:.0f}% of quota — {model} in {region}"),
                 "detail": (f"Peak {metric_name} {peak:,.0f} vs applied limit "
-                           f"{best['limit_value']:,.0f} (7-day window, "
-                           f"burndown-weighted). Account {acct}."),
+                           f"{limit_value:,.0f} (7-day window, {basis}). "
+                           f"Hourly-average per-minute rate, not a measured "
+                           f"minute peak.{coverage} Account {acct}."),
                 "metric": {"value": round(util, 1),
                            "threshold": th["notify_quota_warn_pct"],
                            "unit": f"{metric_name.lower()}_utilization_pct",
-                           "window": "7d"},
+                           "window": "7d",
+                           "consumption_source": source_label,
+                           "quota_family": res.family},
                 "recommended_action": {
                     "kind": "quota_increase",
                     "summary": (f"Request a {metric_name} quota increase for "
-                                f"{best['model_name']} in {region} "
+                                f"{model} in {region} "
                                 f"(suggested: {desired:,.0f})"),
-                    "cli": _quota_cli(region, best["quota_code"], desired),
-                    "console_url": _quota_console_url(region, best["quota_code"]),
+                    "cli": _quota_cli(region, res.quota_code, desired),
+                    "console_url": _quota_console_url(region, res.quota_code),
                 },
             })
     return findings

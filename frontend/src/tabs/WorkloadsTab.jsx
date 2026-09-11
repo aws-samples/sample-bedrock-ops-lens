@@ -153,10 +153,16 @@ export default function WorkloadsTab({ filters, onInfo }) {
   // estimate — the third metric of the common enterprise ask alongside tokens + throttles.
   // (Quota query groups all values for the key; client-side filter applies below.)
   const quotaParams = useMemo(
-    () => ({ days: filters.days, endpoint: 'all', dim_key: activeKey }),
-    [filters.days, activeKey]);
+    () => ({ days: filters.days, endpoint: 'all', dim_key: activeKey,
+             accounts: filters.accounts, region: filters.region }),
+    [filters.days, activeKey, JSON.stringify(filters.accounts || []),
+     filters.region]);
   const quota = useApi('/attribution/quota', quotaParams, [JSON.stringify(quotaParams)]);
   const quotaRowsAll = quota.data?.rows || [];
+  // Calls made straight to a provider consume no AWS quota, so they are returned
+  // separately with a null limit instead of being scored against a Bedrock
+  // ceiling. Show them, rather than dropping them.
+  const quotaDirectRows = quota.data?.direct_provider_rows || [];
   const quotaRows = useMemo(() => (
     selectedValues.length
       ? quotaRowsAll.filter(r => selectedValues.includes(r.workload))
@@ -397,7 +403,17 @@ export default function WorkloadsTab({ filters, onInfo }) {
                   { id: 'value', header: dimLabel, cell: r => r.workload, exportValue: r => r.workload },
                   { id: 'util', header: 'Peak quota utilization', cell: (r) => {
                       const p = r.utilization_pct;
-                      if (p == null) return '—';
+                      // An unknown limit is reported as unknown. It used to
+                      // borrow another model's ceiling (a Sonnet workload could
+                      // read 200% off a Haiku limit), so "—" here means "we will
+                      // not guess", and the reason says which case it is.
+                      if (p == null) {
+                        return (
+                          <StatusIndicator type="info">
+                            Unknown{r.limit_unknown_reason ? ` — ${r.limit_unknown_reason}` : ''}
+                          </StatusIndicator>
+                        );
+                      }
                       const t = p > 80 ? 'error' : p > 50 ? 'warning' : 'success';
                       return <StatusIndicator type={t}>{p.toFixed(2)}%</StatusIndicator>;
                     }, exportValue: r => r.utilization_pct },
@@ -405,10 +421,63 @@ export default function WorkloadsTab({ filters, onInfo }) {
                   { id: 'tpm_limit', header: 'TPM limit', cell: r => r.tpm_limit != null ? fmt(r.tpm_limit) : '—', exportValue: r => r.tpm_limit },
                   { id: 'model', header: 'Busiest model', cell: r => r.model, exportValue: r => r.model },
                   { id: 'region', header: 'Region', cell: r => r.region, exportValue: r => r.region },
+                  { id: 'acct', header: 'Quota account',
+                    cell: r => (r.quota_account_known && r.accountId)
+                      ? r.accountId
+                      : <StatusIndicator type="info">not reported</StatusIndicator>,
+                    exportValue: r => (r.quota_account_known ? r.accountId : '') },
                 ]}
                 empty="No quota-utilization estimate."
               />
         }
+        {(quota.data?.breach_count || 0) > 0 && (
+          <Box padding={{ top: 's' }}>
+            <Alert type="error" header={`${quota.data.breach_count} quota breach${quota.data.breach_count === 1 ? '' : 'es'} at the account level`}>
+              At least one (account, region, model) combination exceeded its own
+              TPM limit. The table shows the worst utilization per {lc}; a breach
+              in a lower-traffic account used to be hidden behind a
+              higher-traffic account with a larger limit, so it is called out
+              here explicitly.
+            </Alert>
+          </Box>
+        )}
+        {quota.data?.any_limit_unknown && (
+          <Box padding={{ top: 's' }}>
+            <Alert type="info">
+              Some rows show an unknown limit. TPM quotas are set per (account,
+              model, region); a limit is only applied when a Service Quotas entry
+              matches that exact combination. Another model's limit is never
+              substituted, because doing so silently misreports utilization.
+            </Alert>
+          </Box>
+        )}
+      </Container>
+      )}
+
+      {caps.quota && quotaDirectRows.length > 0 && (
+      <Container header={
+        <SectionHeader
+          title="Direct-provider traffic (no AWS quota)"
+          description="Calls made straight to Anthropic or OpenAI rather than through Bedrock. AWS neither bills nor rate-limits these, so no AWS quota utilization applies; the provider's own limits are not visible here."
+          sectionId="wl-quota"
+          onInfo={onInfo}
+        />
+      }>
+        <PaginatedTable
+          items={quotaDirectRows}
+          downloadFileName={`direct-provider-traffic-by-${activeKey}.csv`}
+          trackBy="workload"
+          columnDefinitions={[
+            { id: 'value', header: dimLabel, cell: r => r.workload, exportValue: r => r.workload },
+            { id: 'path', header: 'Path', cell: r => r.endpoint, exportValue: r => r.endpoint },
+            { id: 'peak_tpm', header: 'Peak TPM (est.)', cell: r => fmt(r.peak_tpm), exportValue: r => r.peak_tpm },
+            { id: 'model', header: 'Model', cell: r => r.model, exportValue: r => r.model },
+            { id: 'util', header: 'AWS quota utilization',
+              cell: () => <StatusIndicator type="info">Not applicable</StatusIndicator>,
+              exportValue: () => 'n/a' },
+          ]}
+          empty="No direct-provider traffic."
+        />
       </Container>
       )}
 

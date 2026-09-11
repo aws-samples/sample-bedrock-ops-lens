@@ -403,12 +403,21 @@ CREATE TABLE IF NOT EXISTS f_latency_daily (
     month       SMALLINT  GENERATED ALWAYS AS (EXTRACT(MONTH FROM event_date)::SMALLINT) STORED,
     day         SMALLINT  GENERATED ALWAYS AS (EXTRACT(DAY   FROM event_date)::SMALLINT) STORED,
 
+    -- accountId is part of the key (migration 010). Without it, the per-account
+    -- ingester's upsert overwrote other accounts' rows and every account showed
+    -- the same latency. '__unknown__' marks pre-010 rows whose owner cannot be
+    -- recovered — surfaced as unattributed, never assigned to an account.
+    accountId     TEXT NOT NULL DEFAULT '__unknown__',
     modelId       TEXT NOT NULL,
     traffic_type  TEXT NOT NULL DEFAULT '__none__',
     region        TEXT NOT NULL DEFAULT '__none__',
     endpoint      TEXT NOT NULL DEFAULT 'runtime',  -- 'runtime' (CW) | 'mantle' (invocation logs)
 
     sample_count  BIGINT,
+    -- TTFT is emitted only for STREAMING operations, so it has its own
+    -- population size. Weighting/dividing TTFT by sample_count (the E2E count)
+    -- understated it whenever non-streaming traffic was present (migration 010).
+    ttft_sample_count BIGINT,
     avg_e2e       DOUBLE PRECISION,
     p50_e2e       DOUBLE PRECISION,
     p90_e2e       DOUBLE PRECISION,
@@ -418,7 +427,7 @@ CREATE TABLE IF NOT EXISTS f_latency_daily (
     p90_ttft      DOUBLE PRECISION,
     p99_ttft      DOUBLE PRECISION,
 
-    PRIMARY KEY (event_date, modelId, traffic_type, region, endpoint)
+    PRIMARY KEY (event_date, accountId, modelId, traffic_type, region, endpoint)
 );
 
 CREATE INDEX IF NOT EXISTS ix_f_latency_brin  ON f_latency_daily USING BRIN (event_date);

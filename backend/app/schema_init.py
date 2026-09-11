@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import urllib.request
 
 import asyncpg
@@ -36,7 +37,31 @@ def _send(event, status: str, reason: str, data: dict | None = None) -> None:
         event["ResponseURL"], data=body, method="PUT",
         headers={"Content-Type": ""},
     )
-    urllib.request.urlopen(req, timeout=20).read()
+    # Retry briefly, and make each attempt fail FAST. Measured during a real
+    # teardown: `timeout=20` still took 122.9 seconds to give up, because urllib
+    # applies the timeout per resolved ADDRESS and the S3 endpoint resolves to
+    # several — so one lost callback burned the whole Lambda budget on a single
+    # doomed attempt and CloudFormation learned nothing.
+    #
+    # A short timeout plus a couple of retries covers the case this is actually
+    # for: a transient blip while the VPC's egress path is being torn down around
+    # us. It cannot rescue a permanently unroutable network — the DependsOn
+    # ordering in the template is what prevents that — but it turns a 2-minute
+    # silent stall into a fast, logged failure.
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            urllib.request.urlopen(req, timeout=8).read()
+            return
+        except Exception as e:                       # noqa: BLE001 - logged below
+            last = e
+            print(f"[schema-init] CFN callback attempt {attempt + 1}/3 failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            time.sleep(2 * (attempt + 1))
+    # Surface it: a swallowed failure here is exactly what makes a stack sit in
+    # DELETE_IN_PROGRESS with no explanation.
+    raise RuntimeError(
+        f"could not PUT CloudFormation response after 3 attempts: {last}")
 
 
 async def _apply(db_url: str, sql_files: list[str]) -> dict:

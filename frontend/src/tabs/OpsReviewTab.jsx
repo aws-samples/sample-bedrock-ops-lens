@@ -392,8 +392,14 @@ export default function OpsReviewTab({ filters, onInfo }) {
                   { id: 'r',   header: 'Region',   cell: r => r.region },
                   { id: 't',   header: 'Requests', cell: r => fmt(r.total_requests) },
                   { id: 'p',   header: 'Throttle %', cell: r => fmtPct(r.throttle_pct, 2) },
-                  { id: 'tpm', header: 'Peak TPM (obs)', cell: r => fmt(r.peak_tpm_observed) },
-                  { id: 'rpm', header: 'Peak RPM (obs)', cell: r => fmt(r.peak_rpm_observed) },
+                  // Busiest hour's hourly-average per-minute rate (hourly
+                  // total ÷ 60), not a minute peak — see units.py.
+                  { id: 'tpm', header: 'Busiest hr — avg TPM',
+                    cell: r => fmt(r.busiest_hour_avg_tpm ?? r.peak_tpm_observed),
+                    exportValue: r => r.busiest_hour_avg_tpm ?? r.peak_tpm_observed },
+                  { id: 'rpm', header: 'Busiest hr — avg RPM',
+                    cell: r => fmt(r.busiest_hour_avg_rpm ?? r.peak_rpm_observed),
+                    exportValue: r => r.busiest_hour_avg_rpm ?? r.peak_rpm_observed },
                 ]}
                 empty="No capacity issues"
               />
@@ -436,8 +442,20 @@ export default function OpsReviewTab({ filters, onInfo }) {
                   { id: 'm',   header: 'Model',   cell: r => r.modelId },
                   { id: 'r',   header: 'Region',  cell: r => r.region },
                   { id: 'avg', header: 'Avg output / req', cell: r => fmt(r.avg_output_tokens) },
-                  { id: 'p',   header: 'Peak TPM',         cell: r => fmt(r.peak_tpm_observed) },
-                  { id: 'eff', header: 'Effective (5×)',   cell: r => <Box color="text-status-error" fontWeight="bold">{fmt(r.effective_peak_tpm_5x)}</Box> },
+                  { id: 'p',   header: 'Busiest hr — avg raw TPM',
+                    cell: r => fmt(r.busiest_hour_avg_raw_tpm ?? r.peak_tpm_observed),
+                    exportValue: r => r.busiest_hour_avg_raw_tpm ?? r.peak_tpm_observed },
+                  // Label carries the model's ACTUAL rate (15x Opus 4.8, 10x
+                  // Sonnet 5 / Opus 5, 5x <=4.7) — it was hardcoded "5x".
+                  { id: 'eff',
+                    header: 'Effective quota TPM',
+                    cell: r => (
+                      <Box color="text-status-error" fontWeight="bold">
+                        {fmt(r.busiest_hour_avg_effective_tpm ?? r.effective_peak_tpm_5x)}
+                        {r.burndown_rate ? ` (${r.burndown_rate}×)` : ''}
+                      </Box>
+                    ),
+                    exportValue: r => r.busiest_hour_avg_effective_tpm ?? r.effective_peak_tpm_5x },
                   { id: 'oh',  header: 'Overhead %',       cell: r => fmtPct(r.burndown_overhead_pct) },
                 ]}
                 empty="No burndown risks"

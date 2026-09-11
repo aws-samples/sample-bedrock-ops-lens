@@ -21,6 +21,7 @@ import { useApi, fmt, fmtPct, accountName, useAccountNames } from '../api.js';
 import { ChartLoading, KpiCard, SectionHeader, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
+import { utcDayFromString, fmtDayUTC } from '../dates';
 
 // Currency formatter:
 //   - For axis ticks where space is tight: pass `compact: true` for $1.2K.
@@ -122,7 +123,7 @@ function CostBody({ filters, endpoint, onInfo }) {
       // (Jun 3, Jun 22, Jun 7, … Jul 3, Jun 5). Sort by real date ascending.
       data: [...m.entries()]
         .sort((a, b) => new Date(a[0]) - new Date(b[0]))
-        .map(([d, cost]) => ({ x: new Date(d), y: cost })),
+        .map(([d, cost]) => ({ x: utcDayFromString(d), y: cost })),
     }));
   }, [byModelChart.data]);
 
@@ -132,7 +133,7 @@ function CostBody({ filters, endpoint, onInfo }) {
   const spendXDomain = useMemo(() => {
     const ds = new Set();
     for (const r of (byModelChart.data || [])) ds.add(r.event_date);
-    return [...ds].sort((a, b) => new Date(a) - new Date(b)).map(d => new Date(d));
+    return [...ds].sort((a, b) => utcDayFromString(a) - utcDayFromString(b)).map(d => utcDayFromString(d));
   }, [byModelChart.data]);
 
   const isCostDerived = useMemo(
@@ -226,7 +227,7 @@ function CostBody({ filters, endpoint, onInfo }) {
             ariaLabel="Daily spend"
             i18nStrings={{
               ...CHART_I18N,
-              xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+              xTickFormatter: d => fmtDayUTC(d),
               yTickFormatter: v => fmtCurrency(v, currency, { compact: true }),
             }}
             height={300}

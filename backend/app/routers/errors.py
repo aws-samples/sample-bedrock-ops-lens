@@ -1,10 +1,12 @@
 """Errors tab endpoints."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from fastapi import APIRouter, Depends, Query
 
 from .. import db
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ..filters import PROVIDER_PREFIX, FilterSet, build_where, parse_filters
 
@@ -134,11 +136,12 @@ async def mantle_health(f: FilterSet = Depends(parse_filters)):
     read status_429_count here — the ingester folds the whole 4xx total into
     that column, which would mislabel ordinary client errors as "throttles".
     """
-    # Force the mantle slice regardless of the tab's switcher state.
-    forced = FilterSet(start=f.start, end=f.end, provider=f.provider,
-                       region=f.region, accounts=f.accounts,
-                       traffic_type=f.traffic_type, tag_filter=f.tag_filter,
-                       endpoint="mantle")
+    # Force the mantle slice regardless of the tab's switcher state. replace()
+    # rather than a hand-built FilterSet: the latter silently drops any field it
+    # forgets (that is how /regions lost `endpoint` — audit finding 11) and would
+    # also discard the `invalid` flags that keep unsupported filters from
+    # broadening the scope.
+    forced = replace(f, endpoint="mantle")
     w = build_where(forced)
 
     summary_row = await db.fetchrow(
@@ -278,7 +281,13 @@ async def status_codes(f: FilterSet = Depends(parse_filters)):
 
     series = [
         {
-            "ts": r["ts"].isoformat() if r["ts"] else None,
+            # Tag the instant as UTC. These hours come from CloudWatch /
+            # invocation logs, which are UTC, but the column is naive: a bare
+            # "2026-09-09T14:00:00" is parsed by JS `new Date()` as LOCAL time,
+            # which shifted the whole hourly axis by the browser's offset and
+            # mislabelled the busiest hour (audit finding 17). An explicit
+            # offset removes the ambiguity for every client.
+            "ts": r["ts"].replace(tzinfo=timezone.utc).isoformat() if r["ts"] else None,
             "total": int(r["total"] or 0),
             "ok":   int(r["ok"] or 0),
             "s400": int(r["s400"] or 0),

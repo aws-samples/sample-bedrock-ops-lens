@@ -42,4 +42,28 @@ async def hourly_heatmap(f: FilterSet = Depends(parse_filters)):
         """,
         *params,
     )
-    return db.rows_to_dicts(rows)
+    # Report the window actually covered. f_hourly_peak is loaded by the
+    # ingester's rolling lookback (INGESTER_DAYS_DEFAULT, 14 days by default),
+    # but the filter bar offers up to 90 - so the panel used to title itself
+    # "last 90 days" over 14 days of data (audit finding 17). The UI now states
+    # the covered span whenever it is shorter than the selection.
+    cov = await db.fetchrow(
+        f"""
+        SELECT MIN(event_date) AS min_date, MAX(event_date) AS max_date,
+               COUNT(DISTINCT event_date)::INT AS days_covered
+        FROM f_hourly_peak
+        WHERE {where_sql}
+        """,
+        *params,
+    )
+    requested_days = (f.end - f.start).days + 1
+    return {
+        "rows": db.rows_to_dicts(rows),
+        "coverage": {
+            "min_date": cov["min_date"].isoformat() if cov and cov["min_date"] else None,
+            "max_date": cov["max_date"].isoformat() if cov and cov["max_date"] else None,
+            "days_covered": int(cov["days_covered"] or 0) if cov else 0,
+            "days_requested": requested_days,
+            "hour_basis": "utc",
+        },
+    }

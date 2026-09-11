@@ -102,7 +102,7 @@ function ModelCard({ m, hideCache }) {
           <StatRow label="Input tokens"  value={fmt(m.input_tokens)} />
           <StatRow label="Output tokens" value={fmt(m.output_tokens)} />
           <StatRow label="Avg in / out"  value={`${fmt(Math.round(m.avg_input))} / ${fmt(Math.round(m.avg_output))}`} />
-          {!hideCache && <StatRow label="Cache hit" value={fmtPct(m.cache_hit_pct, 1)} />}
+          {!hideCache && <StatRow label="Cached prompt tokens" value={fmtPct(m.cached_prompt_token_pct ?? m.cache_hit_pct, 1)} />}
           <StatRow label="Error rate"    value={fmtPct(m.error_rate, 2)} color={errColor} />
           <StatRow label="Throttled"     value={fmt(m.throttled)} />
           <StatRow label="Accounts"      value={fmt(m.unique_accounts)} />
@@ -312,7 +312,11 @@ function ModelInsightsBody({ filters, onInfo, endpoint }) {
     { id: 'avg_in',       header: 'Avg in',        cell: m => fmt(Math.round(m.avg_input)),  exportValue: m => Math.round(m.avg_input ?? 0) },
     { id: 'avg_out',      header: 'Avg out',       cell: m => fmt(Math.round(m.avg_output)), exportValue: m => Math.round(m.avg_output ?? 0) },
     { id: 'io_ratio',     header: 'I/O ratio',     cell: m => m.io_ratio?.toFixed(2) ?? '—', exportValue: m => m.io_ratio != null ? m.io_ratio.toFixed(2) : '' },
-    { id: 'cache_hit',    header: 'Cache hit %',   cell: m => fmtPct(m.cache_hit_pct), exportValue: m => m.cache_hit_pct ?? '' },
+    // Finding 14: a share of prompt TOKENS served from cache, not the fraction
+    // of requests that hit cache - CloudWatch has no per-request cache dimension.
+    { id: 'cache_hit',    header: 'Cached prompt tokens %',
+      cell: m => fmtPct(m.cached_prompt_token_pct ?? m.cache_hit_pct),
+      exportValue: m => m.cached_prompt_token_pct ?? m.cache_hit_pct ?? '' },
     {
       id: 'error_rate', header: 'Error rate', minWidth: 130,
       cell: m => (
@@ -460,7 +464,9 @@ function ModelInsightsBody({ filters, onInfo, endpoint }) {
                 { id: 'm',    header: 'Model',        cell: r => r.modelid || r.modelId },
                 { id: 'ain',  header: 'Avg input/req',  cell: r => fmt(Math.round(r.avg_input_per_req)) },
                 { id: 'aout', header: 'Avg output/req', cell: r => fmt(Math.round(r.avg_output_per_req)) },
-                { id: 'ratio', header: 'In:Out ratio', cell: r => r.in_out_ratio != null ? `${Number(r.in_out_ratio).toFixed(1)}:1` : '—' },
+                // Already input/output (extras.py), i.e. the correct orientation. Renamed
+                // only so both shape tables use one term for one measure (finding 12).
+                { id: 'ratio', header: 'Input:output ratio', cell: r => r.in_out_ratio != null ? `${Number(r.in_out_ratio).toFixed(1)}:1` : '—' },
                 { id: 'req',  header: 'Total requests', cell: r => fmt(r.total_requests) },
               ]}
             />

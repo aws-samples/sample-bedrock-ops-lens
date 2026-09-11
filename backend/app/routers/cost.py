@@ -12,6 +12,8 @@ Endpoints:
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Query
@@ -19,88 +21,16 @@ from fastapi import APIRouter, Depends, Query
 from .. import db
 from ..filters import FilterSet, parse_filters
 from .model_insights import BEDROCK_PRICING, _provider_of
+from .. import cost_alloc
 
 router = APIRouter()
 
 
-async def _endpoint_fraction(f: FilterSet, key_cols: list[str]) -> dict:
-    """Return, per grouping key, the fraction of that key's token-cost weight
-    attributable to EACH endpoint — used to slice CE spend by endpoint
-    accurately at the row level (not a global smear).
-
-    key_cols: f_daily columns to group by (e.g. ['event_date'], ['accountId'],
-    ['modelId']). Returns {key_tuple: {'runtime': frac, 'mantle': frac}} where
-    fracs sum to 1 (or {} for a key with no usage → caller keeps full amount).
-
-    Weight = input×in_price + output×out_price, provider-priced (same basis as
-    the model cost allocation), so it tracks real dollar mix, not raw tokens."""
-    parts = ["event_date BETWEEN $1::date AND $2::date"]
-    params: list = [f.start, f.end]
-    if f.accounts:
-        parts.append(f"accountId = ANY(${len(params)+1}::text[])")
-        params.append(list(f.accounts))
-    cols = ", ".join(key_cols)
-    rows = await db.fetch(
-        f"""
-        SELECT {cols}, endpoint, modelId,
-               SUM(total_input_tokens)::BIGINT  AS in_tok,
-               SUM(total_output_tokens)::BIGINT AS out_tok
-        FROM f_daily
-        WHERE {" AND ".join(parts)}
-        GROUP BY {cols}, endpoint, modelId
-        """,
-        *params,
-    )
-    # Accumulate weight per (key, endpoint).
-    from collections import defaultdict
-    w = defaultdict(lambda: {"runtime": 0.0, "mantle": 0.0})
-    for r in rows:
-        rd = dict(r)
-        key = tuple(rd[c.lower()] if c.lower() in rd else rd[c] for c in key_cols)
-        ep = rd.get("endpoint") if rd.get("endpoint") in ("runtime", "mantle") else "runtime"
-        price = BEDROCK_PRICING.get(_provider_of(rd.get("modelid") or rd.get("modelId")),
-                                    {"input": 0.50, "output": 1.50})
-        w[key][ep] += (int(rd.get("in_tok") or 0) / 1_000_000) * price["input"] \
-                    + (int(rd.get("out_tok") or 0) / 1_000_000) * price["output"]
-    out = {}
-    for key, ew in w.items():
-        tot = ew["runtime"] + ew["mantle"]
-        if tot > 0:
-            out[key] = {"runtime": ew["runtime"] / tot, "mantle": ew["mantle"] / tot}
-    return out
-
-
-async def _endpoint_cost_weights(f: FilterSet) -> dict:
-    """Per-endpoint token-cost WEIGHT from f_daily (input×in_price +
-    output×out_price, provider-priced). Cost Explorer gives an invoice-accurate
-    TOTAL but no runtime-vs-mantle dimension; we allocate that real total across
-    endpoints by each endpoint's share of this weight. Returns
-    {'runtime': w, 'mantle': w} (0 when no usage)."""
-    parts = ["event_date BETWEEN $1::date AND $2::date"]
-    params: list = [f.start, f.end]
-    if f.accounts:
-        parts.append(f"accountId = ANY(${len(params)+1}::text[])")
-        params.append(list(f.accounts))
-    rows = await db.fetch(
-        f"""
-        SELECT endpoint, modelId,
-               SUM(total_input_tokens)::BIGINT  AS in_tok,
-               SUM(total_output_tokens)::BIGINT AS out_tok
-        FROM f_daily
-        WHERE {" AND ".join(parts)}
-        GROUP BY endpoint, modelId
-        """,
-        *params,
-    )
-    weights = {"runtime": 0.0, "mantle": 0.0}
-    for r in rows:
-        ep = r["endpoint"] if r["endpoint"] in ("runtime", "mantle") else "runtime"
-        price = BEDROCK_PRICING.get(_provider_of(r["modelid"] or r["modelId"]),
-                                    {"input": 0.50, "output": 1.50})
-        w = (int(r["in_tok"] or 0) / 1_000_000) * price["input"] \
-          + (int(r["out_tok"] or 0) / 1_000_000) * price["output"]
-        weights[ep] += w
-    return weights
+# NOTE: the two former endpoint allocators (_endpoint_fraction, per-key, and
+# _endpoint_cost_weights, whole-window) were DELETED. Having two bases is what
+# made the headline and the daily chart disagree (audit finding 07). All cost
+# widgets now derive from app/cost_alloc.allocate(), which allocates once per
+# (event_date, accountId). Do not reintroduce a second allocator here.
 
 
 # ---------------------------------------------------------------------------
@@ -152,27 +82,42 @@ async def cost_summary(f: FilterSet = Depends(parse_filters)):
     )
     total = float(cur["total_cost"] or 0)
 
-    # Allocate the invoice-accurate CE total across endpoints by each
-    # endpoint's token-cost weight (CE itself has no runtime/mantle dimension).
-    weights = await _endpoint_cost_weights(f)
-    wsum = weights["runtime"] + weights["mantle"]
-    if wsum > 0:
-        by_endpoint = {
-            "runtime": round(total * weights["runtime"] / wsum, 6),
-            "mantle":  round(total * weights["mantle"]  / wsum, 6),
-            "allocated": True,   # derived split, not a native CE dimension
-        }
-    else:
-        by_endpoint = {"runtime": total, "mantle": 0.0, "allocated": True}
+    # ONE allocation basis for every cost widget (app/cost_alloc.py): per
+    # (event_date, accountId), then aggregated. The headline previously used
+    # WHOLE-WINDOW token weights while the daily chart used per-day weights, and
+    # those are not additive ($90@90% + $10@10% is $82 per day but $50 by
+    # window). Now the headline is the sum of the same per-day numbers.
+    alloc = await cost_alloc.allocate(f)
+    by_endpoint = {
+        "runtime": round(alloc.by_endpoint.get("runtime", 0.0), 6),
+        "mantle":  round(alloc.by_endpoint.get("mantle", 0.0), 6),
+        # Charges with no token basis in their (date, account): NOT smeared onto
+        # the endpoints that do have usage.
+        "unknown": round(alloc.by_endpoint.get("unknown", 0.0), 6),
+        "allocated": True,   # derived split, not a native CE dimension
+        "basis": alloc.basis,
+    }
+
+    # Prior period: allocate using the PRIOR window's own inputs. Reusing the
+    # current window's endpoint fraction made growth wrong (the audit measured a
+    # displayed 8.1% where the prior window's own allocation gives 7.21%).
+    prev_f = replace(f, start=prev_start, end=prev_end)
+    prev_alloc = await cost_alloc.allocate(prev_f)
 
     return {
-        "total_cost": total,
+        "total_cost": round(alloc.selected_total, 6) if f.endpoint in ("runtime", "mantle") else total,
+        "scope_total_all_endpoints": total,
         "currency": cur["currency"] or "USD",
         "unique_accounts": int(cur["unique_accounts"] or 0),
         "unique_services": int(cur["unique_services"] or 0),
-        "previous_total_cost": float(prev["total_cost"] or 0),
+        "previous_total_cost": round(prev_alloc.selected_total, 6)
+            if f.endpoint in ("runtime", "mantle") else float(prev["total_cost"] or 0),
+        "unattributed_cost": round(alloc.unattributed, 6),
+        "has_unattributed": alloc.has_unattributed,
         "by_endpoint": by_endpoint,
+        "allocation_basis": alloc.basis,
         "window": {"start": f.start.isoformat(), "end": f.end.isoformat(), "days": days},
+        "previous_window": {"start": prev_start.isoformat(), "end": prev_end.isoformat()},
     }
 
 
@@ -192,20 +137,24 @@ async def cost_daily(f: FilterSet = Depends(parse_filters)):
         """,
         *params,
     )
-    # Endpoint slice: scale each DAY's spend by that day's endpoint token-cost
-    # fraction (accurate per-day, not a global smear). 'all' → untouched CE $.
-    frac = {}
-    if f.endpoint in ("runtime", "mantle"):
-        frac = await _endpoint_fraction(f, ["event_date"])
+    # Endpoint slice comes from the SHARED per-(date, account) allocation, so
+    # these daily values sum exactly to the headline (finding 07).
     out = []
+    if f.endpoint in ("runtime", "mantle"):
+        alloc = await cost_alloc.allocate(f)
+        for r in rows:
+            d = r["event_date"]
+            out.append({
+                "event_date": d.isoformat(),
+                "total_cost": round(alloc.by_date.get(d, 0.0), 6),
+                "currency": r["currency"] or "USD",
+                "allocation_basis": alloc.basis,
+            })
+        return out
     for r in rows:
-        amt = float(r["total_cost"] or 0)
-        if f.endpoint in ("runtime", "mantle"):
-            fr = frac.get((r["event_date"],))
-            amt = amt * fr[f.endpoint] if fr else 0.0
         out.append({
             "event_date": r["event_date"].isoformat(),
-            "total_cost": amt,
+            "total_cost": float(r["total_cost"] or 0),
             "currency": r["currency"] or "USD",
         })
     return out
@@ -261,20 +210,23 @@ async def cost_by_account(f: FilterSet = Depends(parse_filters)):
         for r in prev_rows
     }
 
-    # Endpoint slice: scale each account's spend (current + previous) by its
-    # own endpoint token-cost fraction. 'all' → untouched.
-    frac = {}
+    # Endpoint slice from the SHARED per-(date, account) allocation. Each period
+    # is allocated with ITS OWN inputs: the previous window used to be multiplied
+    # by the CURRENT window's endpoint fraction, which made growth wrong (the
+    # audit measured a displayed 8.1% against 7.21% computed properly).
+    cur_alloc = prev_alloc = None
     if f.endpoint in ("runtime", "mantle"):
-        frac = await _endpoint_fraction(f, ["accountId"])
+        cur_alloc = await cost_alloc.allocate(f)
+        prev_alloc = await cost_alloc.allocate(
+            replace(f, start=prev_start, end=prev_end))
 
     out = []
     for acct, cur in cur_by_acct.items():
         prev = prev_by_acct.get(acct, 0)
         tc, pc = cur["total_cost"], prev
         if f.endpoint in ("runtime", "mantle"):
-            fr = frac.get((acct,))
-            mult = fr[f.endpoint] if fr else 0.0
-            tc, pc = tc * mult, pc * mult
+            tc = cur_alloc.by_account.get(acct, 0.0)
+            pc = prev_alloc.by_account.get(acct, 0.0)
         out.append({
             "accountId": acct,
             "total_cost": tc,
@@ -339,12 +291,12 @@ async def cost_by_model_detailed(f: FilterSet = Depends(parse_filters)):
         *params,
     ) or "USD"
 
-    # Endpoint slice: scale the CE total to this endpoint's allocated share, so
-    # the per-model amounts below sum to the endpoint total (not fleet total).
+    # Endpoint slice from the SHARED per-(date, account) allocation, so this
+    # endpoint's per-model amounts sum to the same headline the ribbon shows
+    # (previously a whole-window weight, inconsistent with the daily chart).
+    detailed_alloc = await cost_alloc.allocate(f)
     if f.endpoint in ("runtime", "mantle"):
-        weights = await _endpoint_cost_weights(f)
-        wsum = weights["runtime"] + weights["mantle"]
-        cost_total = float(cost_total or 0) * (weights[f.endpoint] / wsum if wsum else 0.0)
+        cost_total = detailed_alloc.selected_total
 
     # Try direct per-model service rows first.
     direct = await db.fetch(
@@ -400,58 +352,16 @@ async def cost_concentration(
     prev_start = prev_end - timedelta(days=days - 1)
 
     async def _per_acct_model(start_d, end_d):
-        # Cost per (date, accountId).
-        cw = "event_date BETWEEN $1::date AND $2::date"
-        cp = [start_d, end_d]
-        if f.accounts:
-            cw += f" AND accountId = ANY($3::text[])"
-            cp.append(list(f.accounts))
-        cost_rows = await db.fetch(
-            f"""
-            SELECT event_date, accountId,
-                   SUM(total_cost)::numeric AS daily_cost,
-                   MIN(currency) AS currency
-            FROM f_daily_cost
-            WHERE {cw}
-            GROUP BY event_date, accountId
-            """,
-            *cp,
-        )
-        cost_by_ad = {}
-        for r in cost_rows:
-            aid = r["accountid"] if "accountid" in r else r["accountId"]
-            cost_by_ad[(r["event_date"], aid)] = (
-                float(r["daily_cost"] or 0),
-                r["currency"] or "USD",
-            )
-        # Token mix per (date, account, model).
-        tok_rows = await db.fetch(
-            f"""
-            SELECT event_date, accountId, modelId,
-                   (SUM(total_input_tokens) + SUM(total_output_tokens))::BIGINT AS toks
-            FROM f_daily
-            WHERE {cw}
-            GROUP BY event_date, accountId, modelId
-            """,
-            *cp,
-        )
-        totals_ad = {}
-        for r in tok_rows:
-            aid = r["accountid"] if "accountid" in r else r["accountId"]
-            totals_ad[(r["event_date"], aid)] = totals_ad.get((r["event_date"], aid), 0) + int(r["toks"] or 0)
-        agg = {}
-        for r in tok_rows:
-            aid = r["accountid"] if "accountid" in r else r["accountId"]
-            mid = r["modelid"] if "modelid" in r else r["modelId"]
-            d = r["event_date"]
-            cost_pair = cost_by_ad.get((d, aid))
-            tot = totals_ad.get((d, aid), 0)
-            if not cost_pair or not tot:
-                continue
-            allocated = cost_pair[0] * (int(r["toks"] or 0) / tot)
-            key = (aid, mid)
-            agg[key] = agg.get(key, 0.0) + allocated
-        return agg
+        """Per-(account, model) spend from the SHARED allocation.
+
+        This used to run its own copy of the allocation, without any endpoint
+        filter — which is how a Mantle view showed $24,638.38 of Nova Lite under
+        an $11,428.82 Mantle headline (a single row exceeding the whole total).
+        Delegating to app/cost_alloc keeps every cost widget on one basis and one
+        endpoint scope."""
+        scoped = replace(f, start=start_d, end=end_d)
+        a = await cost_alloc.allocate(scoped)
+        return dict(a.by_account_model)
 
     cur_agg = await _per_acct_model(f.start, f.end)
     prev_agg = await _per_acct_model(prev_start, prev_end)
@@ -496,150 +406,37 @@ async def cost_by_model(
     Most non-EDP customers see (2). The UI surfaces `derived` so the
     disclosure is honest.
     """
-    where_sql, params = _cost_where(f)
-
-    # Direct: per-service rows. Filter to "Bedrock Edition" services if any.
-    direct_rows = await db.fetch(
-        f"""
-        SELECT event_date, service,
-               SUM(total_cost)::numeric AS total_cost,
-               MIN(currency) AS currency
-        FROM f_daily_cost
-        WHERE {where_sql} AND service ILIKE '%Bedrock Edition%'
-        GROUP BY event_date, service
-        ORDER BY event_date, service
-        """,
-        *params,
-    )
-    if direct_rows:
-        return [
-            {
-                "event_date": r["event_date"].isoformat(),
-                "model_label": r["service"],
-                "total_cost": float(r["total_cost"]),
-                "currency":   r["currency"] or "USD",
-                "derived": False,
-            }
-            for r in direct_rows
-        ]
-
-    # Fallback: consolidated "Amazon Bedrock" service. Allocate per-model by
-    # f_daily token mix. Two CTEs: daily total cost from CE, and per-model
-    # daily token share from f_daily; we multiply at the row level.
-    if not derive:
-        return []
-
-    # Build the WHERE for the f_daily side using the same date+accounts.
-    # Endpoint slice: filtering the TOKEN side to one endpoint makes the
-    # per-(date,account) normalization total that endpoint's tokens, so each
-    # model's allocated cost reflects only its usage on the selected endpoint
-    # (models not used there fall out). CE $ (the numerator) is unchanged; this
-    # apportions the same real dollars to the endpoint's actual model mix.
-    fd_where = "event_date BETWEEN $1::date AND $2::date"
-    fd_params = [f.start, f.end]
-    if f.accounts:
-        fd_where += f" AND accountId = ANY(${len(fd_params)+1}::text[])"
-        fd_params.append(list(f.accounts))
-    if f.endpoint in ("runtime", "mantle"):
-        fd_where += f" AND endpoint = ${len(fd_params)+1}"
-        fd_params.append(f.endpoint)
-
-    # Cost Explorer cost is per (event_date, accountId). Token mix is per
-    # (event_date, accountId, modelId). Allocate cost ∝ tokens within the
-    # same (event_date, accountId), then sum to (event_date, modelId) for
-    # the chart series.
-    rows = await db.fetch(
-        f"""
-        WITH cost AS (
-            SELECT event_date, accountId,
-                   SUM(total_cost)::numeric AS daily_cost,
-                   MIN(currency) AS currency
-            FROM f_daily_cost
-            WHERE {where_sql}
-            GROUP BY event_date, accountId
-        ),
-        tokens AS (
-            SELECT event_date, accountId, modelId,
-                   SUM(total_input_tokens + total_output_tokens)::numeric AS toks
-            FROM f_daily
-            WHERE {fd_where}
-            GROUP BY event_date, accountId, modelId
-        ),
-        totals AS (
-            SELECT event_date, accountId, SUM(toks)::numeric AS total_toks
-            FROM tokens GROUP BY event_date, accountId
-        )
-        SELECT t.event_date, t.modelId AS model_label,
-               SUM(c.daily_cost * t.toks / NULLIF(tt.total_toks, 0))::numeric AS total_cost,
-               MIN(c.currency) AS currency
-        FROM tokens t
-        JOIN totals tt ON tt.event_date = t.event_date AND tt.accountId = t.accountId
-        JOIN cost c    ON c.event_date  = t.event_date AND c.accountId  = t.accountId
-        GROUP BY t.event_date, t.modelId
-        ORDER BY t.event_date, total_cost DESC
-        """,
-        *params, *(fd_params if f.accounts else fd_params[:2]),  # dedupe accounts param
-    ) if False else await db.fetch(
-        # Two queries are cleaner than parameter-juggling — fetch tokens and
-        # cost separately and stitch in Python.
-        f"""
-        SELECT event_date, accountId,
-               SUM(total_cost)::numeric AS daily_cost,
-               MIN(currency) AS currency
-        FROM f_daily_cost
-        WHERE {where_sql}
-        GROUP BY event_date, accountId
-        """,
-        *params,
-    )
-
-    cost_by_acct_day: dict[tuple, tuple[float, str]] = {}
-    for r in rows:
-        aid = r["accountid"] if "accountid" in r else r["accountId"]
-        cost_by_acct_day[(r["event_date"], aid)] = (
-            float(r["daily_cost"] or 0),
-            r["currency"] or "USD",
-        )
-
-    tok_rows = await db.fetch(
-        f"""
-        SELECT event_date, accountId, modelId,
-               (SUM(total_input_tokens) + SUM(total_output_tokens))::BIGINT AS toks
-        FROM f_daily
-        WHERE {fd_where}
-        GROUP BY event_date, accountId, modelId
-        """,
-        *fd_params,
-    )
-
-    # Sum per (date, account) for normalization.
-    totals: dict[tuple, int] = {}
-    for r in tok_rows:
-        aid = r["accountid"] if "accountid" in r else r["accountId"]
-        key = (r["event_date"], aid)
-        totals[key] = totals.get(key, 0) + int(r["toks"] or 0)
-
-    out_keyed: dict[tuple[str, str], dict] = {}
-    for r in tok_rows:
-        aid = r["accountid"] if "accountid" in r else r["accountId"]
-        mid = r["modelid"] if "modelid" in r else r["modelId"]
-        d = r["event_date"]
-        cost_pair = cost_by_acct_day.get((d, aid))
-        total_toks = totals.get((d, aid), 0)
-        if not cost_pair or total_toks == 0:
-            continue
-        cost_amt, cur = cost_pair
-        share = (int(r["toks"] or 0)) / total_toks
-        allocated = cost_amt * share
-        k = (d.isoformat(), mid)
-        if k not in out_keyed:
-            out_keyed[k] = {
-                "event_date":  d.isoformat(),
-                "model_label": mid,
-                "total_cost":  0.0,
-                "currency":    cur,
-                "derived":     True,
-            }
-        out_keyed[k]["total_cost"] += allocated
-
-    return sorted(out_keyed.values(), key=lambda x: (x["event_date"], -x["total_cost"]))
+    # ONE allocation (app/cost_alloc.py). The old implementation returned early
+    # whenever CE reported any "... (Amazon Bedrock Edition)" service, BEFORE the
+    # endpoint slice was applied — so runtime, mantle and all returned the same
+    # rows and the same total (the audit measured a $96,699.54 chart under an
+    # $11,428.82 Mantle headline). It also suppressed consolidated charges and
+    # dropped billed account-days with no token rows. The shared allocator scopes
+    # by endpoint, attributes per-model services to their own family, and emits
+    # an explicit unattributed bucket so money is conserved.
+    alloc = await cost_alloc.allocate(f)
+    out = [
+        {
+            "event_date": d.isoformat(),
+            "model_label": mid,
+            "total_cost": round(amt, 6),
+            "currency": alloc.currency,
+            "derived": alloc.derived,
+            "allocation_basis": alloc.basis,
+        }
+        for (d, mid), amt in alloc.by_date_model.items()
+        if amt != 0
+    ]
+    # Unattributable charges are shown, not hidden: sum(models) + unattributed
+    # equals the same-scope CE total for the selected endpoint.
+    if alloc.unattributed:
+        out.append({
+            "event_date": f.end.isoformat(),
+            "model_label": cost_alloc.UNATTRIBUTED_LABEL,
+            "total_cost": round(alloc.unattributed, 6),
+            "currency": alloc.currency,
+            "derived": True,
+            "unattributed": True,
+            "allocation_basis": alloc.basis,
+        })
+    return sorted(out, key=lambda x: (x["event_date"], -x["total_cost"]))

@@ -15,6 +15,7 @@ from .db import close_pool, init_pool
 from .routers import (
     agents as agents_router,
     attribution as attribution_router,
+    burndown_rates as burndown_rates_router,
     notifications as notifications_router,
     by_user as by_user_router,
     compliance as compliance_router,
@@ -39,6 +40,17 @@ from .routers import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_pool()
+    # Store the bundled, doc-verified burndown rates on first boot so the
+    # Settings editor opens with real values instead of an empty table the admin
+    # would have to retype from the AWS doc. No-op once a catalog exists, so an
+    # operator's edits are never overwritten by a restart or a redeploy.
+    try:
+        from . import rate_catalog
+        await rate_catalog.seed_if_absent()
+    except Exception:
+        # A cold stack whose schema-init has not finished yet must still serve.
+        # The catalog falls back to the bundled values in that case anyway.
+        pass
     yield
     await close_pool()
 
@@ -82,6 +94,7 @@ app.include_router(quota_drilldown_router.router, prefix="/api", tags=["quota-dr
 app.include_router(workload_usage_router.router, prefix="/api", tags=["workload-usage"])
 app.include_router(attribution_router.router, prefix="/api", tags=["attribution"])
 app.include_router(notifications_router.router, prefix="/api", tags=["notifications"])
+app.include_router(burndown_rates_router.router, prefix="/api", tags=["burndown-rates"])
 
 # SPA static mount goes LAST so /api/* takes precedence.
 _static_dir = Path(__file__).parent.parent / "static"

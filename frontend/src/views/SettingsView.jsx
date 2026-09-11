@@ -21,6 +21,7 @@ import { useUser } from '../components/UserContext.jsx';
 import { InfoLink } from '../components/Common.jsx';
 import { OPTIONAL_TABS, loadOptionalTabs, saveOptionalTabs } from '../prefs.js';
 import { AdminNotificationSettings, UserNotificationSubscribe } from '../components/NotificationSettings.jsx';
+import BurndownRateSettings from '../components/BurndownRateSettings.jsx';
 
 function K({ label, value, color }) {
   return (
@@ -254,6 +255,10 @@ export default function SettingsView({ onInfo }) {
         {/* One source powers the "Usage · Custom Attributes" tab + the top-bar
             attribute filter. Two mutually-exclusive sources - the admin's
             choice wins. Both surface the same UX; they differ in reach. */}
+        {/* Quota burndown rates — runtime-editable so an AWS rate change
+            does not require a code change and redeploy. */}
+        <BurndownRateSettings isAdmin={isAdmin} onInfo={onInfo ? () => onInfo('burndown') : undefined} />
+
         <Container header={<Header variant="h2"
             info={<InfoLink sectionId="workloads-setup" onInfo={onInfo} />}
             description="Break down usage by your own custom attributes (workload, environment, business unit, team, …). Pick ONE source - both drive the same 'Usage · Custom Attributes' tab and the top-bar attribute filter.">

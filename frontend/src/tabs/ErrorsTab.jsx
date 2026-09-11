@@ -9,6 +9,7 @@ import { ChartLoading, KpiCard, SectionHeader, InfoLink, CHART_I18N } from '../c
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import ImpactedAccountsModal from '../components/ImpactedAccountsModal.jsx';
 import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
+import { utcDayOf, fmtDayUTC, fmtHourUTC } from '../dates';
 
 // Per-code palette + render order for the "Status Codes" stacked chart.
 // 200 OK first (bottom of stack), then client codes, then server codes.
@@ -82,7 +83,7 @@ function MantleHealthBody({ filters, onInfo }) {
     if (!trend.length) return [];
     return [{
       title: 'Requests', type: 'bar', color: '#0972d3', valueFormatter: fmt,
-      data: trend.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.total_requests || 0) })),
+      data: trend.map(r => ({ x: utcDayOf(r), y: Number(r.total_requests || 0) })),
     }];
   }, [trend]);
 
@@ -139,7 +140,7 @@ function MantleHealthBody({ filters, onInfo }) {
                 i18nStrings={{
                   ...CHART_I18N,
                   yTickFormatter: fmt,
-                  xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                  xTickFormatter: d => fmtDayUTC(d),
                 }}
                 xTitle="Day" yTitle="Requests"
                 height={260}
@@ -293,13 +294,13 @@ function RuntimeErrorsBody({ filters, onInfo }) {
     if (!trend.data) return [];
     return [
       { title: 'Throttled (429)', type: 'bar',
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_429 || 0) })),
+        data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.status_429 || 0) })),
         color: '#ef4444' },
       { title: '4xx (non-throttle)', type: 'bar',
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_400 || 0) })),
+        data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.status_400 || 0) })),
         color: '#f59e0b' },
       { title: '5xx Server errors', type: 'bar',
-        data: trend.data.map(r => ({ x: new Date(r.year, r.month - 1, r.day), y: Number(r.status_500 || 0) })),
+        data: trend.data.map(r => ({ x: utcDayOf(r), y: Number(r.status_500 || 0) })),
         color: '#b91c1c' },
     ];
   }, [trend.data]);
@@ -372,9 +373,7 @@ function RuntimeErrorsBody({ filters, onInfo }) {
               i18nStrings={{
                 ...CHART_I18N,
                 yTickFormatter: fmt,
-                xTickFormatter: d => new Date(d).toLocaleString(undefined, {
-                  month: 'short', day: 'numeric', hour: 'numeric',
-                }),
+                xTickFormatter: d => fmtHourUTC(d),
               }}
               detailPopoverFooter={(xValue) => (
                 <Button variant="inline-link"
@@ -405,7 +404,7 @@ function RuntimeErrorsBody({ filters, onInfo }) {
               i18nStrings={{
                 ...CHART_I18N,
                 yTickFormatter: fmt,
-                xTickFormatter: d => new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+                xTickFormatter: d => fmtDayUTC(d),
               }}
               detailPopoverFooter={(xValue) => {
                 const d = new Date(xValue);

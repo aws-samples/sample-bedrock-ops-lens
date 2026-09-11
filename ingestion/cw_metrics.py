@@ -30,6 +30,7 @@ import boto3
 from botocore.config import Config
 
 from .accounts import (
+    metric_window,
     DEFAULT_EXTERNAL_ID,
     DEFAULT_ROLE_NAME,
     _add_common_args,
@@ -75,6 +76,12 @@ LATENCY_METRICS = [
     ("TimeToFirstToken",  "p99_ttft", "p99"),
     ("TimeToFirstToken",  "avg_ttft", "Average"),
     ("InvocationLatency", "sample_count", "SampleCount"),
+    # TimeToFirstToken is published ONLY for streaming operations
+    # (ConverseStream / InvokeModelWithResponseStream), so its population is a
+    # SUBSET of the InvocationLatency population. Pull its own SampleCount:
+    # weighting TTFT by the E2E count understated it whenever non-streaming
+    # traffic was present (900 non-streaming + 100 streaming @200ms -> 20ms).
+    ("TimeToFirstToken",  "ttft_sample_count", "SampleCount"),
 ]
 
 
@@ -139,20 +146,56 @@ def _safe_id(prefix: str, idx: int) -> str:
     return f"{prefix}{idx}"
 
 
+def _native_or_none(bucket: dict, key: str) -> int | None:
+    """Preserve the difference between "AWS returned no datapoint" and "AWS
+    returned zero" for EstimatedTPMQuotaUsage.
+
+    Every other counter here is a Sum where absent and zero mean the same thing,
+    so `or 0` is right for them. This one is different: it is the only
+    AWS-COMPUTED quota-consumption observation we store, and consumers choose
+    between it and a locally reconstructed estimate. Flattening a missing
+    datapoint to 0 asserted "AWS measured no quota consumption in this hour",
+    which made a model with no published metric look permanently idle and
+    suppressed the reconstruction fallback that should have covered it.
+
+    The column (f_hourly_peak.estimated_tpm_quota_usage) is already nullable, so
+    only the loader was destroying the distinction. Rows written before this fix
+    are ambiguous zeros and cannot be retroactively classified.
+    """
+    v = bucket.get(key)
+    return None if v is None else int(v)
+
+
 def _build_daily_queries(models: list[tuple[str, str | None]]) -> tuple[list[dict], dict[str, tuple[str, str, str | None]]]:
-    """Return (queries, idx → (metric_name, modelId, context_window))."""
+    """Return (queries, idx → (metric_name, modelId, context_window)).
+
+    CANONICAL GRAIN: one series per (ModelId, metric), with NO ContextWindow
+    dimension. `_list_models` reports a (ModelId, ContextWindow) pair for every
+    dimension combination CloudWatch has seen, so iterating those pairs used to
+    (a) re-issue the same aggregate query once per context variant and
+    (b) emit one f_daily row per variant into a primary key that has no context
+    column — where the last writer silently replaced the aggregate. With
+    aggregate=500, ctxA=100, ctxB=400 the stored value could end up 400.
+
+    Context-window token splits are deliberately NOT stored here: f_daily's key
+    has no context dimension, and f_context_length is sourced from invocation
+    logs (`routedModelId`), not from this producer. Mixing the two sources in one
+    table would make neither trustworthy. The aggregate is complete on its own —
+    it already includes every context variant.
+    """
     queries: list[dict] = []
     idx_map: dict[str, tuple[str, str, str | None]] = {}
     counter = 0
-    for mid, ctx in models:
+    seen_models: set[str] = set()
+    for mid, _ctx in models:
+        if mid in seen_models:
+            continue
+        seen_models.add(mid)
+        ctx = None
         for metric_name, _ in [(m, s) for m, (_, s) in DAILY_METRICS.items()]:
             stat = DAILY_METRICS[metric_name][1]
             qid = _safe_id("d", counter)
             dims = [{"Name": "ModelId", "Value": mid}]
-            if ctx and metric_name in ("InputTokenCount", "OutputTokenCount",
-                                        "CacheReadInputTokenCount",
-                                        "CacheWriteInputTokenCount"):
-                dims.append({"Name": "ContextWindow", "Value": ctx})
             queries.append({
                 "Id": qid,
                 "MetricStat": {
@@ -265,34 +308,45 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
 
     daily_rows: list[tuple] = []
     for (d, mid, ctx), m in daily_buckets.items():
-        total = int(m.get("total_requests", 0) or 0)
+        # AWS/Bedrock counter semantics, per the runtime-metrics doc:
+        #   Invocations            = number of SUCCESSFUL requests
+        #   InvocationClientErrors = invocations that failed client-side (4xx)
+        #   InvocationServerErrors = invocations that failed server-side (5xx)
+        #   InvocationThrottles    = invocations the system throttled, and
+        #     "Throttled requests and other invocation errors don't count as
+        #      either Invocations or Errors."
+        # So the four counters are MUTUALLY EXCLUSIVE populations. Successes are
+        # read directly (never derived by subtraction), throttles are never
+        # treated as a subset of the 4xx counter, and attempts are their sum.
+        # https://docs.aws.amazon.com/bedrock/latest/userguide/monitoring-runtime-metrics.html
+        successes = int(m.get("total_requests", 0) or 0)   # Invocations
         c4xx = int(m.get("failed_requests_4xx", 0) or 0)
         c5xx = int(m.get("failed_requests_5xx", 0) or 0)
         c429 = int(m.get("throttles_429", 0) or 0)
+        failed = c4xx + c5xx
+        total = successes + failed + c429                  # attempts
+        # Keep an interval whenever ANY counter fired. A window with zero
+        # successes but 20 throttles is precisely the case an operator needs to
+        # see; dropping it (the old `if total <= 0: continue`) hid outages.
         if total <= 0:
             continue
-        # HONEST per-code storage. CloudWatch AWS/Bedrock exposes three error
-        # counters we can trust: InvocationClientErrors (ALL 4xx),
-        # InvocationServerErrors (ALL 5xx), and InvocationThrottles (real 429s).
-        # It does NOT break the rest of the 4xx down by code, so we DON'T
-        # fabricate a per-code split. Mapping:
-        #   status_429 = real throttle count (InvocationThrottles)
-        #   status_400 = the remaining non-throttle 4xx aggregate (4xx − 429),
-        #                surfaced in the UI as "4xx (non-throttle)"
-        #   status_500 = ALL 5xx aggregate ("5xx Server")
+        # Per-code storage stays honest: CloudWatch gives all-4xx, all-5xx and
+        # real 429s, and does NOT break the remaining 4xx down by code, so we
+        # don't fabricate a split.
+        #   status_429 = InvocationThrottles (a population of its own)
+        #   status_400 = the all-4xx aggregate (non-throttle by definition)
+        #   status_500 = the all-5xx aggregate
         #   403/503    = 0 (indistinguishable from CloudWatch)
-        # Real per-code data (403/404/408/424/503 individually) only comes from
-        # Bedrock invocation logs and lands in f_hourly_status.
-        # 429 can't exceed the all-4xx counter; clamp so non_throttle_4xx >= 0.
-        c429 = min(c429, c4xx)
-        non_throttle_4xx = max(0, c4xx - c429)
+        # Real per-code data (403/404/408/424/503) comes only from Bedrock
+        # invocation logs and lands in f_hourly_status.
+        non_throttle_4xx = c4xx
         daily_rows.append((
             d, account, mid, region,
             "__none__", "__none__", "__none__", "__none__",  # operation/traffic/tier/profile
             "runtime",                      # endpoint: AWS/Bedrock = bedrock-runtime
-            total,                          # total_requests
-            max(0, total - c4xx - c5xx),    # successful
-            c4xx + c5xx,                    # failed
+            total,                          # total_requests = attempts
+            successes,                      # successful (Invocations, as reported)
+            failed,                         # failed (4xx + 5xx; throttles separate)
             int(m.get("total_input_tokens", 0) or 0),
             int(m.get("total_output_tokens", 0) or 0),
             int(m.get("total_cache_read_input_tokens", 0) or 0),
@@ -379,12 +433,17 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
     today_utc = datetime.now(timezone.utc).date()
     err_window_start = today_utc - timedelta(days=6)  # rolling 7 days incl. today
 
+
     for (d, hr, mid), m in hourly_buckets.items():
-        total = int(m.get("total_requests", 0) or 0)
+        # Same disjoint-counter semantics as f_daily above: Invocations is the
+        # SUCCESS count, and throttles/errors are separate populations that are
+        # not included in it. total_requests therefore = attempts.
+        successes = int(m.get("total_requests", 0) or 0)   # Invocations
         c4xx = int(m.get("client_errors_4xx", 0) or 0)
         c5xx = int(m.get("server_errors_5xx", 0) or 0)
-        c429 = min(int(m.get("throttles_429", 0) or 0), c4xx)  # real 429s, clamped ≤ 4xx
-        non_throttle_4xx = max(0, c4xx - c429)
+        c429 = int(m.get("throttles_429", 0) or 0)          # NOT clamped to 4xx
+        non_throttle_4xx = c4xx
+        total = successes + c4xx + c5xx + c429              # attempts
         if total > 0:
             hourly_rows.append((
                 d, hr, account, mid, region, "runtime",
@@ -393,12 +452,14 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
                 int(m.get("total_output_tokens", 0) or 0),
                 int(m.get("total_cache_read_input_tokens", 0) or 0),
                 int(m.get("total_cache_write_input_tokens", 0) or 0),
-                int(m.get("estimated_tpm_quota_usage", 0) or 0),
+                _native_or_none(m, "estimated_tpm_quota_usage"),
                 c429,  # real throttle count (InvocationThrottles) in peak table
             ))
-        # Error rows: only within the rolling 7-day window AND only when
-        # there's at least one failure to report.
-        if (c4xx > 0 or c5xx > 0) and d >= err_window_start:
+        # Error rows: only within the rolling 7-day window AND only when there's
+        # at least one failure OR throttle to report. Throttles must qualify on
+        # their own — an hour that was 100% throttled has no 4xx/5xx yet is the
+        # most important hour to surface.
+        if (c4xx > 0 or c5xx > 0 or c429 > 0) and d >= err_window_start:
             failed = c4xx + c5xx
             # HONEST mapping (see f_daily note): status_429 = real throttles,
             # status_400 = remaining non-throttle 4xx aggregate, status_500 = all
@@ -425,7 +486,14 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
                 total_output_tokens = EXCLUDED.total_output_tokens,
                 total_cache_read_input_tokens = EXCLUDED.total_cache_read_input_tokens,
                 total_cache_write_input_tokens = EXCLUDED.total_cache_write_input_tokens,
-                estimated_tpm_quota_usage = EXCLUDED.estimated_tpm_quota_usage,
+                -- COALESCE, not a bare overwrite: now that an absent datapoint
+                -- is NULL, a re-scrape of a past hour where CloudWatch happens
+                -- to return nothing would otherwise ERASE an observation we
+                -- already had. A given (date, hour) bucket is historical and
+                -- immutable, so the last known value is always the better one.
+                estimated_tpm_quota_usage = COALESCE(
+                    EXCLUDED.estimated_tpm_quota_usage,
+                    f_hourly_peak.estimated_tpm_quota_usage),
                 status_429_count = EXCLUDED.status_429_count
             """,
             hourly_rows,
@@ -480,9 +548,14 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
     for (d, mid), m in lat_buckets.items():
         if not m.get("sample_count"):
             continue
+        # accountId is part of the row AND of the conflict key (migration 010).
+        # Previously this wrote an account-free key, so the next account's upsert
+        # replaced this one's percentiles instead of coexisting with them.
+        ttft_n = m.get("ttft_sample_count")
         lat_rows.append((
-            d, mid, "__none__", region, "runtime",
+            d, account, mid, "__none__", region, "runtime",
             int(m.get("sample_count", 0)),
+            int(ttft_n) if ttft_n is not None else None,
             m.get("avg_e2e"),  m.get("p50_e2e"),  m.get("p90_e2e"),  m.get("p99_e2e"),
             m.get("avg_ttft"), m.get("p50_ttft"), m.get("p90_ttft"), m.get("p99_ttft"),
         ))
@@ -491,13 +564,15 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
         await conn.executemany(
             """
             INSERT INTO f_latency_daily (
-                event_date, modelId, traffic_type, region, endpoint, sample_count,
+                event_date, accountId, modelId, traffic_type, region, endpoint,
+                sample_count, ttft_sample_count,
                 avg_e2e, p50_e2e, p90_e2e, p99_e2e,
                 avg_ttft, p50_ttft, p90_ttft, p99_ttft
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-            ON CONFLICT (event_date, modelId, traffic_type, region, endpoint)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            ON CONFLICT (event_date, accountId, modelId, traffic_type, region, endpoint)
             DO UPDATE SET
                 sample_count = EXCLUDED.sample_count,
+                ttft_sample_count = EXCLUDED.ttft_sample_count,
                 avg_e2e = EXCLUDED.avg_e2e, p50_e2e = EXCLUDED.p50_e2e,
                 p90_e2e = EXCLUDED.p90_e2e, p99_e2e = EXCLUDED.p99_e2e,
                 avg_ttft = EXCLUDED.avg_ttft, p50_ttft = EXCLUDED.p50_ttft,
@@ -526,8 +601,10 @@ async def main() -> int:
         print("ERROR: no monitored accounts resolved", file=sys.stderr)
         return 2
 
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=args.days)
+    # Hour/midnight-aligned window — CloudWatch buckets align to StartTime, so an
+    # unaligned start mislabels every hourly and daily bucket. See
+    # accounts.metric_window for the measured evidence.
+    start, end = metric_window(args.days)
 
     # Region resolution precedence: CLI flag wins; otherwise pull from config.
     if args.regions:

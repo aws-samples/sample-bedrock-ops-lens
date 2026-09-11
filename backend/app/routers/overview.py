@@ -1,6 +1,8 @@
 """Overview tab endpoints: totals, daily trend, by-model/region/op/traffic-type."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 from fastapi import APIRouter, Depends, Query
 
 from .. import db
@@ -79,6 +81,9 @@ async def daily_trend(f: FilterSet = Depends(parse_filters)):
           SUM(total_input_tokens)::BIGINT   AS input_tokens,
           SUM(total_output_tokens)::BIGINT  AS output_tokens,
           SUM(total_cache_read_input_tokens)::BIGINT AS cache_read_tokens,
+          -- Needed for the cached-prompt-token share: writes are a third
+          -- disjoint counter and belong in the denominator (finding 14).
+          SUM(total_cache_write_input_tokens)::BIGINT AS cache_write_tokens,
           SUM(status_429_count)::BIGINT     AS throttled,
           SUM(CASE WHEN endpoint = 'runtime' THEN total_requests ELSE 0 END)::BIGINT AS runtime_requests,
           SUM(CASE WHEN endpoint = 'mantle'  THEN total_requests ELSE 0 END)::BIGINT AS mantle_requests
@@ -187,28 +192,48 @@ async def operations(f: FilterSet = Depends(parse_filters)):
 
     The AWS/Bedrock CloudWatch metrics carry NO operation dimension, so f_daily
     only ever has the '__none__' sentinel. The real per-operation split comes
-    from Bedrock model invocation logs → f_daily_tagged (which has an
-    `operation` column). We read that here.
+    from Bedrock model invocation logs -> f_daily_tagged (which has an
+    `operation` column).
 
     f_daily_tagged fans out one row per requestMetadata tag_key, so summing all
-    rows would multiply-count. Restrict to a single tag_key (each key covers
-    100% of requests) so the totals are correct. When invocation logging is off
-    f_daily_tagged is empty → we return [] and the UI shows the "enable logging"
-    note.
+    rows multiply-counts. The old code restricted to MIN(tag_key) on the stated
+    assumption that "each key covers 100% of requests" - which is false: tags
+    are sparse, so a request tagged only `team` is absent from tag_key
+    ='application' and an untagged request is absent from every real key. Worse,
+    MIN() picks the alphabetically first key, not the most complete one, so the
+    operation totals were an arbitrary undercount of the fleet (audit finding
+    16).
+
+    The ingester now writes an '__all__' accounting row per request, so reading
+    that key gives exact totals. For data ingested before that change there is
+    no such row; we fall back to the WIDEST real tag_key and report the coverage
+    so the UI can say the split is partial instead of implying a fleet total.
     """
     w = build_where(f, has_traffic_type=False, has_endpoint=False)
     rows = await db.fetch(
         f"""
-        WITH one_key AS (
-            SELECT MIN(tag_key) AS k FROM f_daily_tagged WHERE {w.sql}
+        WITH scoped AS (
+            SELECT * FROM f_daily_tagged WHERE {w.sql}
+        ),
+        -- Exact when the '__all__' accounting row exists; otherwise the tag_key
+        -- with the greatest request coverage, which is the best available lower
+        -- bound.
+        chosen AS (
+            SELECT tag_key, SUM(total_requests) AS reqs
+            FROM scoped
+            GROUP BY tag_key
+            ORDER BY (tag_key = '__all__') DESC, SUM(total_requests) DESC
+            LIMIT 1
         )
         SELECT operation,
           SUM(total_requests)::BIGINT      AS total_requests,
           SUM(failed_requests)::BIGINT     AS failed_requests,
           SUM(total_input_tokens)::BIGINT  AS input_tokens,
-          SUM(total_output_tokens)::BIGINT AS output_tokens
-        FROM f_daily_tagged
-        WHERE {w.sql} AND tag_key = (SELECT k FROM one_key)
+          SUM(total_output_tokens)::BIGINT AS output_tokens,
+          (SELECT tag_key = '__all__' FROM chosen) AS exact,
+          (SELECT tag_key FROM chosen)             AS basis_tag_key
+        FROM scoped
+        WHERE tag_key = (SELECT tag_key FROM chosen)
         GROUP BY operation
         ORDER BY total_requests DESC
         """,
@@ -221,9 +246,11 @@ async def operations(f: FilterSet = Depends(parse_filters)):
 async def regions(f: FilterSet = Depends(parse_filters)):
     """Per-region rollup. Forces region='all' (always groups by region regardless
     of the user's region selection)."""
-    overridden = FilterSet(start=f.start, end=f.end, provider=f.provider, region="all",
-                           accounts=f.accounts, traffic_type=f.traffic_type,
-                           tag_filter=f.tag_filter)
+    # replace() keeps every OTHER field. Hand-constructing a new FilterSet
+    # silently dropped `endpoint` (and would drop any field added later), so the
+    # Mantle region chart summed 23,204,626 requests against a 208,705 Mantle
+    # headline — 111x (audit finding 11).
+    overridden = replace(f, region="all")
     w = build_where(overridden)
     rows = await db.fetch(
         f"""

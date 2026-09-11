@@ -44,16 +44,69 @@ const XTAB_REDIRECT = {
   '/cost-by-model': '/attribution/xtab/cost-by-model', // cost stacked chart (Overview + Cost)
 };
 
+// ---------------------------------------------------------------------------
+// Filter disclosure
+// ---------------------------------------------------------------------------
+// The xtab endpoints report when they could NOT honour the whole attribute
+// selection (`partial`, `filters_dropped`, `partial_reason`). Returning that in
+// JSON is not disclosure: nothing rendered it, so the viewer still saw broader
+// totals under a filter that looked applied. This store captures the metadata
+// from every response and notifies subscribers, so the app shell can show it.
+let _disclosure = null;
+const _disclosureSubs = new Set();
+
+export function subscribeDisclosure(fn) {
+  _disclosureSubs.add(fn);
+  fn(_disclosure);
+  return () => _disclosureSubs.delete(fn);
+}
+
+export function getDisclosure() { return _disclosure; }
+
+export function clearDisclosure() {
+  if (_disclosure === null) return;
+  _disclosure = null;
+  _disclosureSubs.forEach(fn => fn(null));
+}
+
+function noteDisclosure(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+  const dropped = data.filters_dropped;
+  if (!data.partial || !Array.isArray(dropped) || dropped.length === 0) return;
+  const next = {
+    applied: data.filters_applied || [],
+    dropped,
+    reason: data.partial_reason || '',
+    grain: data.source_grain || '',
+  };
+  const same = _disclosure
+    && _disclosure.dropped.join('|') === next.dropped.join('|')
+    && _disclosure.applied.join('|') === next.applied.join('|');
+  if (same) return;
+  _disclosure = next;
+  _disclosureSubs.forEach(fn => fn(next));
+}
+
+
 export function buildUrl(path, params = {}) {
   // Redirect to the attribution-sourced sibling when an attribution source is
   // active AND this request carries an attribute filter (tag_filter "key:value").
   const tf = params && params.tag_filter;
   if (_attributionActive && XTAB_REDIRECT[path] && Array.isArray(tf) && tf.length) {
+    // Audit T06: this used to keep only the FIRST key's values and drop every
+    // other attribute the user had selected, with no indication - so a
+    // "env=prod AND workload=search" selection quietly showed all workloads in
+    // prod. Send the whole selection as repeated dim_filter=key:value entries;
+    // the backend evaluates a conjunction per request when it can and reports
+    // `filters_dropped` / `partial` when it cannot. dim_key/dim_value are still
+    // sent so an older backend keeps its previous behaviour.
     const dimKey = String(tf[0]).split(':')[0];
     const dimValues = tf.filter(s => String(s).startsWith(`${dimKey}:`))
                         .map(s => String(s).slice(dimKey.length + 1));
     const { tag_filter, ...rest } = params;   // drop tag_filter; use dim_* instead
-    return _buildUrl(XTAB_REDIRECT[path], { ...rest, dim_key: dimKey, dim_value: dimValues });
+    return _buildUrl(XTAB_REDIRECT[path], {
+      ...rest, dim_key: dimKey, dim_value: dimValues, dim_filter: tf.map(String),
+    });
   }
   return _buildUrl(path, params);
 }
@@ -78,7 +131,10 @@ export async function api(path, params = {}, { signal, useCache = true } = {}) {
   const url = buildUrl(path, params);
   if (useCache) {
     const hit = cache.get(url);
-    if (hit && Date.now() - hit.ts < CACHE_MS) return hit.data;
+    if (hit && Date.now() - hit.ts < CACHE_MS) {
+      noteDisclosure(hit.data);
+      return hit.data;
+    }
   }
   const res = await fetch(url, { signal, credentials: 'include' });
   if (res.status === 401) {
@@ -94,6 +150,7 @@ export async function api(path, params = {}, { signal, useCache = true } = {}) {
   if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${url}`);
   const data = await res.json();
   if (useCache) cache.set(url, { ts: Date.now(), data });
+  noteDisclosure(data);
   return data;
 }
 

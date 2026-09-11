@@ -9,8 +9,14 @@ distinction explicit.
 The pricing table is product opinion (per the spec) — kept in code, not
 JSON, not scraped. Update when a customer asks about a model not listed.
 
-Cache-hit formula:
-    cache_hit_pct = cache_read / (cache_read + total_input_tokens) * 100
+Cached prompt-token share (finding 14):
+    cached_prompt_token_pct = cache_read
+                             / (cache_read + cache_write + input_tokens) * 100
+Cache writes are a third disjoint prompt-token counter in the Bedrock
+Runtime TokenUsage structure; leaving them out overstated the share for
+workloads that are actively populating a cache. This is a share of TOKENS,
+not the fraction of requests that hit cache - CloudWatch publishes no
+per-request cache dimension.
 NOT cache_read / total_input_tokens — that produces values >100% because
 CloudWatch's InputTokenCount excludes cached tokens by definition.
 """
@@ -128,6 +134,7 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
             SUM(total_input_tokens)::BIGINT      AS input_tokens,
             SUM(total_output_tokens)::BIGINT     AS output_tokens,
             SUM(total_cache_read_input_tokens)::BIGINT AS cache_read_tokens,
+            SUM(total_cache_write_input_tokens)::BIGINT AS cache_write_tokens,
             COUNT(DISTINCT accountId)::INT       AS unique_accounts
         FROM f_daily
         WHERE {where.sql}
@@ -186,12 +193,15 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
         input_tokens  = int(r["input_tokens"] or 0)
         output_tokens = int(r["output_tokens"] or 0)
         cache_read    = int(r["cache_read_tokens"] or 0)
+        cache_write   = int(r["cache_write_tokens"] or 0)
 
         provider = _provider_of(mid)
         avg_in   = (input_tokens / total_req) if total_req else 0
         avg_out  = (output_tokens / total_req) if total_req else 0
         io_ratio = (input_tokens / output_tokens) if output_tokens else 0
-        cache_denom = cache_read + input_tokens
+        # All three prompt-token counters (finding 14): omitting cache writes
+        # overstated the share exactly where a cache is being populated.
+        cache_denom = cache_read + cache_write + input_tokens
         cache_pct   = (cache_read / cache_denom * 100) if cache_denom else 0
         error_rate  = (failed / total_req * 100) if total_req else 0
 
@@ -209,7 +219,11 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
             "input_tokens":     input_tokens,
             "output_tokens":    output_tokens,
             "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "cached_prompt_token_pct": round(cache_pct, 2),
+            # Alias kept for compatibility; same corrected value.
             "cache_hit_pct":    round(cache_pct, 2),
+            "cache_basis":      "cached_share_of_prompt_tokens",
             "avg_input":        round(avg_in, 1),
             "avg_output":       round(avg_out, 1),
             "io_ratio":         round(io_ratio, 2),

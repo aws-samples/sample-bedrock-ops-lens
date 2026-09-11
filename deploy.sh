@@ -104,7 +104,27 @@ if [[ -z "${ALLOWED_EMAIL_DOMAINS:-}" ]]; then
     done
 fi
 export ALLOWED_EMAIL_DOMAINS
-echo "    sign-up: ALLOWED_EMAIL_DOMAINS=$ALLOWED_EMAIL_DOMAINS"
+
+# Self-service sign-up is OFF unless explicitly requested. The template's secure
+# default is admin-create-only, and deploy.sh used not to pass this parameter at
+# all while still printing "sign-up gated to <domain>" - so a first-time operator
+# followed the README, opened the dashboard, and had no way to create an account.
+# Whichever mode applies, say which, and print how to get in.
+COGNITO_SELF_SIGNUP="${COGNITO_SELF_SIGNUP:-disabled}"
+case "$COGNITO_SELF_SIGNUP" in
+    enabled|disabled) ;;
+    *) echo "    ERROR: COGNITO_SELF_SIGNUP must be 'enabled' or 'disabled'" >&2; exit 1 ;;
+esac
+export COGNITO_SELF_SIGNUP
+if [[ "$COGNITO_SELF_SIGNUP" == "enabled" ]]; then
+    echo "    sign-up: SELF-SERVICE, gated to ALLOWED_EMAIL_DOMAINS=$ALLOWED_EMAIL_DOMAINS"
+else
+    echo "    sign-up: admin-create-only (secure default)."
+    echo "             ALLOWED_EMAIL_DOMAINS=$ALLOWED_EMAIL_DOMAINS still gates who"
+    echo "             may be created. Set COGNITO_SELF_SIGNUP=enabled for a public"
+    echo "             sign-up form. The command to create the first user is printed"
+    echo "             at the end of this deploy."
+fi
 
 # -----------------------------------------------------------------------------
 # Bedrock model-invocation logs — discover or (with consent) enable.
@@ -160,13 +180,6 @@ else
         fi
     done
 
-    if [[ -z "$BEDROCK_LOGS_BUCKET" ]]; then
-        echo "    bedrock invocation logs: could not auto-discover a logging bucket"
-        echo "      (checked $REGION, us-east-1, us-east-2, us-west-2 in account $ACCOUNT_ID)"
-        echo "      This is normal if logging is off, enabled only in another region we"
-        echo "      didn't check, in a different account, or this principal lacks"
-        echo "      bedrock:GetModelInvocationLoggingConfiguration."
-
         # Enable metadata-only invocation logging in $REGION (creates bucket,
         # bucket policy, and turns logging on with ALL data modalities off).
         _enable_metadata_only_logging() {
@@ -200,6 +213,35 @@ JSON
 )" >/dev/null
             echo "    ✓ logging enabled (metadata only — no prompt/response text captured)"
         }
+
+    # Invocation logging is configured PER REGION. Discovering a bucket in some
+    # OTHER region does not mean the deploy region is logging - and it used to be
+    # treated as "handled", so every invocation-log-derived view (per-operation
+    # split, tag attribution, By User) stayed permanently empty for traffic in the
+    # deploy region while the deploy reported success.
+    if [[ -n "$BEDROCK_LOGS_BUCKET" && "$BEDROCK_LOGS_REGION" != "$REGION" ]]; then
+        echo "    NOTE: invocation logging was found in $BEDROCK_LOGS_REGION, not the"
+        echo "          deploy region $REGION. Bedrock logs per region, so traffic in"
+        echo "          $REGION is NOT being logged yet."
+        if [[ "${ENABLE_INVOCATION_LOGGING:-}" == "yes" ]]; then
+            echo "          ENABLE_INVOCATION_LOGGING=yes -> enabling it in $REGION too."
+            _cross_region_bucket="$BEDROCK_LOGS_BUCKET"
+            _cross_region_region="$BEDROCK_LOGS_REGION"
+            _enable_metadata_only_logging
+            echo "          (the ingester reads both: $_cross_region_bucket in"
+            echo "           $_cross_region_region and $BEDROCK_LOGS_BUCKET in $REGION)"
+        else
+            echo "          Set ENABLE_INVOCATION_LOGGING=yes to enable it in $REGION."
+        fi
+    fi
+
+    if [[ -z "$BEDROCK_LOGS_BUCKET" ]]; then
+        echo "    bedrock invocation logs: could not auto-discover a logging bucket"
+        echo "      (checked $REGION, us-east-1, us-east-2, us-west-2 in account $ACCOUNT_ID)"
+        echo "      This is normal if logging is off, enabled only in another region we"
+        echo "      didn't check, in a different account, or this principal lacks"
+        echo "      bedrock:GetModelInvocationLoggingConfiguration."
+
 
         # Accept a bucket the operator already has (possibly in another
         # account/region) and print the exact bucket policy they must add so
@@ -324,12 +366,54 @@ if [[ "$ACTION" == "destroy" ]]; then
     aws cloudformation delete-stack --stack-name "$MAIN_STACK" --region "$REGION" || true
     echo "    waiting for $MAIN_STACK delete..."
     aws cloudformation wait stack-delete-complete --stack-name "$MAIN_STACK" --region "$REGION" || true
+
+    # Report what actually happened. The waiter above is allowed to fail (it caps
+    # out at 30 minutes), and this used to print "deleted." regardless — so a
+    # stack sitting in DELETE_FAILED was reported as a success and the leftover
+    # VPC/Aurora/NAT kept costing money silently.
+    MAIN_STATUS="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" \
+        --region "$REGION" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo GONE)"
+
+    # A custom resource that never answered leaves the stack DELETE_FAILED. Retry
+    # once, retaining only that logical resource. SchemaInit creates no AWS
+    # resource of its own (the schema lives in Aurora, which is already being
+    # deleted), so retaining it leaks nothing. The template now orders SchemaInit
+    # ahead of its egress path, which should prevent this — this is the belt to
+    # that braces, and it keeps an OLD stack from needing manual CLI surgery.
+    if [[ "$MAIN_STATUS" == "DELETE_FAILED" ]]; then
+        RETAIN="$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" \
+            --region "$REGION" \
+            --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" \
+            --output text 2>/dev/null || true)"
+        if [[ -n "$RETAIN" ]]; then
+            echo "    $MAIN_STACK is DELETE_FAILED on: $RETAIN"
+            echo "    retrying, retaining those logical resources..."
+            # shellcheck disable=SC2086
+            aws cloudformation delete-stack --stack-name "$MAIN_STACK" --region "$REGION" \
+                --retain-resources $RETAIN || true
+            aws cloudformation wait stack-delete-complete --stack-name "$MAIN_STACK" \
+                --region "$REGION" || true
+            MAIN_STATUS="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" \
+                --region "$REGION" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo GONE)"
+        fi
+    fi
+
     aws cloudformation delete-stack --stack-name "$ECR_STACK" --region "$REGION" || true
     aws cloudformation wait stack-delete-complete --stack-name "$ECR_STACK" --region "$REGION" || true
     aws cloudformation delete-stack --stack-name "$EDGE_STACK" --region "$EDGE_REGION" || true
     echo "    edge stack delete initiated; Lambda@Edge replicas may keep it"
     echo "    in DELETE_IN_PROGRESS for 30-90 min after CloudFront detaches."
-    echo "    deleted."
+
+    if [[ "$MAIN_STATUS" == "GONE" ]]; then
+        echo "    $MAIN_STACK deleted."
+    else
+        echo ""
+        echo "    WARNING: $MAIN_STACK is still $MAIN_STATUS — NOT fully deleted."
+        echo "             Billable resources may remain (Aurora, NAT gateway, VPC)."
+        echo "             Check:  aws cloudformation describe-stack-events \\"
+        echo "                       --stack-name $MAIN_STACK --region $REGION"
+        exit 1
+    fi
     exit 0
 fi
 
@@ -415,7 +499,7 @@ Security defaults:
     ✓ Aurora + Memcached + Lambda: PRIVATE subnets only
     ✓ Lambda Function URL: AuthType=AWS_IAM (CloudFront-OAC-only)
     ✓ CloudFront: only public surface, fronted by AWS WAF
-    ✓ Cognito User Pool: MFA optional, sign-up gated to: $ALLOWED_EMAIL_DOMAINS
+    ✓ Cognito User Pool: MFA optional, allowed email domains: $ALLOWED_EMAIL_DOMAINS (sign-up: $COGNITO_SELF_SIGNUP)
     ✓ IAM: least-privilege per Lambda role
 
 To actually deploy, run:
@@ -513,6 +597,7 @@ cat > "$PARAMS_JSON" <<EOF
   {"ParameterKey":"ProxyEventsBucket","ParameterValue":"${PROXY_EVENTS_BUCKET:-}"},
   {"ParameterKey":"ProxyEventsRegions","ParameterValue":"${PROXY_EVENTS_REGIONS:-}"},
   {"ParameterKey":"CognitoDomainPrefix","ParameterValue":"$COGNITO_DOMAIN_PREFIX"},
+  {"ParameterKey":"CognitoSelfSignUp","ParameterValue":"$COGNITO_SELF_SIGNUP"},
   {"ParameterKey":"StackNamePrefix","ParameterValue":"$MAIN_STACK"},
   {"ParameterKey":"EdgeShaVersionArn","ParameterValue":"$EDGE_SHA_VERSION_ARN"},
   {"ParameterKey":"WebAclArn","ParameterValue":"$WEB_ACL_ARN"}
@@ -720,9 +805,44 @@ DASHBOARD_URL="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" -
 COGNITO_DOMAIN="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" --region "$REGION" \
     --query 'Stacks[0].Outputs[?OutputKey==`CognitoDomain`].OutputValue' --output text)"
 
+POOL_ID="$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" --region "$REGION" \
+    --query 'Stacks[0].Outputs[?OutputKey==`CognitoUserPoolId`].OutputValue' --output text)"
+
 echo
 echo "============================================================================"
 echo "✅ DEPLOYED"
 echo "   Dashboard:   $DASHBOARD_URL"
 echo "   Cognito:     $COGNITO_DOMAIN"
 echo "============================================================================"
+# Tell the operator how to actually GET IN. Without this, a first deploy ends with
+# a URL and a sign-in form that nobody can pass: sign-up is admin-create-only by
+# default, and the README used to say "open the dashboard URL and sign up".
+if [[ "$COGNITO_SELF_SIGNUP" == "enabled" ]]; then
+    echo "   Sign-up:     self-service, open to $ALLOWED_EMAIL_DOMAINS"
+    echo "                Open the dashboard and create your account. The first"
+    echo "                verified user is promoted to admin automatically."
+else
+    echo "   Sign-up:     admin-create-only. Create the first user with:"
+    echo
+    echo "     aws cognito-idp admin-create-user \\"
+    echo "       --user-pool-id $POOL_ID --region $REGION \\"
+    echo "       --username you@${ALLOWED_EMAIL_DOMAINS%%,*} \\"
+    echo "       --user-attributes Name=email,Value=you@${ALLOWED_EMAIL_DOMAINS%%,*} Name=email_verified,Value=true \\"
+    echo "       --temporary-password 'ChangeMe-123!'"
+    echo
+    echo "                ...then grant it admin (Settings write access). The"
+    echo "                first-admin bootstrap runs in a Cognito PostConfirmation"
+    echo "                trigger, and admin-create-user does NOT fire that trigger,"
+    echo "                so this step is required for an admin-created user:"
+    echo
+    echo "     aws cognito-idp admin-add-user-to-group \\"
+    echo "       --user-pool-id $POOL_ID --region $REGION \\"
+    echo "       --username you@${ALLOWED_EMAIL_DOMAINS%%,*} \\"
+    echo "       --group-name bedrock-lens-admins"
+    echo
+    echo "                Then sign in at the dashboard and set a new password."
+    echo "                (Group membership is baked into the JWT at sign-in, so"
+    echo "                 sign out and back in if you were already signed in.)"
+    echo "                (Re-run with COGNITO_SELF_SIGNUP=enabled for a public"
+    echo "                 sign-up form gated to $ALLOWED_EMAIL_DOMAINS.)"
+fi

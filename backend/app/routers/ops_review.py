@@ -17,16 +17,18 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
-from .. import db
+from .. import db, rate_catalog
 from ..config import settings
 from ..filters import FilterSet, build_where, parse_filters
 from ..ops_review.prompt import SYSTEM_PROMPT
+from ..units import PER_MINUTE_BASIS, hourly_total_to_per_minute
 from .extras import _load_lifecycle
 
 router = APIRouter()
@@ -100,14 +102,21 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
           SUM(total_requests)::BIGINT     AS total_requests,
           SUM(status_429_count)::BIGINT   AS throttled,
           ROUND((100.0 * SUM(status_429_count) / NULLIF(SUM(total_requests), 0))::numeric, 2) AS throttle_pct,
-          (SELECT MAX(total_requests) * 60::BIGINT FROM f_hourly_peak h
+          -- f_hourly_peak stores CloudWatch Period=3600 SUMS. The busiest
+          -- hour's hourly-average per-minute rate is total/60. Multiplying by
+          -- 60 (the old code) overstated RPM by 3,600x: 73 requests in an hour
+          -- became 4,380 "RPM" instead of 1.22. No minute-resolution source
+          -- exists here, so this is a lower bound on the true minute peak and
+          -- is named accordingly.
+          (SELECT MAX(total_requests) / 60.0 FROM f_hourly_peak h
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
               AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
-            AS peak_rpm_observed,
-          (SELECT MAX((total_input_tokens + COALESCE(total_cache_write_input_tokens,0)) + total_output_tokens) FROM f_hourly_peak h
+            AS busiest_hour_avg_rpm,
+          (SELECT MAX((total_input_tokens + COALESCE(total_cache_write_input_tokens,0)) + total_output_tokens) / 60.0
+             FROM f_hourly_peak h
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
               AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
-            AS peak_tpm_observed
+            AS busiest_hour_avg_tpm
         FROM f_daily
         WHERE {w.sql}
         GROUP BY accountId, modelId, region
@@ -129,8 +138,14 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
             "total_requests": int(r["total_requests"]),
             "throttled":      int(r["throttled"] or 0),
             "throttle_pct":   pct,
-            "peak_rpm_observed": int(r["peak_rpm_observed"] or 0),
-            "peak_tpm_observed": int(r["peak_tpm_observed"] or 0),
+            # Hourly-average per-minute rates for the busiest hour (see SQL
+            # comment). Kept under both the new explicit names and the old keys
+            # so existing clients get the corrected values, not stale ones.
+            "busiest_hour_avg_rpm": round(float(r["busiest_hour_avg_rpm"] or 0), 2),
+            "busiest_hour_avg_tpm": round(float(r["busiest_hour_avg_tpm"] or 0), 2),
+            "rate_basis": PER_MINUTE_BASIS,
+            "peak_rpm_observed": round(float(r["busiest_hour_avg_rpm"] or 0), 2),
+            "peak_tpm_observed": round(float(r["busiest_hour_avg_tpm"] or 0), 2),
             "severity": _severity_for_throttle(pct),
         })
 
@@ -143,22 +158,31 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         older_start = max(f.start, older_end - timedelta(days=split_days - 1))
 
         async def _avg_tokens(start_d, end_d):
+            # Audit finding 10: this used to filter on DATES ONLY, so a review
+            # scoped to one account could report a DIFFERENT account's growth.
+            # Reuse the request's full filter set for both periods.
+            scoped = replace(f, start=start_d, end=end_d)
+            ww = build_where(scoped)
             return await db.fetch(
-                """
+                f"""
                 SELECT accountId,
-                       (SUM(total_input_tokens + total_output_tokens) / GREATEST(($2::date - $1::date + 1), 1))::BIGINT AS tokens_per_day
+                       (SUM(total_input_tokens + total_output_tokens)
+                        / GREATEST(($2::date - $1::date + 1), 1))::BIGINT AS tokens_per_day
                 FROM f_daily
-                WHERE event_date BETWEEN $1::date AND $2::date
+                WHERE {ww.sql}
                 GROUP BY accountId
                 """,
-                start_d, end_d,
+                *ww.params,
             )
 
         recent = {(r["accountid"] if "accountid" in r else r["accountId"]): int(r["tokens_per_day"] or 0)
                   for r in await _avg_tokens(recent_start, f.end)}
         older = {(r["accountid"] if "accountid" in r else r["accountId"]): int(r["tokens_per_day"] or 0)
                  for r in await _avg_tokens(older_start, older_end)}
-        for acct, recent_v in recent.items():
+        # Accounts that VANISHED in the recent period are real decline signals;
+        # iterating only `recent` hid them entirely.
+        for acct in set(recent) | set(older):
+            recent_v = recent.get(acct, 0)
             older_v = older.get(acct, 0)
             if recent_v < 1_000_000 and older_v < 1_000_000:
                 continue
@@ -186,19 +210,21 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         growth = growth[:20]
 
     # ---- burndown_risk ----
-    bd_rows = await db.fetch(
+    # Rewritten for audit finding 08. The previous version had three defects:
+    #   1. hardcoded a 5x multiplier, ignoring the shared endpoint-aware helper
+    #      (Opus 4.8 is 15x, Sonnet 5 / Opus 5 are 10x) — up to 66% low;
+    #   2. combined MAX(raw_tokens) and MAX(output_tokens) taken from possibly
+    #      DIFFERENT hours, inventing an "effective peak" that no single hour
+    #      ever had (raw 1,100/out 100 and raw 1,000/out 1,000 -> 5,100, while
+    #      the real per-hour effective peaks are 1,500 and 5,000);
+    #   3. left the values as hourly SUMS while calling them TPM.
+    # Now: pull per-hour rows, weight output by the model's own rate WITHIN each
+    # hour, take the max of that, then convert to a per-minute rate once.
+    bd_avg_rows = await db.fetch(
         f"""
         SELECT accountId, modelId, region,
           (SUM(total_input_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_input,
-          (SUM(total_output_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_output,
-          (SELECT MAX((total_input_tokens + COALESCE(total_cache_write_input_tokens,0)) + total_output_tokens) FROM f_hourly_peak h
-            WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
-              AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
-            AS peak_tpm_observed,
-          (SELECT MAX(total_output_tokens) FROM f_hourly_peak h
-            WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
-              AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
-            AS peak_output_tpm
+          (SUM(total_output_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_output
         FROM f_daily
         WHERE {w.sql}
         GROUP BY accountId, modelId, region
@@ -206,29 +232,67 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         """,
         *w.params,
     )
+    avg_by_key = {
+        ((r["accountid"] if "accountid" in r else r["accountId"]),
+         (r["modelid"] if "modelid" in r else r["modelId"]),
+         r["region"]): r
+        for r in bd_avg_rows
+    }
+
+    bd_hourly = await db.fetch(
+        """
+        SELECT accountId, modelId, region,
+               (total_input_tokens + COALESCE(total_cache_write_input_tokens, 0)) AS input_quota_tokens,
+               total_output_tokens
+        FROM f_hourly_peak
+        WHERE event_date BETWEEN $1::date AND $2::date
+        """,
+        w.params[0], w.params[1],
+    )
+    # key -> {raw_hour_max, effective_hour_max}
+    bd_peaks: dict[tuple, dict] = {}
+    _cat = await rate_catalog.snapshot()
+    for r in db.rows_to_dicts(bd_hourly):
+        mid = r.get("modelid") or r.get("modelId")
+        key = (r.get("accountid") or r.get("accountId"), mid, r["region"])
+        if key not in avg_by_key:
+            continue
+        inp = int(r["input_quota_tokens"] or 0)
+        out = int(r["total_output_tokens"] or 0)
+        rate = _cat.rate_for(mid).rate
+        raw_hour = inp + out
+        eff_hour = inp + out * rate          # weighted INSIDE the hour
+        p = bd_peaks.setdefault(key, {"raw": 0, "eff": 0, "rate": rate})
+        p["raw"] = max(p["raw"], raw_hour)
+        p["eff"] = max(p["eff"], eff_hour)
+
     burndown = []
-    for r in bd_rows:
-        mid = r["modelid"] if "modelid" in r else r["modelId"]
+    for key, p in bd_peaks.items():
+        acct, mid, region = key
         if not _is_claude_4_plus(mid):
             continue
-        peak_tpm = int(r["peak_tpm_observed"] or 0)
-        peak_out = int(r["peak_output_tpm"] or 0)
-        if peak_tpm == 0:
+        if p["raw"] <= 0:
             continue
-        eff = peak_tpm + 4 * peak_out  # the "5x" burndown
-        overhead_pct = 100.0 * (eff - peak_tpm) / max(peak_tpm, 1)
+        raw_tpm = hourly_total_to_per_minute(p["raw"])
+        eff_tpm = hourly_total_to_per_minute(p["eff"])
+        overhead_pct = 100.0 * (eff_tpm - raw_tpm) / raw_tpm
         if overhead_pct < 30.0:
             continue
-        sev = "critical" if overhead_pct >= 100 else "warning"
+        avg_r = avg_by_key.get(key)
         burndown.append({
-            "accountId": r["accountid"] if "accountid" in r else r["accountId"],
+            "accountId": acct,
             "modelId":   mid,
-            "region":    r["region"],
-            "avg_output_tokens":      int(r["avg_output"] or 0),
-            "peak_tpm_observed":      peak_tpm,
-            "effective_peak_tpm_5x":  eff,
+            "region":    region,
+            "burndown_rate":          p["rate"],
+            "avg_output_tokens":      int((avg_r or {}).get("avg_output") or 0),
+            "busiest_hour_avg_raw_tpm":       round(raw_tpm, 2),
+            "busiest_hour_avg_effective_tpm": round(eff_tpm, 2),
+            "rate_basis": PER_MINUTE_BASIS,
+            # Back-compat keys, now carrying corrected per-minute values.
+            "peak_tpm_observed":      round(raw_tpm, 2),
+            "effective_peak_tpm_5x":  round(eff_tpm, 2),
             "burndown_overhead_pct":  round(overhead_pct, 1),
-            "severity": sev,
+            "severity": "critical" if overhead_pct >= 100 else "warning",
         })
     burndown.sort(key=lambda r: -r["burndown_overhead_pct"])
     burndown = burndown[:20]
@@ -303,8 +367,16 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         SELECT modelId,
           SUM(total_input_tokens)::BIGINT AS total_input_tokens,
           SUM(total_cache_read_input_tokens)::BIGINT AS cache_read_tokens,
+          SUM(total_cache_write_input_tokens)::BIGINT AS cache_write_tokens,
+          -- Finding 14: the denominator must include cache WRITES. inputTokens,
+          -- cacheReadInputTokens and cacheWriteInputTokens are three disjoint
+          -- counters, so leaving writes out overstated the cached share on
+          -- exactly the workloads that are populating a cache - and could
+          -- suppress this "enable caching" finding for a model that has barely
+          -- any cache reads but large writes.
           ROUND((100.0 * COALESCE(SUM(total_cache_read_input_tokens), 0)
                   / NULLIF(COALESCE(SUM(total_cache_read_input_tokens), 0)
+                           + COALESCE(SUM(total_cache_write_input_tokens), 0)
                            + COALESCE(SUM(total_input_tokens), 0), 0))::numeric, 2)
             AS cache_hit_pct
         FROM f_daily
@@ -313,6 +385,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         HAVING SUM(total_input_tokens) > 100000000
            AND COALESCE(SUM(total_cache_read_input_tokens), 0)
                < (COALESCE(SUM(total_cache_read_input_tokens), 0)
+                  + COALESCE(SUM(total_cache_write_input_tokens), 0)
                   + COALESCE(SUM(total_input_tokens), 0)) * 0.05
         ORDER BY total_input_tokens DESC LIMIT 10
         """,
@@ -335,7 +408,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
             "total_input_tokens": int(r["total_input_tokens"]),
             "cache_hit_pct":      float(r["cache_hit_pct"] or 0),
             "severity": "info",
-            "note": f"<5% cache hit rate on >100M daily input tokens. Enable prompt caching on stable system prompts for ~90% cost / ~85% TTFT reduction on cached portions.",
+            "note": f"<5% of prompt tokens served from cache on >100M daily input tokens. Enable prompt caching on stable system prompts for ~90% cost / ~85% TTFT reduction on cached portions.",
         })
 
     # ---- lifecycle_alerts ----
@@ -427,7 +500,12 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         actions.append({
             "priority": "warning",
             "title": "Claude 4+ burndown overhead > 100%",
-            "detail": "Tune `max_tokens` close to actual expected output (not the model maximum) to prevent phantom quota burndown.",
+            # Finding 08: the up-front deduction is (input tokens + max_tokens) per the token-burndown
+            # doc - the burndown rate applies to tokens actually generated, not to the reservation.
+            "detail": "Set `max_tokens` close to the output you actually expect rather than leaving "
+                      "it at the model maximum: Bedrock deducts (input tokens + max_tokens) from the "
+                      "TPM quota when the request starts and replenishes the unused remainder only "
+                      "after it completes.",
         })
     if any(g["trend_label"] == "HIGH GROWTH" for g in growth):
         actions.append({

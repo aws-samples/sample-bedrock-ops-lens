@@ -414,6 +414,15 @@ def seed_fact_daily_tagged(cur, today: date, rng: random.Random) -> int:
                             d, acct, model, region, op, tk, tv,
                             total, failed, in_tok, out_tok, cache_read, cache_write,
                         ))
+                    # Whole-population accounting row, mirroring the real
+                    # ingester. Tags are sparse, so no single real tag_key covers
+                    # every request; widgets needing a total (the per-operation
+                    # split) read '__all__'. Excluded from dim_tags, so it is
+                    # never offered as a selectable tag.
+                    rows.append((
+                        d, acct, model, region, op, "__all__", "__all__",
+                        total, failed, in_tok, out_tok, cache_read, cache_write,
+                    ))
     cur.executemany(
         """
         INSERT INTO f_daily_tagged (
@@ -627,14 +636,29 @@ def seed_daily_cost(cur, today: date, rng: random.Random) -> int:
 
 
 def seed_latency_daily(cur, today: date, rng: random.Random) -> int:
+    """Per-(day, ACCOUNT, model, traffic type, region) latency distributions.
+
+    accountId is part of the grain (migration 010): the real producer runs per
+    account, and before 010 its account-free upsert let one account's row
+    replace another's. Seeding per account keeps the demo consistent with the
+    fixed contract and gives the account filter something to actually filter.
+
+    ttft_sample_count is a SUBSET of sample_count because TimeToFirstToken is
+    published only for streaming operations — the streaming share is modelled
+    explicitly instead of implying every request has a TTFT observation.
+    """
     rows = []
     for d_offset in range(DAYS):
         d = today - timedelta(days=d_offset)
         for model in MODELS:
             tier = LATENCY_TIERS[latency_tier(model)]
-            for tt in rng.sample(TRAFFIC_TYPES, k=2):
+            for acct in rng.sample(ACCOUNTS, k=4):
+              for tt in rng.sample(TRAFFIC_TYPES, k=2):
                 for region in rng.sample(REGIONS, k=2):
                     samples = rng.randint(500, 50000)
+                    # 0-70% of calls stream, so TTFT's population is smaller.
+                    streaming_share = rng.uniform(0.0, 0.7)
+                    ttft_samples = int(samples * streaming_share)
                     # Anchor percentiles on the REAL per-tier numbers with mild
                     # per-cell jitter; keep p50 < p90 < p99 monotonic.
                     j = lambda: rng.uniform(0.9, 1.12)
@@ -646,16 +670,23 @@ def seed_latency_daily(cur, today: date, rng: random.Random) -> int:
                     p50_t = avg_ttft * rng.uniform(0.85, 1.0)
                     p90_t = avg_ttft * rng.uniform(1.3, 1.8)
                     p99_t = avg_ttft * rng.uniform(2.0, 3.5)
-                    rows.append((d, model, tt, region, samples,
+                    if ttft_samples == 0:
+                        # No streaming traffic in this cell -> TTFT is genuinely
+                        # unavailable. NULL, never 0 ms.
+                        avg_ttft = p50_t = p90_t = p99_t = None
+                    rows.append((d, acct, model, tt, region, samples, ttft_samples or None,
                                  avg_e2e, p50, p90, p99,
                                  avg_ttft, p50_t, p90_t, p99_t))
     cur.executemany(
         """
         INSERT INTO f_latency_daily (
-            event_date, modelId, traffic_type, region, sample_count,
+            event_date, accountId, modelId, traffic_type, region,
+            sample_count, ttft_sample_count,
             avg_e2e, p50_e2e, p90_e2e, p99_e2e,
             avg_ttft, p50_ttft, p90_ttft, p99_ttft
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (event_date, accountId, modelId, traffic_type, region, endpoint)
+        DO NOTHING
         """,
         rows,
     )
@@ -948,8 +979,11 @@ def seed_client_telemetry(cur, today: date, rng: random.Random) -> int:
             workload = _WORKLOADS[team_idx % len(_WORKLOADS)]
             env = "prod" if (rank + d_offset) % 5 else ("staging" if rank % 2 else "dev")
             bu = _BUSINESS_UNITS[team_idx % len(_BUSINESS_UNITS)]
+            # '__all__' mirrors the real ingester: one row per request
+            # regardless of which attributes the caller sent, so totals and the
+            # provider list are complete even when attributes are sparse (T09).
             for dk, dv in (("user", user), ("team", team), ("workload", workload),
-                           ("env", env), ("business_unit", bu)):
+                           ("env", env), ("business_unit", bu), ("__all__", "__all__")):
                 rows.append((d, hour, dk, dv, model, ep, "us-east-1", "__none__",
                              reqs, in_tok, out_tok, cache, thr, errs,
                              lat, lat * 1.8, lat * 3.2, ttft50, ttft90,
@@ -994,6 +1028,8 @@ def seed_client_telemetry(cur, today: date, rng: random.Random) -> int:
                array_agg(DISTINCT endpoint)
         FROM f_proxy_dim_hourly
         WHERE event_date >= current_date - INTERVAL '30 days'
+        -- '__all__' is the accounting row, not a filterable attribute.
+          AND dim_key <> '__all__'
         GROUP BY dim_key, dim_value
     """)
     return len(rows)
@@ -1147,6 +1183,8 @@ def refresh_dim_tags(cur) -> int:
                SUM(total_requests)
         FROM f_daily_tagged
         WHERE event_date >= current_date - INTERVAL '30 days'
+          -- '__all__' is the accounting row, not a tag.
+          AND tag_key <> '__all__'
         GROUP BY tag_key, tag_value
         """
     )
@@ -1342,9 +1380,10 @@ def main() -> int:
             finally:
                 await c.close()
 
-        # If seed.main() is invoked in-process from inside an already-running
-        # event loop, asyncio.run() would raise. Run the evaluator on its own
-        # loop in a worker thread instead; works standalone and nested.
+        # A caller may invoke seed.main() in-process from INSIDE a running
+        # event loop, where asyncio.run() would raise. Run the
+        # evaluator on its own loop in a worker thread instead; works both
+        # standalone (CLI) and nested (Lambda).
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             summary = ex.submit(lambda: asyncio.run(_findings())).result(timeout=120)

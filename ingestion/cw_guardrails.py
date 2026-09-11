@@ -32,7 +32,7 @@ import asyncpg
 import boto3
 from botocore.config import Config
 
-from .accounts import _add_common_args, discover_accounts, session_for
+from .accounts import metric_window, _add_common_args, discover_accounts, session_for
 
 DEFAULT_DB_URL = os.environ.get(
     "DATABASE_URL",
@@ -202,8 +202,10 @@ async def main() -> int:
         except Exception:
             regions = ["us-east-1"]
 
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=args.days)
+    # Hour/midnight-aligned window — CloudWatch buckets align to StartTime, so an
+    # unaligned start mislabels every hourly and daily bucket. See
+    # accounts.metric_window for the measured evidence.
+    start, end = metric_window(args.days)
 
     conn = await asyncpg.connect(args.db_url)
     total = 0

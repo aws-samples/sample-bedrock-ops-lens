@@ -22,6 +22,8 @@ from datetime import date, timedelta
 from fastapi import APIRouter, Depends, Query
 
 from .. import db
+from dataclasses import replace
+
 from ..filters import FilterSet, build_where, parse_filters
 
 router = APIRouter()
@@ -31,24 +33,28 @@ router = APIRouter()
 # /api/wow-comparison
 # ---------------------------------------------------------------------------
 @router.get("/wow-comparison")
-async def wow_comparison():
-    """Compare last 7 days against the prior 7 days. Fleet-wide; ignores
-    filters by design (the WoW pill is a fleet-health signal, not a slice).
+async def wow_comparison(f: FilterSet = Depends(parse_filters)):
+    """Current window vs the immediately preceding window of EQUAL length,
+    both computed under the SAME filters.
 
-    Returns:
-      {
-        "current":  {total_requests, unique_accounts, total_input_tokens, ...},
-        "previous": {... same fields ...}
-      }
+    Audit finding 10: this endpoint used to ignore every filter and hardcode a
+    fleet-wide 7-day-vs-7-day comparison, while the Overview rendered its delta
+    badges next to SCOPED KPIs. For one account, requests grew 2.8124% while the
+    fleet grew 1.2482%; mixing a scoped current error rate with a fleet prior
+    error rate even reversed the sign (-47.13% shown against +4.37% actual).
+
+    The two periods are paired explicitly: `previous` covers the equally long
+    window ending the day before `current` starts, using the current filter set.
     """
-    today = date.today()
-    cur_start = today - timedelta(days=6)
-    prev_end = cur_start - timedelta(days=1)
-    prev_start = prev_end - timedelta(days=6)
+    days = (f.end - f.start).days + 1
+    prev_end = f.start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=days - 1)
 
     async def _row(start_d, end_d):
+        scoped = replace(f, start=start_d, end=end_d)
+        w = build_where(scoped)
         return await db.fetchrow(
-            """
+            f"""
             SELECT
               COALESCE(SUM(total_requests), 0)::BIGINT AS total_requests,
               COUNT(DISTINCT accountId)::BIGINT AS unique_accounts,
@@ -57,14 +63,23 @@ async def wow_comparison():
               COALESCE(SUM(failed_requests), 0)::BIGINT AS failed_requests,
               COALESCE(SUM(status_429_count), 0)::BIGINT AS throttled_requests
             FROM f_daily
-            WHERE event_date BETWEEN $1 AND $2
+            WHERE {w.sql}
             """,
-            start_d, end_d,
+            *w.params,
         )
 
-    cur = await _row(cur_start, today)
+    cur = await _row(f.start, f.end)
     prev = await _row(prev_start, prev_end)
-    return {"current": dict(cur), "previous": dict(prev)}
+    return {
+        "current": dict(cur),
+        "previous": dict(prev),
+        # The compared windows travel with the numbers so a reader can verify
+        # they are corresponding, equally defined periods.
+        "current_window": {"start": f.start.isoformat(), "end": f.end.isoformat()},
+        "previous_window": {"start": prev_start.isoformat(), "end": prev_end.isoformat()},
+        "scoped": bool(f.accounts) or f.provider != "all" or f.region != "all"
+                  or f.traffic_type != "all" or f.endpoint != "all",
+    }
 
 
 # ---------------------------------------------------------------------------

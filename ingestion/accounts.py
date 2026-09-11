@@ -36,7 +36,7 @@ import json
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -346,3 +346,38 @@ async def upsert_dim_account(conn, resolved: list[tuple[str, str, str]]) -> int:
         resolved,
     )
     return len(resolved)
+
+
+def metric_window(days: int, now: datetime | None = None) -> tuple[datetime, datetime]:
+    """The (start, end) window every CloudWatch ingester must use.
+
+    CloudWatch aligns GetMetricData buckets to the requested StartTime, NOT to
+    the wall clock. Every ingester used to pass `start = now() - days`, so a run
+    at 03:37 produced Period=3600 buckets stamped 16:37, 17:37, ... and
+    Period=86400 buckets stamped 03:37 — then stored them with `ts.hour` and
+    `ts.date()`, labelling a 16:37-17:37 window as "hour 16" and an
+    03:37-to-03:37 window as a calendar day.
+
+    Measured on real Bedrock traffic (us-east-1, Claude Haiku 4.5):
+
+        request start 03:00  ->  bucket 2026-09-09T16:00  =   236,840
+        request start 03:37  ->  bucket 2026-09-09T16:37  =   496,302
+        daily, start 03:00   ->  4,556,604
+        daily, start 03:37   ->  4,752,045      (4.3% apart)
+
+    So the same traffic produced different stored numbers depending on the
+    MINUTE the ingester happened to run, hourly peaks were attributed to the
+    wrong hour, and re-running the ingester silently rewrote history. A
+    reconciliation against CloudWatch disagreed on 140 of 163 overlapping hours.
+
+    Flooring START to UTC midnight fixes both grains at once: midnight is also an
+    hour boundary, so 3600s buckets land on :00 and 86400s buckets land on
+    midnight. END stays at `now` on purpose — bucket alignment depends only on
+    StartTime, so keeping it live preserves the current partial hour/day instead
+    of throwing away the freshest data.
+    """
+    now = now or datetime.now(timezone.utc)
+    end = now
+    start = (now - timedelta(days=days)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return start, end
