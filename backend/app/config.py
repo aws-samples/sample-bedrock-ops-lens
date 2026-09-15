@@ -104,7 +104,7 @@ class Settings:
     # ValidationException. Use the `us.` (or `eu.` / `global.`) CRIS prefix.
     bedrock_region: str = os.environ.get("BEDROCK_REGION", "us-east-1")
     bedrock_model_id: str = os.environ.get(
-        "BEDROCK_MODEL_ID", "us.anthropic.claude-opus-4-1-20250805-v1:0"
+        "BEDROCK_MODEL_ID", "us.anthropic.claude-opus-5"
     )
     # Ops Review synthesis runs against the bedrock-mantle endpoint (Anthropic
     # Messages API) — the dashboard dogfoods the endpoint it recommends. Mantle

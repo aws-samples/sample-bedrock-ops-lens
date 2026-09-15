@@ -26,7 +26,7 @@ Run: .venv/bin/python -m pytest tests/test_cw_accounting.py -q
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -99,10 +99,22 @@ class FakeCW:
         return {"MetricDataResults": results}
 
 
-TS = datetime(2026, 9, 8, 13, 0, tzinfo=timezone.utc)
+# Anchored to TODAY, not a hardcoded date. f_hourly_errors is only written for
+# `event_date >= today_utc - 6 days` (a deliberate rolling 7-day window in
+# cw_metrics), so a fixed fixture date is a time bomb: these tests passed for a
+# week and then began failing on 2026-09-15 UTC, when the window floor moved to
+# 09-09 and the old hardcoded 09-08 fell outside it. No error row was written and
+# the assertions dereferenced None. Nothing in the product had changed.
+#
+# Deriving the fixture from the clock keeps the tests testing the loader's
+# accounting rules rather than the calendar. Nothing here asserts on a literal
+# date, so this is safe.
+_TODAY_UTC = datetime.now(timezone.utc).replace(
+    hour=0, minute=0, second=0, microsecond=0)
+TS = _TODAY_UTC + timedelta(hours=13)
 MODELS = [("anthropic.claude-sonnet-4-5-20250929-v1:0", None)]
-START = datetime(2026, 9, 8, 0, 0, tzinfo=timezone.utc)
-END = datetime(2026, 9, 9, 0, 0, tzinfo=timezone.utc)
+START = _TODAY_UTC
+END = _TODAY_UTC + timedelta(days=1)
 
 
 async def _run(series: dict[str, float], monkeypatch=None) -> RecordingConn:

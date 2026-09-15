@@ -91,7 +91,7 @@ class InvocationLoggingConfig:
 @dataclass(frozen=True)
 class OpsReviewConfig:
     bedrock_region: str = "us-east-1"
-    bedrock_model_id: str = "us.anthropic.claude-opus-4-1-20250805-v1:0"
+    bedrock_model_id: str = "us.anthropic.claude-opus-5"
 
 
 @dataclass(frozen=True)
@@ -193,7 +193,7 @@ def load_config(path: str | Path | None = None) -> Config:
     op = OpsReviewConfig(
         bedrock_region=   _env_str("BEDROCK_REGION",   or_raw.get("bedrock_region", "us-east-1")),
         bedrock_model_id= _env_str("BEDROCK_MODEL_ID", or_raw.get("bedrock_model_id",
-                                                                   "us.anthropic.claude-opus-4-1-20250805-v1:0")),
+                                                                   "us.anthropic.claude-opus-5")),
     )
 
     iam_raw = raw.get("iam") or {}

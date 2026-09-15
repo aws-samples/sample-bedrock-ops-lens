@@ -48,18 +48,22 @@ def _severity_for_throttle(pct: float) -> str:
 
 
 def _is_claude_4_plus(model_id: str) -> bool:
-    """Public Claude 4+ family check. We use a simple substring match against
-    the public model IDs we know are Claude 4 generation. The reference's
-    codename-based check (`anthropic.coffee/fern/...`) is NOT relevant for
-    the customer build."""
-    needles = (
-        "claude-opus-4", "claude-sonnet-4", "claude-haiku-4",
-        "claude-opus-4-1", "claude-opus-4-5", "claude-opus-4-6", "claude-opus-4-7",
-        "claude-sonnet-4-5", "claude-sonnet-4-6",
-        "claude-haiku-4-5",
-    )
-    m = model_id.lower()
-    return any(n in m for n in needles)
+    """Does this model carry an output-token burndown multiplier?
+
+    Gates the Ops Review burndown-risk section. The old implementation was an
+    enumerated substring list of Claude 4 SKUs, which meant every Claude 5 model
+    answered False — so Opus 5, Sonnet 5 and Fable 5.1 were silently dropped from
+    burndown risk despite each burning output tokens at 10x, the highest rates in
+    the fleet. An allowlist of known names cannot help but go stale the moment a
+    generation ships; that is the bug, not a missing entry.
+
+    Parse the generation instead, and defer the rate itself to burndown.py so
+    there is one source of truth. Anything with a multiplier above 1:1 qualifies —
+    which today means Claude 4.x and 5.x plus the 10x OpenAI GPT-5.6 SKUs, and
+    tomorrow means whatever the rate catalog says without editing this function.
+    """
+    from ..burndown import output_burndown_rate
+    return output_burndown_rate(model_id) > 1
 
 
 # ---------------------------------------------------------------------------

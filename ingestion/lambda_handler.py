@@ -78,7 +78,8 @@ def _set_argv(argv: list[str]) -> None:
     sys.argv = argv
 
 
-async def _orchestrate(only: list[str] | None, days: int) -> dict:
+async def _orchestrate(only: list[str] | None, days: int,
+                       logs_budget_s: int = 0) -> dict:
     """Run ingesters in order. `only` filters to a subset by module name."""
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
@@ -177,6 +178,13 @@ async def _orchestrate(only: list[str] | None, days: int) -> dict:
              "--bucket", logs_bucket,
              "--accounts", accounts_csv,
              "--regions", logs_region]
+            # Wall-clock cap so the first ingest of a bucket with real history
+            # cannot run past the Lambda timeout. Without it the function is
+            # killed mid-flight (committing nothing, logging no completion) and
+            # the caller's SDK retries the invoke — the ~30-minute "hanging
+            # deploy" with two starting markers ~898s apart. Progress is durable
+            # per S3 object, so stopping early just means the next run resumes.
+            + (["--max-seconds", str(logs_budget_s)] if logs_budget_s > 0 else [])
         ))
 
     # proxy_events is opt-in: a GenAI proxy fronting Bedrock drops one
@@ -395,8 +403,20 @@ def handler(event, context):
         only = [str(only)]
     days = int(event.get("days", os.environ.get("INGESTER_DAYS_DEFAULT", "14")))
 
-    print(f"[ingester] event={json.dumps(event)[:300]}  only={only}  days={days}")
-    result = asyncio.run(_orchestrate(only=only, days=days))
+    # Derive the invocation_logs budget from what Lambda actually has left,
+    # rather than hardcoding 900. Reserve headroom for the modules that run after
+    # it (proxy_events, quotas) plus the findings evaluator and cache bump.
+    logs_budget_s = 0
+    try:
+        remaining_s = int(context.get_remaining_time_in_millis() / 1000)
+        logs_budget_s = max(60, int(remaining_s * 0.45))
+    except Exception:  # noqa: BLE001 — local/CLI runs have no Lambda context
+        pass
+
+    print(f"[ingester] event={json.dumps(event)[:300]}  only={only}  days={days}"
+          f"  logs_budget_s={logs_budget_s}")
+    result = asyncio.run(_orchestrate(only=only, days=days,
+                                      logs_budget_s=logs_budget_s))
 
     # Surface a summary for log-greppability.
     failed = [r for r in result["runs"] if r.get("rc") not in (0, None)]

@@ -26,6 +26,7 @@ import gzip
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 
@@ -289,7 +290,26 @@ async def main() -> int:
     ap.add_argument("--regions", default="us-east-1")
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--db-url", default=DEFAULT_DB_URL)
+    # Wall-clock budget. 0 disables it (CLI/backfill runs, where there is no
+    # 900-second ceiling to respect).
+    #
+    # Without this the first ingest of a bucket with real history runs past the
+    # Lambda's 900s timeout. The function is killed mid-flight, so it writes
+    # nothing and logs no completion; the caller's SDK then RETRIES the
+    # RequestResponse invoke, producing two "[invocation_logs] starting" markers
+    # ~898s apart and a deploy that appears to hang for ~30 minutes before
+    # failing. deploy.sh's `--cli-read-timeout 900` matches the Lambda timeout
+    # exactly, which is what turns the timeout into a silent retry.
+    #
+    # Stopping early is safe and already designed for: every finished S3 object is
+    # recorded in ingestion_log_objects, so the next run skips it and resumes.
+    # Partial progress beats a killed run that commits nothing.
+    ap.add_argument("--max-seconds", type=int,
+                    default=int(os.environ.get("INVOCATION_LOGS_MAX_SECONDS", "0")),
+                    help="stop starting new S3 objects after N seconds (0 = no limit)")
     args = ap.parse_args()
+    _deadline = (time.monotonic() + args.max_seconds) if args.max_seconds > 0 else None
+    _budget_hit = False
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=args.days)
@@ -306,7 +326,11 @@ async def main() -> int:
 
     try:
         for acct in accounts:
+            if _budget_hit:
+                break
             for region in regions:
+                if _budget_hit:
+                    break
                 s3 = _s3_client(region)
                 keys = _list_log_keys(s3, args.bucket, acct, region, start, end)
                 already = await _already_processed(conn, keys)
@@ -352,6 +376,17 @@ async def main() -> int:
                              "total_output_tokens": 0, "failed_requests": 0})
 
                 for key in pending:
+                    # Check BEFORE starting an object, never mid-object: a
+                    # half-parsed file must not be marked processed, or its
+                    # remaining rows would be skipped forever.
+                    if _deadline is not None and time.monotonic() >= _deadline:
+                        _budget_hit = True
+                        print(f"  [{acct}/{region}] time budget reached "
+                              f"({args.max_seconds}s) — stopping with "
+                              f"{len(pending) - pending.index(key)} object(s) left; "
+                              f"the next run resumes from ingestion_log_objects",
+                              flush=True)
+                        break
                     obj_rows = 0
                     obj_tag_rows = 0
                     for entry in _read_log_lines(s3, args.bucket, key):
@@ -664,10 +699,16 @@ async def main() -> int:
 
         n_status = await conn.fetchval("SELECT COUNT(*) FROM f_hourly_status")
         print(f"DONE. parsed {total_logs} log lines → {total_tagged_rows} f_daily_tagged rows, "
-              f"f_hourly_status now has {n_status} rows.")
+              f"f_hourly_status now has {n_status} rows."
+              + (f" PARTIAL: stopped at the {args.max_seconds}s budget; "
+                 f"objects already processed are recorded, so the next run resumes."
+                 if _budget_hit else ""))
     finally:
         await conn.close()
-    return 0
+    # Non-zero on a partial pass so the orchestrator reports `status: partial`
+    # rather than claiming a clean run. The work committed is still durable and
+    # the next run resumes — this is "more to do", not "broken".
+    return 2 if _budget_hit else 0
 
 
 if __name__ == "__main__":
