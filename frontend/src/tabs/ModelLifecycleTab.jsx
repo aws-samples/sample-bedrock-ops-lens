@@ -1,6 +1,8 @@
 // Model Lifecycle tab — shows which Bedrock models in the customer's
 // portfolio are LEGACY, in extended access, or past EOL, plus the live
 // usage on each so the customer knows where to focus migration work.
+// ACTIVE models are deliberately absent: they need no migration work, and
+// listing them buried the ones that do.
 //
 // Data is 100% live from AWS:
 //   - lifecycle status + dates: bedrock:ListFoundationModels (refreshed
@@ -9,10 +11,22 @@
 // No bundled JSON, no scrape. The only product opinion is the
 // recommended-upgrade map, kept in backend/app/routers/model_lifecycle.py.
 //
+// TWO LIFECYCLE POLICIES. Models launched on Bedrock before 2026-09-07 follow
+// the legacy policy and may get a public-extended-access phase; models
+// launched on or after it follow the current policy, which has NO
+// extended-access phase and a Legacy period of either 6 months or 45 days.
+// Hence the Policy and "Notice given" columns, and why Extended access reads
+// "n/a" (not "—") for current-policy models — absent and not-applicable are
+// different facts when you're planning a migration.
+//
+// Rows survive EOL. AWS removes a model from the API once it dies, so the
+// ingester retains the row (api_visible = FALSE) and the EOL cell shows
+// "removed from API": any traffic on such a row is failing requests.
+//
 // Three sections:
-//   1. KPI ribbon — total legacy, in-use legacy, past-EOL count
-//   2. Timeline — top 8 in-use legacy models, with today's date marker
-//   3. Table — every legacy model in the customer's portfolio with
+//   1. KPI ribbon — total tracked, in-use, critical count
+//   2. Timeline — top 8 in-use models, with today's date marker
+//   3. Table — every legacy/EOL model in the customer's portfolio with
 //              expandable per-account drill-down + CSV download
 
 import { useMemo, useState } from 'react';
@@ -38,6 +52,32 @@ function SeverityBadge({ severity }) {
   return <StatusIndicator type={type}>{SEV_LABEL[severity] || severity}</StatusIndicator>;
 }
 
+// Which lifecycle policy governs a model, derived by the ingester from its
+// Bedrock launch date (before / on-or-after 2026-09-07). Rendered as plain
+// text, not a StatusIndicator — neither policy is a problem in itself, and a
+// coloured icon here would compete with the Severity column that IS the signal.
+const POLICY_LABEL = {
+  legacy:  'Legacy policy',
+  current: 'Current policy',
+};
+
+function PolicyBadge({ policy }) {
+  if (!policy) {
+    // No startOfLifeTime from the API, so the regime is genuinely unknown.
+    // Say so rather than defaulting to one — the notice period a customer
+    // should expect differs between the two.
+    return <Box color="text-body-secondary"><i>Unknown</i></Box>;
+  }
+  return (
+    <Box>
+      <Box>{POLICY_LABEL[policy] || policy}</Box>
+      <Box color="text-body-secondary" fontSize="body-s">
+        {policy === 'current' ? 'no extended access' : 'may have extended access'}
+      </Box>
+    </Box>
+  );
+}
+
 export default function ModelLifecycleTab({ filters, onInfo }) {
   // Lifecycle is endpoint-agnostic: model status (Legacy / EOL / etc.) is a
   // property of the model identity, not how it's invoked. No runtime/mantle
@@ -54,7 +94,8 @@ function ModelLifecycleBody({ filters, onInfo }) {
   const models     = data?.models || [];
   const meta       = data?.meta || {};
   const inUse      = useMemo(() => models.filter(m => m.total_requests > 0), [models]);
-  const pastEol    = useMemo(() => models.filter(m => m.severity === 'critical'), [models]);
+  const criticalCount = useMemo(
+    () => models.filter(m => m.severity === 'critical').length, [models]);
   const top8       = useMemo(() => inUse.slice(0, 8), [inUse]);
 
   // Default the table to models the fleet is ACTUALLY using — otherwise most
@@ -100,16 +141,51 @@ function ModelLifecycleBody({ filters, onInfo }) {
       cell: (item) => item.provider || '—',
     },
     {
+      id: 'lifecycle_policy', header: 'Policy', minWidth: 110,
+      cell: (item) => <PolicyBadge policy={item.lifecycle_policy} />,
+      exportValue: (item) => item.lifecycle_policy || 'unknown',
+    },
+    {
+      id: 'notice_period_label', header: 'Notice given', minWidth: 110,
+      // How much warning this model actually gave (EOL − Legacy). Under the
+      // current policy this can be as little as 45 days, so flag that: it is
+      // the difference between a comfortable migration and a scramble.
+      cell: (item) => {
+        if (!item.notice_period_label) return <Box color="text-body-secondary">—</Box>;
+        return item.notice_period_days <= 60
+          ? <StatusIndicator type="warning">{item.notice_period_label}</StatusIndicator>
+          : item.notice_period_label;
+      },
+      exportValue: (item) => item.notice_period_label || '',
+    },
+    {
       id: 'legacy_date', header: 'Legacy date', minWidth: 110,
       cell: (item) => item.legacy_date || '—',
     },
     {
       id: 'extended_access_date', header: 'Extended access', minWidth: 130,
-      cell: (item) => item.extended_access_date || '—',
+      // Absent and not-applicable are different facts. Current-policy models
+      // have no extended-access phase at all, so '—' would wrongly imply AWS
+      // simply hasn't published a date yet.
+      cell: (item) => item.lifecycle_policy === 'current'
+        ? <Box color="text-body-secondary" fontSize="body-s"><i>n/a</i></Box>
+        : (item.extended_access_date || '—'),
+      exportValue: (item) => item.lifecycle_policy === 'current'
+        ? 'n/a' : (item.extended_access_date || ''),
     },
     {
-      id: 'eol_date', header: 'EOL date', minWidth: 110,
-      cell: (item) => item.eol_date || '—',
+      id: 'eol_date', header: 'EOL date', minWidth: 140,
+      cell: (item) => (
+        <Box>
+          <Box>{item.eol_date || '—'}</Box>
+          {item.removed_from_api && (
+            <Box color="text-status-error" fontSize="body-s">
+              removed from API
+            </Box>
+          )}
+        </Box>
+      ),
+      exportValue: (item) => item.eol_date || '',
     },
     {
       id: 'unique_accounts', header: 'Accounts', minWidth: 80,
@@ -180,9 +256,14 @@ function ModelLifecycleBody({ filters, onInfo }) {
             with the display-l font that the count tiles use produced an
             absurd 4-line wrap. Drop it into its own slim tile. */}
         <ColumnLayout columns={4} variant="text-grid">
-          <KpiCard title="Legacy models in your portfolio" value={fmt(models.length)} />
+          <KpiCard title="Legacy or EOL models in your portfolio" value={fmt(models.length)} />
           <KpiCard title="Currently in use" value={fmt(inUse.length)} />
-          <KpiCard title="Past extended access (critical)" value={fmt(pastEol.length)} />
+          {/* Was labelled "Past extended access" but has always counted every
+              critical row — past EOL, EOL within 30 days, and past extended
+              access. Label now matches what it computes. Current-policy
+              models have no extended-access phase, so the old label was
+              doubly wrong for them. */}
+          <KpiCard title="Needs action now (critical)" value={fmt(criticalCount)} />
           <Container>
             <Box variant="awsui-key-label">Lifecycle data refreshed</Box>
             <Box variant="h3">{lastRefresh}</Box>
@@ -201,15 +282,19 @@ function ModelLifecycleBody({ filters, onInfo }) {
           {loading ? <ChartLoading height={300} />
             : top8.length === 0
               ? <Box color="text-body-secondary" textAlign="center" padding="l">
-                  No legacy models are currently in use in this window. <br />
-                  The table below still lists every legacy model so you can
-                  monitor proactively.
+                  No legacy or EOL models are currently in use in this window. <br />
+                  The table below still lists every model AWS has scheduled so
+                  you can monitor proactively.
                 </Box>
               : <LifecycleTimeline alerts={top8.map(m => ({
                   modelId: m.public_name || m.modelId,
                   severity: m.severity,
                   legacy_date: m.legacy_date,
-                  extended_access_date: m.extended_access_date,
+                  // Never draw an extended-access marker for a current-policy
+                  // model: that phase doesn't exist under the current policy,
+                  // and a marker would imply a grace period it won't get.
+                  extended_access_date: m.lifecycle_policy === 'current'
+                    ? null : m.extended_access_date,
                   eol_date: m.eol_date,
                 }))} />
           }
@@ -218,7 +303,7 @@ function ModelLifecycleBody({ filters, onInfo }) {
         {/* Table ----------------------------------------------------- */}
         <Container header={
           <SectionHeader
-            title={`Legacy models (${tableItems.length})`}
+            title={`Legacy & EOL models (${tableItems.length})`}
             description="Click a row to see which accounts are using each model."
             sectionId="lifecycle-table"
             onInfo={onInfo}
@@ -229,7 +314,7 @@ function ModelLifecycleBody({ filters, onInfo }) {
                 label="Scope"
                 options={[
                   { id: 'in-use', text: `In use (${inUse.length})` },
-                  { id: 'all',    text: `All legacy (${models.length})` },
+                  { id: 'all',    text: `All tracked (${models.length})` },
                 ]}
               />
             }
@@ -243,8 +328,8 @@ function ModelLifecycleBody({ filters, onInfo }) {
                 trackBy="modelId"
                 renderRowDetail={renderRowDetail}
                 empty={scope === 'in-use'
-                  ? 'No legacy models in active use in this window. Switch to "All legacy" to see the full catalog.'
-                  : 'No legacy models in your portfolio. Nothing to migrate.'}
+                  ? 'No legacy or EOL models in active use in this window. Switch to "All tracked" to see every one AWS has scheduled.'
+                  : 'No legacy or EOL models in your portfolio. Nothing to migrate.'}
                 searchPlaceholder="Search by model id, name, provider…"
                 columnDefinitions={columnDefinitions}
               />

@@ -329,11 +329,19 @@ async def _detect_cost_jump(conn, th: dict) -> list[dict]:
 
 
 async def _detect_model_eol(conn, th: dict) -> list[dict]:
-    """Models with live traffic (7d) whose legacy/EOL date is within N days."""
+    """Models with live traffic (7d) whose legacy/EOL date is within N days.
+
+    Also fires for models ALREADY past EOL. AWS deletes those from the Bedrock
+    API, but the ingester retains the row (api_visible = FALSE) precisely so
+    this detector can reach them — traffic on a dead model is 100 % failures
+    and is the single most urgent finding this dashboard can raise. Before EOL
+    retention existed the row vanished before we could report it.
+    """
     rows = await conn.fetch(
         """
         SELECT l.modelId, l.region, l.model_name,
                l.legacy_time, l.end_of_life_time,
+               l.lifecycle_policy, l.api_visible,
                SUM(p.total_requests) AS reqs
         FROM dim_model_lifecycle l
         JOIN f_hourly_peak p
@@ -348,7 +356,7 @@ async def _detect_model_eol(conn, th: dict) -> list[dict]:
          AND p.region = l.region
          AND p.event_date >= current_date - 7
         WHERE COALESCE(l.end_of_life_time, l.legacy_time) IS NOT NULL
-        GROUP BY 1,2,3,4,5
+        GROUP BY 1,2,3,4,5,6,7
         HAVING SUM(p.total_requests) > 0
         """)
     now = datetime.now(timezone.utc)
@@ -360,23 +368,52 @@ async def _detect_model_eol(conn, th: dict) -> list[dict]:
         if days_left > th["notify_eol_days"]:
             continue
         model, region = r["modelid"], r["region"]
+        past = days_left < 0
+
+        # Point at the policy that actually governs this model. The two docs
+        # pages describe different notice periods and only the legacy one has
+        # an extended-access phase, so linking the wrong page sends the reader
+        # to guarantees their model doesn't have.
+        doc = ("https://docs.aws.amazon.com/bedrock/latest/userguide/"
+               + ("model-lifecycle.html" if r["lifecycle_policy"] == "current"
+                  else "model-lifecycle-legacy.html"))
+
+        if past and kind == "EOL":
+            # Requests are already failing. Say that plainly instead of
+            # reporting "EOL in 0 days", which reads as a warning about the
+            # future and understates a live outage.
+            title = (f"Past EOL — {model} still receiving traffic in {region}, "
+                     f"requests are failing")
+            detail = (f"{r['reqs']:,} request attempts in the last 7 days against a "
+                      f"model AWS retired on {milestone.date().isoformat()} "
+                      f"({abs(days_left)} days ago). Bedrock rejects these calls; "
+                      f"the traffic is errors, not usage.")
+            if not r["api_visible"]:
+                detail += (" AWS has removed the model from the Bedrock API in "
+                           "this Region.")
+        else:
+            title = (f"{kind} in {max(days_left, 0)} days — {model} still has "
+                     f"traffic in {region}")
+            detail = (f"{r['reqs']:,} requests in the last 7 days. "
+                      f"{kind} date: {milestone.date().isoformat()}.")
+
         findings.append({
             "finding_id": f"eol-{model}-{region}",
             "type": "model_eol",
             "severity": "critical" if days_left <= 30 else "warning",
             "accountId": None, "model": model, "region": region,
-            "title": (f"{kind} in {max(days_left,0)} days — {model} still has "
-                      f"traffic in {region}"),
-            "detail": (f"{r['reqs']:,} requests in the last 7 days. "
-                       f"{kind} date: {milestone.date().isoformat()}."),
+            "title": title,
+            "detail": detail,
             "metric": {"value": days_left, "threshold": th["notify_eol_days"],
                        "unit": "days_to_milestone", "window": "7d_traffic"},
             "recommended_action": {
                 "kind": "migrate_model",
-                "summary": "Plan migration to a current model before the milestone.",
+                "summary": ("Migrate this traffic now — the model is gone and "
+                            "every call is failing."
+                            if past and kind == "EOL" else
+                            "Plan migration to a current model before the milestone."),
                 "cli": "",
-                "console_url": ("https://docs.aws.amazon.com/bedrock/latest/"
-                                "userguide/model-lifecycle.html"),
+                "console_url": doc,
             },
         })
     return findings

@@ -511,14 +511,29 @@ CREATE INDEX IF NOT EXISTS ix_dim_tags_key_volume ON dim_tags (tag_key, total_re
 -- region because the same modelId can have different lifecycle dates in
 -- different regions (per the AWS docs page).
 --
---   status                'ACTIVE' | 'LEGACY'  (string, mirrors the API enum)
+--   status                'ACTIVE' | 'LEGACY'  (string, mirrors the API enum —
+--                         we never write a synthetic 'EOL' here; past-EOL is
+--                         derived from end_of_life_time <= today)
 --   start_of_life_time    when the model was first published on Bedrock
 --   legacy_time           when the model entered the Legacy state
 --   public_extended_access_time   start of the (post-2026-02-01) extended-access
---                                 phase when pricing may rise
+--                                 phase when pricing may rise. Legacy-policy
+--                                 models ONLY — the current policy has no such
+--                                 phase, so it stays NULL for those.
 --   end_of_life_time      hard EOL — requests fail after this date
 --   model_name            human-readable, from API (e.g. "Claude 3 Haiku")
 --   provider              from API (e.g. "Anthropic")
+--   lifecycle_policy      'legacy' (launched < 2026-09-07) | 'current' (>=).
+--                         Derived from start_of_life_time; the API has no
+--                         policy field. The two policies differ materially:
+--                         legacy guarantees >=12 months on Bedrock and >=6
+--                         months of Legacy notice; current drops both, allowing
+--                         a 45-day Legacy period and no extended access.
+--   notice_period_days    end_of_life_time - legacy_time. How much warning the
+--                         model actually gave. NULL until it enters Legacy.
+--   api_visible           FALSE once the API stops returning this row, which is
+--                         what AWS does after EOL. Row is RETAINED anyway.
+--   last_seen_at          last ingest run in which the API returned this row.
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS dim_model_lifecycle (
     modelId                       TEXT NOT NULL,
@@ -530,12 +545,21 @@ CREATE TABLE IF NOT EXISTS dim_model_lifecycle (
     legacy_time                   TIMESTAMPTZ,
     public_extended_access_time   TIMESTAMPTZ,
     end_of_life_time              TIMESTAMPTZ,
+    lifecycle_policy              TEXT,
+    notice_period_days            INTEGER,
+    api_visible                   BOOLEAN NOT NULL DEFAULT TRUE,
+    last_seen_at                  TIMESTAMPTZ,
     refreshed_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (modelId, region)
 );
 
 CREATE INDEX IF NOT EXISTS ix_dim_model_lifecycle_status
   ON dim_model_lifecycle (status) WHERE status = 'LEGACY';
+
+-- Past-EOL lookups have to reach rows the API no longer returns, so the
+-- partial index on status='LEGACY' is not sufficient on its own.
+CREATE INDEX IF NOT EXISTS ix_dim_model_lifecycle_eol
+  ON dim_model_lifecycle (end_of_life_time) WHERE end_of_life_time IS NOT NULL;
 
 -- ----------------------------------------------------------------------------
 -- user_preferences — per-user pinned tag keys for the top-bar.

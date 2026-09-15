@@ -57,25 +57,61 @@ def _recommended_upgrade(model_id: str) -> str | None:
     return None
 
 
+#: Days before EOL at which any model — either policy — becomes critical.
+#: Under the current policy this is the ONLY escalation available: there is no
+#: extended-access milestone, so without it a model with a 45-day Legacy period
+#: would sit at "warning" right up to the day requests start failing.
+EOL_IMMINENT_DAYS = 30
+
+
 def _severity(today: date,
               legacy_d: date | None,
               extended_d: date | None,
-              eol_d: date | None) -> str:
+              eol_d: date | None,
+              policy: str | None = None) -> str:
     """Map lifecycle dates → severity class consumed by the UI:
-        critical  past EOL or past extended-access (active customers paying premium)
+        critical  past EOL, EOL within 30 days, or (legacy policy only) past
+                  extended-access, where active users start paying a premium
         warning   already in Legacy
         info      Legacy starts within the next 90 days
         active    none of the above (don't surface to the user)
+
+    `policy` is 'legacy' | 'current' | None. The extended-access rule is
+    deliberately skipped for 'current': models launched on/after 2026-09-07
+    have no extended-access phase at all, so the field is meaningless for them
+    and applying it would invent a milestone AWS does not define. None (regime
+    unknown, no startOfLifeTime from the API) is treated as legacy, which is
+    the conservative reading — it can only raise severity, never lower it.
     """
     if eol_d and eol_d <= today:
         return "critical"
-    if extended_d and extended_d <= today:
+    if eol_d and eol_d <= today + timedelta(days=EOL_IMMINENT_DAYS):
+        return "critical"
+    if policy != "current" and extended_d and extended_d <= today:
         return "critical"
     if legacy_d and legacy_d <= today:
         return "warning"
     if legacy_d and legacy_d <= today + timedelta(days=90):
         return "info"
     return "active"
+
+
+def _notice_period_label(days: int | None) -> str | None:
+    """Human label for the notice period a model actually gave.
+
+    The current policy defines exactly two Legacy periods — 6 months and 45
+    days — but the observed gap is never exact (real 6-month models measure
+    183-185 days), so bucket rather than compare. Anything that matches
+    neither bucket is reported as a plain day count instead of being forced
+    into one.
+    """
+    if days is None:
+        return None
+    if days <= 60:
+        return "45 days"
+    if 150 <= days <= 210:
+        return "6 months"
+    return f"{days} days"
 
 
 @router.get("/model-lifecycle")
@@ -85,16 +121,30 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
     Returns:
       models: list of {modelId, public_name, provider, severity,
                        legacy_date, extended_access_date, eol_date,
+                       lifecycle_policy, notice_period_days,
+                       notice_period_label, removed_from_api,
                        recommended_upgrade, total_requests, unique_accounts,
                        last_accessed, regions, accounts_detail[]}
 
-      meta:   {today, refreshed_at, total_legacy, in_use_count}
+      meta:   {today, refreshed_at, total_legacy, in_use_count,
+               past_eol_count, current_policy_count}
+
+    Includes models AWS has already removed from the API (past EOL). Those are
+    retained by the ingester precisely so this endpoint can report them: a
+    customer still calling one sees only failures, and this is the only place
+    that attributes those failures to a retired model.
     """
     today = date.today()
 
     # --- 1. Lifecycle dates: collapse (modelId, region) → modelId. Use the
     #         earliest legacy/eol date across regions (most conservative —
     #         "this model goes legacy on date X" is the safe message).
+    # `status = 'LEGACY' OR end_of_life_time IS NOT NULL` rather than status
+    # alone: after EOL, AWS removes the model from the API entirely, and the
+    # ingester retains that row with api_visible = FALSE. Keying off status
+    # alone still works today (a model is LEGACY before it dies, and the
+    # retained row keeps its last-known status), but the date clause makes the
+    # intent explicit and survives any future status the API may introduce.
     lc_rows = await db.fetch(
         """
         SELECT modelId,
@@ -104,10 +154,18 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
                MIN(legacy_time)                         AS legacy_time,
                MIN(public_extended_access_time)         AS extended_access_time,
                MIN(end_of_life_time)                    AS end_of_life_time,
+               -- 'current' wins a tie: if ANY region reports the model as
+               -- current-policy then the extended-access phase does not apply
+               -- to it, and suppressing that milestone is the safe direction.
+               MIN(lifecycle_policy)                    AS lifecycle_policy,
+               MIN(notice_period_days)                  AS notice_period_days,
+               -- Gone from the API in EVERY region we track = removed by AWS.
+               -- Still visible somewhere = a region-level delisting only.
+               BOOL_AND(NOT api_visible)                AS removed_from_api,
                array_agg(DISTINCT region ORDER BY region) AS regions,
                MAX(refreshed_at)                        AS refreshed_at
         FROM dim_model_lifecycle
-        WHERE status = 'LEGACY'
+        WHERE status = 'LEGACY' OR end_of_life_time IS NOT NULL
         GROUP BY modelId
         """,
     )
@@ -218,7 +276,9 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
         legacy_d   = r["legacy_time"].date()         if r["legacy_time"]         else None
         extended_d = r["extended_access_time"].date() if r["extended_access_time"] else None
         eol_d      = r["end_of_life_time"].date()    if r["end_of_life_time"]    else None
-        sev = _severity(today, legacy_d, extended_d, eol_d)
+        policy     = r["lifecycle_policy"]
+        notice_days = r["notice_period_days"]
+        sev = _severity(today, legacy_d, extended_d, eol_d, policy)
         if sev == "active":
             continue
 
@@ -232,8 +292,17 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
             "provider":             r["provider"],
             "severity":             sev,
             "legacy_date":          legacy_d.isoformat() if legacy_d else None,
+            # Only ever populated for legacy-policy models; the current policy
+            # has no extended-access phase, so the UI shows n/a rather than '—'
+            # (absent vs not-applicable are different facts to an operator).
             "extended_access_date": extended_d.isoformat() if extended_d else None,
             "eol_date":             eol_d.isoformat() if eol_d else None,
+            "lifecycle_policy":     policy,
+            "notice_period_days":   notice_days,
+            "notice_period_label":  _notice_period_label(notice_days),
+            # True once AWS has removed the model from every region we track —
+            # requests to it fail outright, so any traffic below is failures.
+            "removed_from_api":     bool(r["removed_from_api"]),
             "regions":              list(r["regions"] or []),
             "recommended_upgrade":  _recommended_upgrade(mid),
             "total_requests":       total_req,
@@ -258,5 +327,12 @@ async def model_lifecycle(f: FilterSet = Depends(parse_filters)):
             "refreshed_at":  refreshed_at.isoformat() if refreshed_at else None,
             "total_legacy":  len(lc_rows),
             "in_use_count":  in_use,
+            "past_eol_count": sum(
+                1 for m in out_models
+                if m["eol_date"] and m["eol_date"] <= today.isoformat()
+            ),
+            "current_policy_count": sum(
+                1 for m in out_models if m["lifecycle_policy"] == "current"
+            ),
         },
     }
