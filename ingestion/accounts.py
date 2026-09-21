@@ -20,8 +20,9 @@ makes API calls AS that account. The session is constructed via:
      ExternalId=<optional, set in env>,
    )
 
-The role must already exist in the target account — deployed via the
-StackSet template at infra/monitored-account-role.yaml.
+The role must already exist in the target account. Its owner can deploy
+infra/monitored-account-role.yaml directly or manage the equivalent IAM role
+through their own workflow; StackSets are an optional deployment method.
 
 Special case: if accountId == the running credentials' account, we skip
 the assume-role and use the running credentials directly (the role would

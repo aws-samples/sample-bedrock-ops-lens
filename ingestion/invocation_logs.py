@@ -34,6 +34,12 @@ import asyncpg
 import boto3
 from botocore.config import Config
 
+if __package__:
+    from .outcomes import IngestOutcome
+else:
+    # Preserve direct CLI use: python ingestion/invocation_logs.py ...
+    from outcomes import IngestOutcome
+
 DEFAULT_DB_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://bedrock_lens:bedrock_lens_dev@localhost:5432/bedrock_lens",
@@ -705,10 +711,10 @@ async def main() -> int:
                  if _budget_hit else ""))
     finally:
         await conn.close()
-    # Non-zero on a partial pass so the orchestrator reports `status: partial`
-    # rather than claiming a clean run. The work committed is still durable and
-    # the next run resumes — this is "more to do", not "broken".
-    return 2 if _budget_hit else 0
+    # Signal resumable work only after the writes and connection close succeed.
+    # The typed outcome distinguishes a budget stop from an ordinary rc=2 error,
+    # while preserving the nonzero exit code for direct CLI callers.
+    return IngestOutcome.TIME_BUDGET_EXHAUSTED if _budget_hit else 0
 
 
 if __name__ == "__main__":

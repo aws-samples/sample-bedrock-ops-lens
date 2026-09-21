@@ -2,8 +2,8 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Bedrock Ops Lens — read-only IAM role for cross-account metric ingestion.
   Deploy this in EVERY account whose Bedrock usage you want surfaced in the
-  central dashboard. Use a CloudFormation StackSet from the AWS Organizations
-  management account to deploy it org-wide in one shot.
+  central dashboard. Supports self-managed StackSets without Organizations,
+  service-managed StackSets, or deployment by each account's administrator.
 
 Parameters:
   CentralAccountId:
@@ -13,12 +13,23 @@ Parameters:
       observability account that runs the ingester).
     AllowedPattern: '^[0-9]{12}$'
 
+  CentralIngesterRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$'
+    Description: >
+      IAM role ARN used by the central ingester Lambda. setup-pipeline.sh
+      supplies this to restrict trust to that role. Leaving it empty retains
+      central-account trust for backwards compatibility; principals in that
+      account must also have permission to assume this reader role.
+
   RoleName:
     Type: String
     Default: BedrockOpsLensReader
+    AllowedPattern: '^[A-Za-z0-9+=,.@_-]{1,64}$'
     Description: >
-      IAM role name. Must match the value the ingester uses when constructing
-      the assume-role ARN (default: BedrockOpsLensReader).
+      IAM role name. Must match ReaderRoleName in the central stack, which
+      configures the ingester and its assume-role permission.
 
   ExternalId:
     Type: String
@@ -30,6 +41,7 @@ Parameters:
 
 Conditions:
   HasExternalId: !Not [!Equals [!Ref ExternalId, '']]
+  HasIngesterRole: !Not [!Equals [!Ref CentralIngesterRoleArn, '']]
 
 Resources:
   # Use a customer-managed policy instead of an inline policy (cfn-guard IAM_NO_INLINE_POLICY_CHECK).
@@ -41,10 +53,13 @@ Resources:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
-          - Sid: TrustCentralAccount
+          - Sid: TrustCentralIngester
             Effect: Allow
             Principal:
-              AWS: !Sub 'arn:${AWS::Partition}:iam::${CentralAccountId}:root'
+              AWS: !If
+                - HasIngesterRole
+                - !Ref CentralIngesterRoleArn
+                - !Sub 'arn:${AWS::Partition}:iam::${CentralAccountId}:root'
             Action: sts:AssumeRole
             Condition:
               !If

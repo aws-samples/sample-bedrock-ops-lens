@@ -1,5 +1,7 @@
 # Contributing Guidelines
 
+[Project home](README.md) · [Deployment guide](docs/deployment.md)
+
 Thank you for your interest in contributing to our project. Whether it's a bug report, new feature, correction, or additional
 documentation, we greatly value feedback and contributions from our community.
 
@@ -43,6 +45,74 @@ GitHub provides additional document on [forking a repository](https://help.githu
 ## Finding contributions to work on
 Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
 
+
+## Local development
+
+Use Python 3.12, Node.js/npm, and Docker Compose. From the repository root,
+prepare a virtual environment and the backend/test dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r backend/requirements.txt pytest pytest-asyncio httpx
+if [[ ! -e config.yaml ]]; then
+  cp config.example.yaml config.yaml
+fi
+```
+
+Start the local services. Compose initializes the database schema on a new
+Postgres volume; apply the partition setup from the repository root:
+
+```bash
+docker compose up -d
+docker compose exec -T postgres psql -U bedrock_lens -d bedrock_lens < db/partitions.sql
+```
+
+Wait for Postgres to be healthy before running the SQL command. Start the
+backend in this terminal:
+
+```bash
+cd backend
+DATABASE_URL=postgresql://bedrock_lens:bedrock_lens_dev@localhost:5432/bedrock_lens \
+  AUTH_ENABLED=false PYTHONPATH=.. uvicorn app.main:app --port 8001
+```
+
+The database credentials above are the local Compose defaults. The
+`AUTH_ENABLED=false` setting is for this local development server.
+
+In a separate terminal, start from the repository root:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend is at http://localhost:5173. It uses the same FastAPI application
+and ingestion code as the Lambda deployment.
+
+## Tests
+
+From the repository root with the Python environment activated:
+
+```bash
+python -m pytest -q
+```
+
+The suite covers CloudWatch accounting, quota matching and burndown, cache-token
+accounting, telemetry payloads, ingestion outcomes, and deployment/onboarding
+behavior. Most tests use local fakes. API-dependent tests need a running backend;
+report skips and exclusions separately from passing tests.
+
+With the local backend running as described above:
+
+```bash
+LENS_API=http://localhost:8001/api python -m pytest -q
+```
+
+For deployed UI checks, see the [Playwright instructions](docs/deployment.md#verify).
+For quota drill-down internals, see the
+[implementation reference](docs/quota-drilldown-implementation.md).
 
 ## Code of Conduct
 This project has adopted the [Amazon Open Source Code of Conduct](https://aws.github.io/code-of-conduct).

@@ -99,6 +99,23 @@ Parameters:
     Description: |
       UTC hour to run the ingester each day (5 UTC ≈ midnight CT). Pre-warm
       Lambda runs 30 min after the ingester completes.
+  EnableOrganizationsDiscovery:
+    Type: String
+    Default: 'true'
+    AllowedValues: [ 'true', 'false' ]
+    Description: |
+      Set false when AWS Organizations must not be used. Omits Organizations
+      permissions from the ingester and starts ingestion in single-account
+      mode. After target owners create reader roles, setup-pipeline.sh
+      --scope accounts --skip-rollout configures the explicit account list.
+  ReaderRoleName:
+    Type: String
+    Default: BedrockOpsLensReader
+    AllowedPattern: '^[A-Za-z0-9+=,.@_-]{1,64}$'
+    Description: |
+      Reader role name used in every target account. Configures both the
+      ingester's sts:AssumeRole permission and its runtime role-name setting.
+      Must match RoleName in the target reader template.
   EdgeShaVersionArn:
     Type: String
     Description: |
@@ -116,6 +133,7 @@ Parameters:
 # Conditions
 # =============================================================================
 Conditions:
+  OrganizationsDiscoveryEnabled: !Equals [ !Ref EnableOrganizationsDiscovery, 'true' ]
   AdminOnlySignUp:    !Equals [ !Ref CognitoSelfSignUp, 'disabled' ]
   HasBedrockLogsBkt:  !Not [ !Equals [ !Ref BedrockLogsBucket, '' ] ]
   HasProxyEventsBkt:  !Not [ !Equals [ !Ref ProxyEventsBucket, '' ] ]
@@ -1107,26 +1125,27 @@ Resources:
                   - bedrock:GetInferenceProfile
                 Resource: '*'
               # AssumeRole to hop into linked accounts (multi-account ingest).
-              # Self-account assume is allowed via the same wildcard pattern;
-              # the role ingestion/accounts.py looks for is BedrockOpsLensReader.
+              # Keep the permitted name aligned with the runtime environment.
               - Effect: Allow
                 Action: sts:AssumeRole
-                Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/BedrockOpsLensReader'
+                Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/${ReaderRoleName}'
               # Notifications (009): publish finding transitions to the
               # admin-configured alerts topic (central account only — the one
               # AWS write in the notifications feature).
               - Effect: Allow
                 Action: sns:Publish
                 Resource: !Sub 'arn:${AWS::Partition}:sns:*:${AWS::AccountId}:*'
-              # Organizations read for discover-org mode. Without these,
-              # MONITORED_ACCOUNTS_MODE=discover-org silently degrades to
-              # single-account because ListAccounts returns AccessDenied.
-              - Effect: Allow
-                Action:
-                  - organizations:ListAccounts
-                  - organizations:DescribeOrganization
-                  - organizations:ListAccountsForParent
-                Resource: '*'
+              # Optional discovery only. Explicit-account ingestion does not
+              # need Organizations permissions.
+              - !If
+                - OrganizationsDiscoveryEnabled
+                - Effect: Allow
+                  Action:
+                    - organizations:ListAccounts
+                    - organizations:DescribeOrganization
+                    - organizations:ListAccountsForParent
+                  Resource: '*'
+                - !Ref AWS::NoValue
               # Identity introspection (used to derive self-account context)
               - Effect: Allow
                 Action: sts:GetCallerIdentity
@@ -1188,14 +1207,11 @@ Resources:
           MEMCACHED_PORT: !GetAtt CacheCluster.ConfigurationEndpoint.Port
           BEDROCK_REGION: !Ref AWS::Region
           INGESTER_DAYS_DEFAULT: '14'
-          # Default to discover-org so the dashboard pulls from every active
-          # account in the AWS Organization (after the operator has rolled
-          # out BedrockOpsLensReader via scripts/setup-multi-account.py).
-          # Override to 'single' to keep ingest scoped to the central account
-          # only, or 'explicit' with MONITORED_ACCOUNTS_IDS=... for an
-          # arbitrary list. discover-org needs organizations:ListAccounts on
-          # the IngesterLambdaRole (granted below).
-          MONITORED_ACCOUNTS_MODE: discover-org
+          BEDROCK_OPS_LENS_ROLE_NAME: !Ref ReaderRoleName
+          # Restricted deployments start in single-account mode before any
+          # invocation can call Organizations. setup-pipeline.sh can then
+          # select explicit accounts after their reader roles are in place.
+          MONITORED_ACCOUNTS_MODE: !If [ OrganizationsDiscoveryEnabled, discover-org, single ]
           # Region scope for cw_metrics + invocation_logs comes from
           # config.yaml's `monitored_regions` (baked into the Lambda image
           # at build time). We intentionally do NOT set MONITORED_REGIONS_*

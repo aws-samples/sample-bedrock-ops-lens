@@ -25,9 +25,8 @@ deploy_region: us-east-1                                  # [DEPLOY_REGION]
 # from. The default is `discover-org`, which:
 #   - enumerates every ACTIVE account in your AWS Organization (no list to
 #     maintain — works whether you have 1 account or 1,000),
-#   - deploys the cross-account reader role to all of them via a service-
-#     managed CloudFormation StackSet,
-#   - auto-enrolls any account that joins the org later.
+# Role deployment is separate from account discovery. Use the account owners'
+# IAM workflow or setup-pipeline.sh; changing this mode does not create roles.
 #
 # Three modes for customers who need something other than the default:
 #
@@ -39,12 +38,18 @@ deploy_region: us-east-1                                  # [DEPLOY_REGION]
 #   explicit       A fixed list of account IDs. Useful when you only want
 #                  to monitor a subset of your org, or you don't have an
 #                  organization at all (each account must have the
-#                  BedrockOpsLensReader role deployed; setup-pipeline.sh
-#                  --scope accounts --accounts ID,ID handles this).
+#                  BedrockOpsLensReader role deployed). Use
+#                  setup-pipeline.sh --scope accounts --accounts ID,ID
+#                  --skip-rollout when account owners manage those roles.
+#                  Without --skip-rollout, setup uses self-managed StackSets.
+#                  See docs/manual-multi-account-setup.md.
 #
 #   single         Just the central account (where the dashboard runs).
 #                  Simplest single-account deployment, no cross-account
 #                  roles needed.
+# For a Lambda deployment that must not use Organizations, deploy with
+# ENABLE_ORGANIZATIONS_DISCOVERY=false before configuring the explicit list.
+# Lambda environment values take precedence over this file.
 # -----------------------------------------------------------------------------
 monitored_accounts:
   mode: discover-org                                      # [MONITORED_ACCOUNTS_MODE]
@@ -116,6 +121,10 @@ ops_review:
 
 # -----------------------------------------------------------------------------
 # IAM — cross-account reader role.
+# For Lambda deployments, set BEDROCK_OPS_LENS_ROLE_NAME when running deploy.sh
+# to configure the central ReaderRoleName parameter, IAM permission, and runtime
+# together. setup-pipeline.sh reads that parameter. Changing this file alone
+# does not grant permission to assume a differently named target role.
 # -----------------------------------------------------------------------------
 iam:
   reader_role_name: BedrockOpsLensReader                  # [BEDROCK_OPS_LENS_ROLE_NAME]

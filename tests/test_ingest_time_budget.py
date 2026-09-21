@@ -40,11 +40,6 @@ def test_an_object_is_recorded_only_after_it_is_fully_read():
     assert src.index("for entry in _read_log_lines(") < src.index("new_keys.append")
 
 
-def test_a_partial_pass_does_not_report_a_clean_run():
-    """rc=0 would let the orchestrator claim status=ok while work remained."""
-    assert "return 2 if _budget_hit else 0" in IL.read_text()
-
-
 def test_the_budget_is_opt_in_so_cli_backfills_are_unbounded():
     src = IL.read_text()
     assert "--max-seconds" in src

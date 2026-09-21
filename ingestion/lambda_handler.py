@@ -26,6 +26,8 @@ import sys
 import time
 import traceback
 
+from .outcomes import IngestOutcome
+
 
 # ------------------------------------------------------------------ helpers
 def _bump_cache_generation() -> None:
@@ -58,7 +60,13 @@ async def _run_module(name: str, coro_factory) -> dict:
         rc = await coro_factory()
         elapsed = time.monotonic() - t0
         print(f"========== [{name}] done in {elapsed:.1f}s rc={rc} ==========")
-        return {"module": name, "rc": rc, "elapsed_s": round(elapsed, 1)}
+        result = {"module": name, "rc": rc, "elapsed_s": round(elapsed, 1)}
+        # Only the explicit return value marks a resumable stop. Other modules
+        # return plain 2 on failure, and argparse raises SystemExit(2).
+        if rc is IngestOutcome.TIME_BUDGET_EXHAUSTED:
+            result["rc"] = int(rc)
+            result["incomplete_reason"] = "time_budget"
+        return result
     except SystemExit as e:
         # argparse calls sys.exit; treat as failure but don't abort run.
         elapsed = time.monotonic() - t0
@@ -418,10 +426,19 @@ def handler(event, context):
     result = asyncio.run(_orchestrate(only=only, days=days,
                                       logs_budget_s=logs_budget_s))
 
-    # Surface a summary for log-greppability.
-    failed = [r for r in result["runs"] if r.get("rc") not in (0, None)]
-    result["status"] = "ok" if not failed else "partial"
+    # A budget stop is resumable, but does not mean ingestion is complete.
+    # Errors take precedence when a run contains both outcomes.
+    runs = result["runs"]
+    incomplete = [
+        r for r in runs
+        if r.get("rc") == 2 and r.get("incomplete_reason") == "time_budget"
+    ]
+    failed = [r for r in runs if r.get("rc") not in (0, None) and r not in incomplete]
+    result["status"] = (
+        "partial" if failed or not runs else "incomplete" if incomplete else "ok"
+    )
     result["failed_count"] = len(failed)
+    result["incomplete_modules"] = [r["module"] for r in incomplete]
     return result
 
 

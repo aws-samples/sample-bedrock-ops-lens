@@ -71,6 +71,65 @@ export AWS_DEFAULT_REGION="$REGION"
 echo "    account: $ACCOUNT_ID"
 echo "    region:  $REGION  (pinned for this deploy)"
 
+# Organizations discovery policy. Preserve an existing deployment's choice
+# unless explicitly overridden; a redeploy must not re-enable Organizations.
+if [[ -z "${ENABLE_ORGANIZATIONS_DISCOVERY:-}" ]]; then
+    DISCOVERY_STACK_NAME="${STACK_NAME_SUFFIX:+BedrockOpsLens-${STACK_NAME_SUFFIX}}"
+    if [[ -z "$DISCOVERY_STACK_NAME" && -r "$ROOT/.deploy-stack-name" ]]; then
+        DISCOVERY_STACK_NAME="BedrockOpsLens-$(cat "$ROOT/.deploy-stack-name")"
+    fi
+    if [[ -n "$DISCOVERY_STACK_NAME" ]]; then
+        if DISCOVERY_SETTING="$(aws cloudformation describe-stacks \
+            --stack-name "$DISCOVERY_STACK_NAME" --region "$REGION" \
+            --query 'Stacks[0].Parameters[?ParameterKey==`EnableOrganizationsDiscovery`].ParameterValue' \
+            --output text 2>&1)"; then
+            [[ "$DISCOVERY_SETTING" == "None" ]] && DISCOVERY_SETTING=""
+            ENABLE_ORGANIZATIONS_DISCOVERY="$DISCOVERY_SETTING"
+        elif [[ "$DISCOVERY_SETTING" != *"does not exist"* ]]; then
+            echo "ERROR: could not read the existing Organizations discovery setting." >&2
+            echo "       Resolve CloudFormation access or set ENABLE_ORGANIZATIONS_DISCOVERY=true or false explicitly." >&2
+            exit 1
+        fi
+    fi
+fi
+ENABLE_ORGANIZATIONS_DISCOVERY="${ENABLE_ORGANIZATIONS_DISCOVERY:-true}"
+case "$ENABLE_ORGANIZATIONS_DISCOVERY" in
+    true|false) ;;
+    *) echo "ERROR: ENABLE_ORGANIZATIONS_DISCOVERY must be true or false" >&2; exit 2 ;;
+esac
+export ENABLE_ORGANIZATIONS_DISCOVERY
+echo "    Organizations discovery: $ENABLE_ORGANIZATIONS_DISCOVERY"
+
+# Reader role name controls both the central IAM permission and Lambda setting.
+# Preserve the deployed value unless the operator explicitly selects a new name.
+if [[ -z "${BEDROCK_OPS_LENS_ROLE_NAME:-}" ]]; then
+    READER_STACK_NAME="${STACK_NAME_SUFFIX:+BedrockOpsLens-${STACK_NAME_SUFFIX}}"
+    if [[ -z "$READER_STACK_NAME" && -r "$ROOT/.deploy-stack-name" ]]; then
+        READER_STACK_NAME="BedrockOpsLens-$(cat "$ROOT/.deploy-stack-name")"
+    fi
+    if [[ -n "$READER_STACK_NAME" ]]; then
+        if READER_ROLE_SETTING="$(aws cloudformation describe-stacks \
+            --stack-name "$READER_STACK_NAME" --region "$REGION" \
+            --query 'Stacks[0].Parameters[?ParameterKey==`ReaderRoleName`].ParameterValue | [0]' \
+            --output json 2>&1)"; then
+            BEDROCK_OPS_LENS_ROLE_NAME="$(python3 -c \
+                'import json,sys; value=json.loads(sys.argv[1]); print("BedrockOpsLensReader" if value is None else value)' \
+                "$READER_ROLE_SETTING")"
+        elif [[ "$READER_ROLE_SETTING" != *"does not exist"* ]]; then
+            echo "ERROR: could not read the existing ReaderRoleName setting." >&2
+            echo "       Resolve CloudFormation access or explicitly set BEDROCK_OPS_LENS_ROLE_NAME." >&2
+            exit 1
+        fi
+    fi
+fi
+BEDROCK_OPS_LENS_ROLE_NAME="${BEDROCK_OPS_LENS_ROLE_NAME:-BedrockOpsLensReader}"
+if [[ ! "$BEDROCK_OPS_LENS_ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]]; then
+    echo "ERROR: BEDROCK_OPS_LENS_ROLE_NAME must be a valid IAM role name (1-64 characters, no path or wildcards)." >&2
+    exit 2
+fi
+export BEDROCK_OPS_LENS_ROLE_NAME
+echo "    reader role: $BEDROCK_OPS_LENS_ROLE_NAME"
+
 # -----------------------------------------------------------------------------
 # Sign-up email-domain allowlist
 #
@@ -598,6 +657,8 @@ cat > "$PARAMS_JSON" <<EOF
   {"ParameterKey":"ProxyEventsRegions","ParameterValue":"${PROXY_EVENTS_REGIONS:-}"},
   {"ParameterKey":"CognitoDomainPrefix","ParameterValue":"$COGNITO_DOMAIN_PREFIX"},
   {"ParameterKey":"CognitoSelfSignUp","ParameterValue":"$COGNITO_SELF_SIGNUP"},
+  {"ParameterKey":"EnableOrganizationsDiscovery","ParameterValue":"$ENABLE_ORGANIZATIONS_DISCOVERY"},
+  {"ParameterKey":"ReaderRoleName","ParameterValue":"$BEDROCK_OPS_LENS_ROLE_NAME"},
   {"ParameterKey":"StackNamePrefix","ParameterValue":"$MAIN_STACK"},
   {"ParameterKey":"EdgeShaVersionArn","ParameterValue":"$EDGE_SHA_VERSION_ARN"},
   {"ParameterKey":"WebAclArn","ParameterValue":"$WEB_ACL_ARN"}

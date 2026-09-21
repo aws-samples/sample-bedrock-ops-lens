@@ -2,10 +2,10 @@
 # ============================================================================
 # Bedrock Ops Lens — multi-account data pipeline, one-click setup.
 #
-# Wraps `scripts/setup-multi-account.py` (which deploys BedrockOpsLensReader
-# via CloudFormation StackSets) with a verify-and-trigger flow:
+# Configures ingestion using either existing reader roles or reader roles
+# deployed by `scripts/setup-multi-account.py`:
 #
-#   1. Roll out the reader role into the chosen scope.
+#   1. Use existing reader roles (--skip-rollout), or deploy them.
 #   2. Ensure the central ingester Lambda is in `discover-org` mode (or
 #      `explicit` for --scope accounts), so it actually uses the new roles.
 #   3. Trigger one ingest run synchronously and report what landed.
@@ -15,15 +15,17 @@
 #   ./deploy.sh --yes              # central stack: VPC, Aurora, Lambda, SPA
 #   ./setup-pipeline.sh --scope ou --ou-id ou-xxxx-yyyyyyyy   # multi-account
 #   ./setup-pipeline.sh --scope org-root
-#   ./setup-pipeline.sh --scope accounts --accounts 111,222,333
+#   ./setup-pipeline.sh --scope accounts --accounts 111111111111,222222222222
+#   ./setup-pipeline.sh --scope accounts --accounts-file accounts.txt --skip-rollout
 #   ./setup-pipeline.sh --scope single   # dashboard sees only the central acct
 #
-# Idempotent. Re-runnable any time accounts are added or removed from the OU.
-# Tear-down runs through CloudFormation; this script doesn't delete anything.
+# Re-runnable. Removing an explicit account stops future monitoring, but does
+# not delete its reader role or historical data. See docs/multi-account-setup.md.
 # ============================================================================
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
+PIPELINE_CALLER_DIR="$PWD"
 cd "$ROOT"
 
 # ---------------------------------------------------------------------------
@@ -34,8 +36,10 @@ OU_ID=""
 ACCOUNTS=""
 ACCOUNTS_FILE=""
 DELEGATED_ADMIN=""
+SKIP_ROLLOUT=""
 SKIP_INGEST=""
 DRY_RUN=""
+REQUESTED_ROLE_NAME="${BEDROCK_OPS_LENS_ROLE_NAME:-}"
 # Region resolution mirrors deploy.sh: prefer DEPLOY_REGION env var, else
 # config.yaml's deploy_region, else us-east-1. Deliberately ignores
 # AWS_REGION / AWS_DEFAULT_REGION from the shell — they're a footgun (the
@@ -70,22 +74,45 @@ Scopes:
   --scope org-root [--delegated-admin]
         Same as --scope ou but targets every account in the org root.
 
-  --scope accounts --accounts 111,222,333
+  --scope accounts --accounts 111111111111,222222222222
   --scope accounts --accounts-file accounts.txt
-        Self-managed StackSet against an explicit account list. Doesn't
-        require AWS Organizations, but each member account must have the
-        AWSCloudFormationStackSetExecutionRole pre-provisioned.
+        Explicit account list; no AWS Organizations required.
+        Add --skip-rollout to use reader roles created by each account owner,
+        with no StackSets or StackSet administration/execution roles.
+        Otherwise deploy via a self-managed StackSet: each target needs the
+        AWSCloudFormationStackSetExecutionRole pre-provisioned. The central
+        account also needs AWSCloudFormationStackSetAdministrationRole and
+        the operator needs iam:PassRole. See docs/multi-account-setup.md.
 
 Options:
-  --skip-ingest       Skip the post-rollout ingest run.
-  --dry-run           Print what would happen, don't execute.
+  --skip-rollout      Use existing reader roles; accounts scope only.
+                      Does not create, update, or verify target IAM roles.
+  --role-name NAME    Must match ReaderRoleName in the central stack.
+                      If omitted, setup uses the deployed parameter's value.
+  --skip-ingest       Skip the ingest run after configuring the pipeline.
+  --dry-run           Validate inputs and read central configuration; no writes.
 
 Environment:
-  DEPLOY_REGION       Override the deploy region. Defaults to us-east-1.
+  DEPLOY_REGION       Override config.yaml deploy_region (else us-east-1).
   STACK_NAME_SUFFIX   Override the central-stack suffix lookup. Normally
                       read from .deploy-stack-name.
+  BEDROCK_OPS_LENS_ROLE_NAME
+                        Same check as --role-name (the flag takes precedence).
+                        To change the central permission, set this for deploy.sh
+                        first, then deploy matching target reader roles.
+  BEDROCK_OPS_LENS_EXTERNAL_ID
+                        Optional trust condition. If unset, preserve the
+                        ingester's existing value. With --skip-rollout, target
+                        owners must keep their existing trust conditions in sync.
 EOF
-    exit 1
+    exit "${1:-1}"
+}
+
+require_value() {
+    if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+        echo "ERROR: $1 requires a value" >&2
+        exit 2
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -93,14 +120,16 @@ EOF
 # ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --scope)              SCOPE="$2"; shift 2;;
-        --ou-id)              OU_ID="$2"; shift 2;;
-        --accounts)           ACCOUNTS="$2"; shift 2;;
-        --accounts-file)      ACCOUNTS_FILE="$2"; shift 2;;
+        --scope)              require_value "$@"; SCOPE="$2"; shift 2;;
+        --ou-id)              require_value "$@"; OU_ID="$2"; shift 2;;
+        --accounts)           require_value "$@"; ACCOUNTS="$2"; shift 2;;
+        --accounts-file)      require_value "$@"; ACCOUNTS_FILE="$2"; shift 2;;
+        --role-name)          require_value "$@"; REQUESTED_ROLE_NAME="$2"; shift 2;;
         --delegated-admin)    DELEGATED_ADMIN="--delegated-admin"; shift;;
+        --skip-rollout)       SKIP_ROLLOUT=1; shift;;
         --skip-ingest)        SKIP_INGEST=1; shift;;
         --dry-run)            DRY_RUN=1; shift;;
-        -h|--help)            usage;;
+        -h|--help)            usage 0;;
         *)                    echo "ERROR: unknown arg: $1" >&2; usage;;
     esac
 done
@@ -114,13 +143,66 @@ case "$SCOPE" in
     single|ou|org-root|accounts) ;;
     *) echo "ERROR: --scope must be one of: single, ou, org-root, accounts" >&2; exit 1;;
 esac
+if [[ -n "$SKIP_ROLLOUT" && "$SCOPE" != "accounts" ]]; then
+    echo "ERROR: --skip-rollout requires --scope accounts" >&2
+    exit 2
+fi
+if [[ -n "$REQUESTED_ROLE_NAME" && ! "$REQUESTED_ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]]; then
+    echo "ERROR: --role-name / BEDROCK_OPS_LENS_ROLE_NAME must be a valid IAM role name (1-64 characters, no path or wildcards)." >&2
+    exit 2
+fi
+
+# Validate and normalize explicit IDs once, before any AWS call. Both the
+# StackSet and Lambda receive this exact list, including --accounts-file users.
+command -v python3 >/dev/null || { echo "ERROR: python3 not found"; exit 1; }
+python3 -c 'import boto3' >/dev/null 2>&1 || {
+    echo "ERROR: python3 needs boto3. Install it in your Python environment first." >&2
+    exit 1
+}
+PY_ARGS=( "scripts/setup-multi-account.py" "--scope" "$SCOPE" "--region" "$PIPELINE_REGION" )
+case "$SCOPE" in
+    accounts)
+        if [[ -z "$ACCOUNTS" && -z "$ACCOUNTS_FILE" ]]; then
+            echo "ERROR: --scope accounts requires --accounts or --accounts-file" >&2
+            exit 2
+        fi
+        if [[ -n "$ACCOUNTS" && -n "$ACCOUNTS_FILE" ]]; then
+            echo "ERROR: use only one of --accounts and --accounts-file" >&2
+            exit 2
+        fi
+        if [[ -n "$ACCOUNTS_FILE" ]]; then
+            if [[ "$ACCOUNTS_FILE" != /* ]]; then
+                ACCOUNTS_FILE="$PIPELINE_CALLER_DIR/$ACCOUNTS_FILE"
+            fi
+            ACCOUNTS="$(python3 "${PY_ARGS[@]}" --accounts-file "$ACCOUNTS_FILE" --print-account-ids)"
+        else
+            ACCOUNTS="$(python3 "${PY_ARGS[@]}" --accounts "$ACCOUNTS" --print-account-ids)"
+        fi
+        PY_ARGS+=( "--accounts" "$ACCOUNTS" )
+        ;;
+    ou)
+        if [[ -z "$OU_ID" ]]; then echo "ERROR: --scope ou requires --ou-id" >&2; exit 2; fi
+        PY_ARGS+=( "--ou-id" "$OU_ID" )
+        ;;
+esac
+if [[ "$SCOPE" != "accounts" && ( -n "$ACCOUNTS" || -n "$ACCOUNTS_FILE" ) ]]; then
+    echo "ERROR: account-list options require --scope accounts" >&2; exit 2
+fi
+if [[ "$SCOPE" != "ou" && -n "$OU_ID" ]]; then
+    echo "ERROR: --ou-id requires --scope ou" >&2; exit 2
+fi
+if [[ -n "$DELEGATED_ADMIN" ]]; then
+    if [[ "$SCOPE" != "ou" && "$SCOPE" != "org-root" ]]; then
+        echo "ERROR: --delegated-admin requires --scope ou or org-root" >&2; exit 2
+    fi
+    PY_ARGS+=( "$DELEGATED_ADMIN" )
+fi
 
 # ---------------------------------------------------------------------------
 # Pre-flight
 # ---------------------------------------------------------------------------
 echo "[1/4] pre-flight..."
 command -v aws >/dev/null    || { echo "ERROR: aws CLI not found"; exit 1; }
-command -v python3 >/dev/null || { echo "ERROR: python3 not found"; exit 1; }
 
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 echo "    central account: $ACCOUNT_ID"
@@ -142,40 +224,70 @@ INGESTER_FN="${MAIN_STACK}-ingester"
 echo "    central stack:   $MAIN_STACK"
 echo "    ingester:        $INGESTER_FN"
 
-# Confirm the central stack actually exists.
-if ! aws cloudformation describe-stacks --stack-name "$MAIN_STACK" --region "$PIPELINE_REGION" >/dev/null 2>&1; then
+# Confirm the central stack exists and read only its discovery setting.
+if ! STACK_DISCOVERY_SETTING="$(aws cloudformation describe-stacks \
+    --stack-name "$MAIN_STACK" --region "$PIPELINE_REGION" \
+    --query 'Stacks[0].Parameters[?ParameterKey==`EnableOrganizationsDiscovery`].ParameterValue' \
+    --output text 2>/dev/null)"; then
     echo "ERROR: stack $MAIN_STACK not found in $PIPELINE_REGION." >&2
     echo "       Run ./deploy.sh --yes first." >&2
     exit 1
 fi
+if [[ "$STACK_DISCOVERY_SETTING" == "false" && ( "$SCOPE" == "ou" || "$SCOPE" == "org-root" ) ]]; then
+    echo "ERROR: Organizations discovery is disabled on $MAIN_STACK." >&2
+    echo "       Use --scope accounts, or redeploy with ENABLE_ORGANIZATIONS_DISCOVERY=true before selecting an Organizations scope." >&2
+    exit 1
+fi
+if ! PIPELINE_ROLE_NAME="$(aws cloudformation describe-stacks \
+    --stack-name "$MAIN_STACK" --region "$PIPELINE_REGION" \
+    --query 'Stacks[0].Parameters[?ParameterKey==`ReaderRoleName`].ParameterValue | [0]' \
+    --output json 2>/dev/null)"; then
+    echo "ERROR: cannot read ReaderRoleName from $MAIN_STACK; resolve CloudFormation access before setup." >&2
+    exit 1
+fi
+# Older templates granted only this name; an absent parameter is not permission
+# to select a different role based on a Lambda environment override.
+PIPELINE_ROLE_NAME="$(python3 -c \
+    'import json,sys; value=json.loads(sys.argv[1]); print("BedrockOpsLensReader" if value is None else value)' \
+    "$PIPELINE_ROLE_NAME")"
+if [[ ! "$PIPELINE_ROLE_NAME" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]]; then
+    echo "ERROR: the central stack has an invalid ReaderRoleName." >&2
+    exit 2
+fi
+if [[ -n "$REQUESTED_ROLE_NAME" && "$REQUESTED_ROLE_NAME" != "$PIPELINE_ROLE_NAME" ]]; then
+    echo "ERROR: requested reader role $REQUESTED_ROLE_NAME does not match central ReaderRoleName=$PIPELINE_ROLE_NAME." >&2
+    echo "       Redeploy the central stack with BEDROCK_OPS_LENS_ROLE_NAME=$REQUESTED_ROLE_NAME before onboarding that name." >&2
+    exit 2
+fi
 
 # ---------------------------------------------------------------------------
-# Scope-specific arg validation + pretty-print of what we'll run
+# Resolve the actual runtime principal before creating any cross-account trust.
 # ---------------------------------------------------------------------------
-PY_ARGS=( "scripts/setup-multi-account.py" "--scope" "$SCOPE" )
-case "$SCOPE" in
-    ou)
-        if [[ -z "$OU_ID" ]]; then echo "ERROR: --scope ou requires --ou-id" >&2; exit 1; fi
-        PY_ARGS+=( "--ou-id" "$OU_ID" )
-        [[ -n "$DELEGATED_ADMIN" ]] && PY_ARGS+=( "$DELEGATED_ADMIN" )
-        echo "    target OU:       $OU_ID"
-        ;;
-    org-root)
-        [[ -n "$DELEGATED_ADMIN" ]] && PY_ARGS+=( "$DELEGATED_ADMIN" )
-        echo "    target:          entire org root"
-        ;;
-    accounts)
-        if [[ -z "$ACCOUNTS" && -z "$ACCOUNTS_FILE" ]]; then
-            echo "ERROR: --scope accounts requires --accounts or --accounts-file" >&2; exit 1
-        fi
-        if [[ -n "$ACCOUNTS" ]];      then PY_ARGS+=( "--accounts" "$ACCOUNTS" ); fi
-        if [[ -n "$ACCOUNTS_FILE" ]]; then PY_ARGS+=( "--accounts-file" "$ACCOUNTS_FILE" ); fi
-        echo "    target accounts: ${ACCOUNTS:-(from $ACCOUNTS_FILE)}"
-        ;;
-    single)
-        echo "    target:          central account only"
-        ;;
-esac
+umask 077
+PIPELINE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/bedrock-ops-lens-pipeline.XXXXXX")"
+trap 'rm -rf "$PIPELINE_TMP"' EXIT
+aws lambda get-function-configuration \
+    --function-name "$INGESTER_FN" --region "$PIPELINE_REGION" \
+    --output json > "$PIPELINE_TMP/function.json"
+INGESTER_ROLE_ARN="$(python3 - "$PIPELINE_TMP/function.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as stream:
+    config = json.load(stream)
+if config.get("Environment", {}).get("Error"):
+    raise SystemExit("ERROR: cannot read the ingester environment; resolve its access error before setup")
+print(config["Role"])
+PY
+)"
+PIPELINE_EXTERNAL_ID="${BEDROCK_OPS_LENS_EXTERNAL_ID-$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1])).get("Environment", {}).get("Variables", {}).get("BEDROCK_OPS_LENS_EXTERNAL_ID", ""))' \
+    "$PIPELINE_TMP/function.json")}"
+PY_ARGS+=( "--role-name" "$PIPELINE_ROLE_NAME" "--ingester-role-arn" "$INGESTER_ROLE_ARN" "--external-id" "$PIPELINE_EXTERNAL_ID" )
+echo "    runtime role:    $INGESTER_ROLE_ARN"
+echo "    reader role:     $PIPELINE_ROLE_NAME"
+[[ -z "$ACCOUNTS" ]] || echo "    target accounts: $ACCOUNTS"
+[[ -z "$OU_ID" ]] || echo "    target OU:       $OU_ID"
 
 # Decide what MONITORED_ACCOUNTS_MODE we want the ingester to be in.
 # - single       -> single
@@ -190,44 +302,79 @@ esac
 if [[ -n "$DRY_RUN" ]]; then
     echo
     echo "DRY RUN — would run:"
-    echo "    python3 ${PY_ARGS[*]}"
+    if [[ -n "$SKIP_ROLLOUT" ]]; then
+        echo "    Use existing $PIPELINE_ROLE_NAME roles; no StackSet or IAM rollout"
+        echo "    Target owners must already authorize $INGESTER_ROLE_ARN"
+        [[ -z "$PIPELINE_EXTERNAL_ID" ]] || echo "    Supply the configured external ID; existing target trust conditions must match"
+    else
+        echo "    Roll out $PIPELINE_ROLE_NAME (scope=$SCOPE, region=$PIPELINE_REGION)"
+        echo "    Trust only $INGESTER_ROLE_ARN"
+        [[ -z "$PIPELINE_EXTERNAL_ID" ]] || echo "    Require the configured external ID on reader roles and ingester"
+    fi
     echo "    aws lambda update-function-configuration  (mode=$INGEST_MODE)"
     [[ -z "$SKIP_INGEST" ]] && echo "    aws lambda invoke $INGESTER_FN"
     exit 0
 fi
 
 # ---------------------------------------------------------------------------
-# 2/4: Roll out the reader role
+# 2/4: Use existing reader roles, or roll them out
 # ---------------------------------------------------------------------------
 echo
-echo "[2/4] rolling out BedrockOpsLensReader (scope: $SCOPE)..."
-python3 "${PY_ARGS[@]}"
+if [[ -n "$SKIP_ROLLOUT" ]]; then
+    echo "[2/4] using existing $PIPELINE_ROLE_NAME roles (--skip-rollout)."
+    echo "      Target roles and trust policies are managed by their account owners."
+    echo "      Runtime access will be checked by ingestion unless --skip-ingest is set."
+else
+    echo "[2/4] rolling out $PIPELINE_ROLE_NAME (scope: $SCOPE)..."
+    python3 "${PY_ARGS[@]}"
+fi
 
 # ---------------------------------------------------------------------------
 # 3/4: Reconfigure the central ingester so it actually uses the new roles
 # ---------------------------------------------------------------------------
 echo
 echo "[3/4] reconfiguring ingester to mode=$INGEST_MODE..."
-CURRENT_ENV="$(aws lambda get-function-configuration \
+aws lambda get-function-configuration \
     --function-name "$INGESTER_FN" --region "$PIPELINE_REGION" \
-    --query 'Environment.Variables' --output json)"
+    --output json > "$PIPELINE_TMP/function.json"
 
-NEW_ENV="$(echo "$CURRENT_ENV" | python3 -c "
-import json, sys, os
-v = json.load(sys.stdin)
-v['MONITORED_ACCOUNTS_MODE'] = os.environ['INGEST_MODE']
-ids = os.environ.get('INGEST_IDS', '')
-if ids:
-    v['MONITORED_ACCOUNTS_IDS'] = ids
-elif 'MONITORED_ACCOUNTS_IDS' in v:
-    # Drop a stale explicit list when switching to a discovery mode.
-    del v['MONITORED_ACCOUNTS_IDS']
-print(json.dumps({'Variables': v}))
-" )"
-INGEST_MODE="$INGEST_MODE" INGEST_IDS="$INGEST_IDS" \
-    aws lambda update-function-configuration \
+# Use argv, not unexported shell variables. Keep unrelated environment entries,
+# and use RevisionId so a concurrent update cannot be silently overwritten.
+PIPELINE_REVISION="$(python3 - "$PIPELINE_TMP/function.json" \
+    "$PIPELINE_TMP/environment.json" "$INGEST_MODE" "$INGEST_IDS" \
+    "$PIPELINE_EXTERNAL_ID" "$INGESTER_ROLE_ARN" "$PIPELINE_ROLE_NAME" <<'PY'
+import json
+import sys
+
+source, destination, mode, ids, external_id, expected_role, reader_role_name = sys.argv[1:]
+with open(source) as stream:
+    config = json.load(stream)
+if config["Role"] != expected_role:
+    raise SystemExit("ERROR: the ingester role changed during setup; re-run before changing its scope")
+if config.get("Environment", {}).get("Error"):
+    raise SystemExit("ERROR: cannot read the ingester environment; refusing to overwrite it")
+v = dict(config.get("Environment", {}).get("Variables", {}))
+v["MONITORED_ACCOUNTS_MODE"] = mode
+v["BEDROCK_OPS_LENS_ROLE_NAME"] = reader_role_name
+if mode == "explicit":
+    if not ids:
+        raise SystemExit("ERROR: refusing to configure explicit mode without account IDs")
+    v["MONITORED_ACCOUNTS_IDS"] = ids
+else:
+    v.pop("MONITORED_ACCOUNTS_IDS", None)
+if external_id:
+    v["BEDROCK_OPS_LENS_EXTERNAL_ID"] = external_id
+else:
+    v.pop("BEDROCK_OPS_LENS_EXTERNAL_ID", None)
+with open(destination, "w") as stream:
+    json.dump({"Variables": v}, stream)
+print(config["RevisionId"])
+PY
+)"
+aws lambda update-function-configuration \
         --function-name "$INGESTER_FN" \
-        --environment "$NEW_ENV" \
+        --environment "file://$PIPELINE_TMP/environment.json" \
+        --revision-id "$PIPELINE_REVISION" \
         --region "$PIPELINE_REGION" \
         --query 'Environment.Variables.MONITORED_ACCOUNTS_MODE' --output text >/dev/null
 aws lambda wait function-updated --function-name "$INGESTER_FN" --region "$PIPELINE_REGION"
@@ -238,23 +385,23 @@ echo "    ingester reconfigured."
 # ---------------------------------------------------------------------------
 if [[ -n "$SKIP_INGEST" ]]; then
     echo
-    echo "[4/4] --skip-ingest set; data will populate on the daily 05:00 UTC schedule."
+    echo "[4/4] Pipeline configured. --skip-ingest set; ingestion has not been verified."
+    echo "      The existing EventBridge schedule will run ingestion."
     exit 0
 fi
 
 echo
 echo "[4/4] running first ingest..."
-INGEST_OUT="$(mktemp -t bol-pipe.XXXXXX.json)"
-trap 'rm -f "$INGEST_OUT"' EXIT
+INGEST_OUT="$PIPELINE_TMP/ingest.json"
 
 START="$(date +%s)"
 set +e
-aws lambda invoke \
+AWS_MAX_ATTEMPTS=1 aws lambda invoke \
     --function-name "$INGESTER_FN" \
     --invocation-type RequestResponse \
-    --cli-read-timeout 900 \
+    --cli-read-timeout 910 \
     --region "$PIPELINE_REGION" \
-    "$INGEST_OUT" >/dev/null 2>&1
+    "$INGEST_OUT" > "$PIPELINE_TMP/invoke.json"
 RC=$?
 set -e
 END="$(date +%s)"
@@ -266,17 +413,58 @@ if [[ $RC -ne 0 ]]; then
     exit 1
 fi
 
-if command -v jq >/dev/null 2>&1; then
-    jq . "$INGEST_OUT"
-else
-    cat "$INGEST_OUT"; echo
+if ! python3 - "$PIPELINE_TMP/invoke.json" "$INGEST_OUT" \
+    "$PIPELINE_TMP/ingest-status.txt" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1]) as stream:
+        invocation = json.load(stream)
+    with open(sys.argv[2]) as stream:
+        result = json.load(stream)
+    print(json.dumps(result, indent=2))
+    if invocation.get("StatusCode") != 200 or invocation.get("FunctionError"):
+        raise ValueError("Lambda invocation returned a function error")
+    runs = result.get("runs", [])
+    # Plain rc=2 is an error (including argparse failures and empty account
+    # discovery). A resumable budget stop must carry the runner's explicit mark.
+    incomplete = [
+        run for run in runs
+        if run.get("rc") == 2 and run.get("incomplete_reason") == "time_budget"
+    ]
+    expected_status = "incomplete" if incomplete else "ok"
+    if (result.get("status") != expected_status or result.get("failed_count") != 0
+            or not runs
+            or any(run.get("rc") not in (0, None) and run not in incomplete for run in runs)):
+        raise ValueError("ingestion did not complete successfully in every reported module")
+    if incomplete:
+        print("NOTE: ingestion reached its time budget; data coverage is incomplete for: "
+              + ", ".join(str(run.get("module")) for run in incomplete))
+        print("      Completed log objects are recorded. Re-run the ingester or wait "
+              "for the existing schedule to resume the remaining work.")
+    with open(sys.argv[3], "w") as stream:
+        stream.write(expected_status + "\n")
+except (OSError, ValueError, TypeError, AttributeError) as error:
+    raise SystemExit(f"ERROR: {error}")
+PY
+then
+    echo "    Inspect ingestion logs before relying on data coverage:" >&2
+    echo "      aws logs tail /aws/lambda/$INGESTER_FN --since 30m --region $PIPELINE_REGION" >&2
+    exit 1
 fi
 
 echo
 echo "============================================================================"
-echo "✅ PIPELINE READY"
+IFS= read -r INGEST_STATUS < "$PIPELINE_TMP/ingest-status.txt"
+if [[ "$INGEST_STATUS" == "incomplete" ]]; then
+    echo "⏳ PIPELINE CONFIGURED — ingestion incomplete; remaining log objects can resume"
+else
+    echo "✅ PIPELINE CONFIGURED — ingestion modules completed successfully"
+fi
 echo "   Mode:     $INGEST_MODE"
 echo "   Run took: $DURATION"
-echo "   Daily:    EventBridge fires the ingester at 05:00 UTC every day."
-echo "   Manual:   ./setup-pipeline.sh --scope $SCOPE  (re-run any time)"
+echo "   Schedule: Uses the existing EventBridge ingestion schedule."
+echo "   Verify:   Check the expected accounts and Regions in Settings and the logs."
+echo "   Re-run:   Use the same setup command, including its account or OU arguments."
 echo "============================================================================"

@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Ops Lens self-managed StackSets prerequisite in the central account.
+  Deploy once using central-account administrator credentials. Reuse an existing
+  administration role instead of deploying a second owner for the same IAM name.
+
+Parameters:
+  ExecutionRoleArns:
+    Type: CommaDelimitedList
+    AllowedPattern: '^arn:[a-z0-9-]+:iam::[0-9]{12}:role/AWSCloudFormationStackSetExecutionRole$'
+    Description: >
+      Exact execution-role ARNs in the accounts this administration role may
+      deploy to. Update this list before adding another target account.
+  CloudFormationServicePrincipals:
+    Type: CommaDelimitedList
+    Default: cloudformation.amazonaws.com
+    Description: >
+      CloudFormation service principals. For a Region disabled by default,
+      also include its regional principal as described in the AWS StackSets
+      prerequisites documentation.
+
+Resources:
+  AdministrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSCloudFormationStackSetAdministrationRole
+      Description: Deploy the Bedrock Ops Lens reader role to approved accounts.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Ref CloudFormationServicePrincipals
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stackset/*'
+      Policies:
+        - PolicyName: AssumeApprovedStackSetExecutionRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Ref ExecutionRoleArns
+
+Outputs:
+  AdministrationRoleArn:
+    Value: !GetAtt AdministrationRole.Arn

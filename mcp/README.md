@@ -1,5 +1,7 @@
 # Bedrock Ops Lens — MCP
 
+[Project home](../README.md) · [Dashboard deployment](../docs/deployment.md)
+
 A Model Context Protocol server that exposes the same Bedrock observability insights as the dashboard, but inside your IDE. Claude Code, Cursor, Kiro (CLI or IDE), or anything that speaks MCP.
 
 The MCP **does not duplicate any backend code**. It's a thin client that auto-detects whether the deployed dashboard is reachable and dispatches every tool through the right backend:
@@ -32,7 +34,8 @@ Every tool is registered in both modes — same name, same args, same response s
 
 ## Install
 
-The MCP installs a `bedrock-lens-mcp` command on your `$PATH`. Pick one:
+Use Python 3.11 or newer. The MCP installs a `bedrock-lens-mcp` command on your
+`$PATH`. From the repository root, enter `mcp/` and choose one installation method:
 
 ```bash
 cd mcp
@@ -61,20 +64,28 @@ claude mcp add bedrock-lens-mcp -- bedrock-lens-mcp
 Tier B/C — SigV4 (recommended, no password):
 
 ```bash
-# Get the Function URL from your CFN stack
-FN_URL=$(aws cloudformation describe-stacks --stack-name BedrockOpsLens-<suffix> \
-  --query 'Stacks[0].Outputs[?OutputKey==`BackendLambdaUrl`].OutputValue' --output text)
+# Replace the stack name and Region with your deployed values.
+LENS_STACK_NAME=BedrockOpsLens-example
+LENS_REGION=us-east-1
+FN_URL="$(aws cloudformation describe-stacks \
+  --profile lens-central --region "$LENS_REGION" \
+  --stack-name "$LENS_STACK_NAME" \
+  --query 'Stacks[0].Outputs[?OutputKey==`BackendLambdaUrl`].OutputValue' --output text)"
 
 claude mcp add bedrock-lens-mcp \
+  --env AWS_PROFILE=lens-central \
   --env BEDROCK_LENS_FUNCTION_URL="$FN_URL" \
   -- bedrock-lens-mcp
 ```
 
 Tier B/C — Cognito password (only if you need to share it with someone who has no AWS access):
 
+Set `BEDROCK_LENS_PASSWORD` in your local environment and replace the URL and
+email below. Do not commit credentials.
+
 ```bash
 claude mcp add bedrock-lens-mcp \
-  --env BEDROCK_LENS_API=https://<your-distribution>.cloudfront.net \
+  --env BEDROCK_LENS_API="https://<your-distribution>.cloudfront.net" \
   --env BEDROCK_LENS_USER=you@yourdomain.com \
   --env BEDROCK_LENS_PASSWORD="$BEDROCK_LENS_PASSWORD" \
   -- bedrock-lens-mcp
@@ -108,6 +119,14 @@ In your IDE, ask: *"Run the bedrock-lens health check."*
 The MCP responds with which mode it picked and where it's connected.
 
 Then ask: *"What was our Bedrock spend last 30 days?"* — the LLM picks `cost_summary(days=30)`, calls it, and you'll see real `$`.
+
+Other examples:
+
+- "Which day had the biggest jump in Bedrock spend?"
+- "Are we using models that are Legacy or about to reach end of life?"
+- "Run an ops review of the last 14 days and summarize the top three issues."
+
+Tools that require the hosted backend explain their limitations in direct mode.
 
 ## Auth notes (Tier B/C)
 

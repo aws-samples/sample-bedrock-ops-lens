@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Ops Lens self-managed StackSets prerequisite in each target account.
+  Its administrator must deploy this before central setup can create the reader
+  role. IAM changes are restricted to the named reader role and read policy.
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+    Description: Account containing AWSCloudFormationStackSetAdministrationRole.
+  ReaderRoleName:
+    Type: String
+    Default: BedrockOpsLensReader
+    AllowedPattern: '^[A-Za-z0-9+=,.@_-]{1,64}$'
+    Description: Reader role the execution role is allowed to create and manage.
+
+Resources:
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSCloudFormationStackSetExecutionRole
+      Description: CloudFormation deployment permissions for the Lens reader role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${CentralAccountId}:role/AWSCloudFormationStackSetAdministrationRole'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeployLensReader
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # StackSets needs CloudFormation stack lifecycle permissions in
+              # the target. The resource permissions below limit IAM changes.
+              - Sid: StackLifecycle
+                Effect: Allow
+                Action: cloudformation:*
+                Resource: '*'
+              - Sid: ReaderRoleLifecycle
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:GetRole
+                  - iam:UpdateRole
+                  - iam:UpdateRoleDescription
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:ListInstanceProfilesForRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRoleTags
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${ReaderRoleName}'
+              - Sid: ReaderPolicyLifecycle
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:SetDefaultPolicyVersion
+                  - iam:DeletePolicy
+                  - iam:ListEntitiesForPolicy
+                  - iam:TagPolicy
+                  - iam:UntagPolicy
+                  - iam:ListPolicyTags
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${ReaderRoleName}-Read'
+
+Outputs:
+  ExecutionRoleArn:
+    Value: !GetAtt ExecutionRole.Arn

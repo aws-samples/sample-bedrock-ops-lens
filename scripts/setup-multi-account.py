@@ -16,13 +16,15 @@ on `--scope`:
     --scope accounts      Self-managed StackSet against an explicit account
                           list. No Organizations required, but each member
                           account must have the `AWSCloudFormationStackSetExecutionRole`
-                          pre-provisioned (a one-time AWS-doc setup; not
-                          something we automate per-account).
+                          pre-provisioned, along with the administration
+                          role in the central account. See
+                          docs/multi-account-setup.md for both trust chains.
 
 All four scopes use the same role template (`infra/monitored-account-role.yaml`).
 
-Idempotent: re-runnable without side effects. The script reads the central
-account ID via STS, doesn't take it as input.
+Re-running updates existing roles and adds missing stack instances. Removing
+an account from the list does not delete its role. The script reads the central
+account ID via STS, rather than taking it as input.
 
 Run from the central account:
     python scripts/setup-multi-account.py --scope ou --ou-id ou-xxxx-yyyyyyyy
@@ -35,12 +37,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
 import boto3
-from botocore.exceptions import ClientError, WaiterError
+from botocore.exceptions import ClientError
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -78,15 +81,49 @@ def template_body() -> str:
     return ROLE_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
+def account_ids(accounts: str | None, accounts_file: str | None) -> list[str]:
+    """Resolve one explicit source; never silently discard invalid targets."""
+    if (accounts is not None) == (accounts_file is not None):
+        raise ValueError("provide exactly one of --accounts or --accounts-file")
+    if accounts_file is not None:
+        values = [
+            line.strip()
+            for line in Path(accounts_file).read_text(encoding="utf-8-sig").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    else:
+        values = [value.strip() for value in accounts.split(",")]
+    if not values or any(not re.fullmatch(r"[0-9]{12}", value) for value in values):
+        raise ValueError(
+            "every account ID must contain exactly 12 digits; "
+            "use comma-separated IDs or a file with one ID per line"
+        )
+    return sorted(set(values))
+
+
 def parameters(central_account_id: str, role_name: str,
-                external_id: str | None) -> list[dict]:
+               external_id: str | None,
+               ingester_role_arn: str | None = None) -> list[dict]:
     out = [
         {"ParameterKey": "CentralAccountId", "ParameterValue": central_account_id},
         {"ParameterKey": "RoleName", "ParameterValue": role_name},
+        {"ParameterKey": "ExternalId", "ParameterValue": external_id or ""},
+        {"ParameterKey": "CentralIngesterRoleArn",
+         "ParameterValue": ingester_role_arn or ""},
     ]
-    if external_id:
-        out.append({"ParameterKey": "ExternalId", "ParameterValue": external_id})
     return out
+
+
+def stackset_summaries(cfn, method: str, **kwargs) -> list[dict]:
+    """Read every page; a failure or missing account may be on the last page."""
+    rows = []
+    while True:
+        page = getattr(cfn, method)(**kwargs)
+        rows.extend(page.get("Summaries", []))
+        token = page.get("NextToken")
+        if not token:
+            return rows
+        kwargs["NextToken"] = token
 
 
 def wait_for_stackset_operation(cfn, stack_set_name: str,
@@ -111,32 +148,29 @@ def wait_for_stackset_operation(cfn, stack_set_name: str,
         if status != last_status:
             print(f"    operation {operation_id[:8]}...  status={status}")
             last_status = status
-        if status == "SUCCEEDED":
-            return
-        if status in ("FAILED", "STOPPED"):
-            # Surface per-account details so the operator knows what to fix.
-            try:
-                results = cfn.list_stack_set_operation_results(
-                    StackSetName=stack_set_name,
-                    OperationId=operation_id,
-                    **({"CallAs": call_as} if call_as else {}),
-                )["Summaries"]
-            except ClientError:
-                results = []
-            failed = [r for r in results if r.get("Status") == "FAILED"]
+        if status in ("SUCCEEDED", "FAILED", "STOPPED"):
+            # SUCCEEDED can include failed accounts within the failure tolerance.
+            # Do not configure ingestion until every reported target succeeded.
+            results = stackset_summaries(
+                cfn, "list_stack_set_operation_results", **kwargs
+            )
+            failed = [r for r in results if r.get("Status") != "SUCCEEDED"]
             if failed:
                 print()
                 print("  Per-account failures:")
                 for r in failed[:10]:
                     reason = (r.get("StatusReason") or "").strip()
-                    print(f"    - {r['Account']}: {reason[:200]}")
+                    print(f"    - {r['Account']}/{r.get('Region', '?')}: "
+                          f"{r.get('Status')} {reason[:200]}")
                 if "already exists" in " ".join(r.get("StatusReason", "") for r in failed):
                     print()
-                    print("  Hint: at least one account already has the role from a "
-                          "prior StackSet. Delete the conflicting StackSet first "
-                          "or use --role-name to choose a non-conflicting name.")
+                    print("  Hint: inspect the existing role's CloudFormation owner "
+                          "before changing it. See docs/multi-account-setup.md.")
+            if status == "SUCCEEDED" and not failed:
+                return
             raise RuntimeError(
-                f"StackSet operation {operation_id} ended in status {status}"
+                f"StackSet operation {operation_id} ended in status {status}; "
+                f"{len(failed)} account result(s) did not succeed"
             )
         # Polling delay between StackSet operation status checks. Not a
         # leftover debug sleep; this is the documented pattern for waiting
@@ -175,7 +209,8 @@ def scope_single(args, central_account_id: str) -> None:
         "StackName": stack_name,
         "TemplateBody": template_body(),
         "Capabilities": ["CAPABILITY_NAMED_IAM"],
-        "Parameters": parameters(central_account_id, args.role_name, args.external_id),
+        "Parameters": parameters(central_account_id, args.role_name, args.external_id,
+                                 args.ingester_role_arn),
     }
     try:
         getattr(cfn, verb)(**kwargs)
@@ -234,7 +269,8 @@ def scope_org(args, central_account_id: str) -> None:
         StackSetName=stack_set_name,
         TemplateBody=template,
         Capabilities=["CAPABILITY_NAMED_IAM"],
-        Parameters=parameters(central_account_id, args.role_name, args.external_id),
+        Parameters=parameters(central_account_id, args.role_name, args.external_id,
+                              args.ingester_role_arn),
         PermissionModel="SERVICE_MANAGED",
         AutoDeployment={"Enabled": True, "RetainStacksOnAccountRemoval": False},
         CallAs=call_as,
@@ -287,14 +323,18 @@ def scope_org(args, central_account_id: str) -> None:
         if "StackInstanceNotFoundException" in msg or "already exists" in msg:
             print("  (some instances already present; that's fine)")
         elif "OperationInProgressException" in msg:
-            print("  (an operation is already running; let it finish, then re-run)")
-            return
+            raise RuntimeError(
+                "A StackSet operation is already running. Wait for it to finish, "
+                "then re-run setup; ingestion has not been reconfigured."
+            ) from e
         else:
             raise
 
     # 3. summary ----------------------------------------------------------------
-    summary = cfn.list_stack_instances(StackSetName=stack_set_name, CallAs=call_as)
-    print(f"  ✓ StackSet has {len(summary.get('Summaries', []))} stack instances")
+    summary = stackset_summaries(
+        cfn, "list_stack_instances", StackSetName=stack_set_name, CallAs=call_as
+    )
+    print(f"  ✓ StackSet has {len(summary)} stack instances")
 
 
 # ---------------------------------------------------------------------------
@@ -308,19 +348,11 @@ def scope_accounts(args, central_account_id: str) -> None:
       - Each member account: AWSCloudFormationStackSetExecutionRole exists,
         trusting the central admin role.
 
-    The script doesn't auto-create those roles (they're org-foundation IAM
-    you'd want your central platform team to manage). It checks for them
-    and prints the AWS-doc snippet if missing.
+    The script checks the central role exists. CloudFormation checks the target
+    execution roles during rollout; the caller need not assume them directly.
+    Bootstrap instructions and templates are in docs/multi-account-setup.md.
     """
-    accounts = sorted({a.strip() for a in (args.accounts or "").split(",") if a.strip()})
-    if args.accounts_file:
-        accounts = sorted({
-            line.strip() for line in Path(args.accounts_file).read_text().splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        })
-    accounts = [a for a in accounts if a.isdigit() and len(a) == 12]
-    if not accounts:
-        sys.exit("--scope accounts requires --accounts CSV or --accounts-file <path>")
+    accounts = account_ids(args.accounts, args.accounts_file)
 
     print(f"[scope=accounts]  central={central_account_id}  "
           f"members={len(accounts)}  region={args.region}")
@@ -328,14 +360,16 @@ def scope_accounts(args, central_account_id: str) -> None:
     iam = boto3.client("iam")
     admin_role_name = "AWSCloudFormationStackSetAdministrationRole"
     try:
-        iam.get_role(RoleName=admin_role_name)
+        admin_role = iam.get_role(RoleName=admin_role_name)["Role"]
     except ClientError as e:
         if e.response["Error"]["Code"] == "NoSuchEntity":
             sys.exit(
                 f"Missing IAM role '{admin_role_name}' in central account "
                 f"{central_account_id}.\n\n"
                 "This is a one-time AWS-StackSets pre-requisite for self-managed "
-                "deployments. Create it via the CFN template at:\n"
+                "deployments. See docs/multi-account-setup.md for the included "
+                "bootstrap templates and the operator's iam:PassRole permission.\n"
+                "AWS reference:\n"
                 "  https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/"
                 "stacksets-prereqs-self-managed.html\n\n"
                 "Each member account also needs "
@@ -351,16 +385,20 @@ def scope_accounts(args, central_account_id: str) -> None:
         StackSetName=stack_set_name,
         TemplateBody=template_body(),
         Capabilities=["CAPABILITY_NAMED_IAM"],
-        Parameters=parameters(central_account_id, args.role_name, args.external_id),
+        Parameters=parameters(central_account_id, args.role_name, args.external_id,
+                              args.ingester_role_arn),
         PermissionModel="SELF_MANAGED",
-        AdministrationRoleARN=(
-            f"arn:aws:iam::{central_account_id}:role/{admin_role_name}"
-        ),
+        AdministrationRoleARN=admin_role["Arn"],
         ExecutionRoleName="AWSCloudFormationStackSetExecutionRole",
     )
 
     try:
-        cfn.describe_stack_set(StackSetName=stack_set_name)
+        existing = cfn.describe_stack_set(StackSetName=stack_set_name)["StackSet"]
+        if existing.get("PermissionModel") != "SELF_MANAGED":
+            raise ValueError(
+                f"{stack_set_name} is not SELF_MANAGED. Use a separate StackSet "
+                "name for a different permission model; do not replace it implicitly."
+            )
         exists = True
     except ClientError as e:
         if "StackSetNotFoundException" in str(e):
@@ -382,32 +420,43 @@ def scope_accounts(args, central_account_id: str) -> None:
         print(f"  creating StackSet {stack_set_name}…")
         cfn.create_stack_set(**common)
 
-    print(f"  attaching stack instances to {len(accounts)} accounts in {args.region}…")
-    try:
+    summaries = stackset_summaries(
+        cfn, "list_stack_instances", StackSetName=stack_set_name
+    )
+    present = {r["Account"] for r in summaries if r["Region"] == args.region}
+    missing = sorted(set(accounts) - present)
+    if missing:
+        print(f"  attaching stack instances to {len(missing)} new accounts "
+              f"in {args.region}…")
         resp = cfn.create_stack_instances(
             StackSetName=stack_set_name,
-            Accounts=accounts,
+            Accounts=missing,
             Regions=[args.region],
             OperationPreferences={
                 "FailureToleranceCount": args.failure_tolerance,
-                "MaxConcurrentCount": 10,
+                "MaxConcurrentCount": min(10, args.failure_tolerance + 1),
             },
         )
         wait_for_stackset_operation(
             cfn, stack_set_name, None, resp["OperationId"], max_minutes=60
         )
-    except ClientError as e:
-        msg = str(e)
-        if "already exists" in msg:
-            print("  (instances already present; updating any drifted ones)")
-        elif "OperationInProgressException" in msg:
-            print("  (an operation is already running; let it finish, then re-run)")
-            return
-        else:
-            raise
-
-    summary = cfn.list_stack_instances(StackSetName=stack_set_name)
-    print(f"  ✓ StackSet has {len(summary.get('Summaries', []))} stack instances")
+    summaries = stackset_summaries(
+        cfn, "list_stack_instances", StackSetName=stack_set_name
+    )
+    current = {
+        r["Account"] for r in summaries
+        if r["Region"] == args.region and r.get("Status") == "CURRENT"
+        and r.get("StackInstanceStatus", {}).get("DetailedStatus", "SUCCEEDED")
+        == "SUCCEEDED"
+    }
+    incomplete = sorted(set(accounts) - current)
+    if incomplete:
+        raise RuntimeError(
+            "Reader-role rollout is incomplete for account(s): "
+            + ", ".join(incomplete)
+            + ". Inspect the StackSet instance status before retrying."
+        )
+    print(f"  ✓ All {len(accounts)} requested accounts have current stack instances")
 
 
 # ---------------------------------------------------------------------------
@@ -442,11 +491,23 @@ def main() -> int:
     )
     p.add_argument(
         "--role-name", default=DEFAULT_ROLE_NAME,
-        help=f"IAM role name to deploy. Default: {DEFAULT_ROLE_NAME}.",
+        help=f"IAM role name to deploy. Default: {DEFAULT_ROLE_NAME}. Must match "
+             "ReaderRoleName in the central Lambda stack; this command does not "
+             "change the central IAM policy or runtime configuration.",
     )
     p.add_argument(
         "--external-id", default=os.environ.get("BEDROCK_OPS_LENS_EXTERNAL_ID", ""),
         help="Optional external ID for the trust policy.",
+    )
+    p.add_argument(
+        "--ingester-role-arn", default=None,
+        help="Trust only this central ingester IAM role. setup-pipeline.sh obtains "
+             "it from the deployed Lambda. Omitting it retains account-level trust.",
+    )
+    p.add_argument(
+        "--print-account-ids", action="store_true",
+        help="Validate an explicit account source, print canonical CSV, and exit "
+             "without calling AWS.",
     )
     p.add_argument(
         "--stack-name", default=None,
@@ -462,13 +523,41 @@ def main() -> int:
              "account that has been registered as a StackSets delegated administrator.",
     )
     p.add_argument(
-        "--failure-tolerance", type=int, default=2,
-        help="StackSets FailureToleranceCount. Default 2.",
+        "--failure-tolerance", type=int, default=0,
+        help="StackSets FailureToleranceCount. Default 0. Any failed account "
+             "still makes this setup command fail.",
     )
     args = p.parse_args()
 
+    if not re.fullmatch(r"[A-Za-z0-9+=,.@_-]{1,64}", args.role_name):
+        p.error("--role-name must be a valid IAM role name (1-64 characters, no path or wildcards)")
+    if args.failure_tolerance < 0:
+        p.error("--failure-tolerance must be nonnegative")
+    if args.scope == "accounts":
+        try:
+            resolved = account_ids(args.accounts, args.accounts_file)
+        except (ValueError, OSError) as e:
+            p.error(str(e))
+        if args.print_account_ids:
+            print(",".join(resolved))
+            return 0
+        # Freeze the input once so the same validated targets are used throughout.
+        args.accounts, args.accounts_file = ",".join(resolved), None
+    elif args.print_account_ids:
+        p.error("--print-account-ids requires --scope accounts")
+
     me = caller_identity()
     central_account_id = me["Account"]
+    if args.ingester_role_arn:
+        if not re.fullmatch(
+            rf"arn:[a-z0-9-]+:iam::{central_account_id}:role/[\w+=,.@/-]+",
+            args.ingester_role_arn,
+        ):
+            p.error("--ingester-role-arn must name an IAM role in the central account")
+    else:
+        print("NOTE: reader roles will trust the central account; principals there "
+              "also need sts:AssumeRole permission. Use --ingester-role-arn to "
+              "restrict trust to the ingester.")
     print(f"Caller: {me['Arn']}")
 
     if args.scope == "single":
@@ -482,6 +571,9 @@ def main() -> int:
 
     print()
     print("Next steps:")
+    print(f"  Ensure the central stack's ReaderRoleName is {args.role_name!r}.")
+    print("  For Lambda deployments, setup-pipeline.sh uses that parameter for both")
+    print("  rollout and ingestion; deploy.sh changes it via BEDROCK_OPS_LENS_ROLE_NAME.")
     print(f"  Update the central ingester to use mode='discover-org' or 'explicit'")
     print(f"  with the relevant account list. Then trigger:")
     print(
