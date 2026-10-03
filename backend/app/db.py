@@ -17,6 +17,9 @@ async def init_pool() -> None:
             min_size=settings.db_pool_min,
             max_size=settings.db_pool_max,
             command_timeout=30,
+            # Reporting views resolve AIP identifiers; ingesters use public
+            # tables so replay keys and original profile attribution are stable.
+            server_settings={"search_path": "lens_read,public"},
         )
 
 

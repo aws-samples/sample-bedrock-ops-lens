@@ -416,6 +416,7 @@ async def attribution_quota(
     rows = db.rows_to_dicts(await db.fetch(
         f"""
         SELECT dim_value, modelId, endpoint, region, accountId,
+          BOOL_OR(has_application_profile) AS has_application_profile,
           SUM(input_tokens)::BIGINT  AS input_tokens,
           SUM(output_tokens)::BIGINT AS output_tokens
         FROM f_proxy_dim_hourly

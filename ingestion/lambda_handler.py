@@ -213,6 +213,13 @@ async def _orchestrate(only: list[str] | None, days: int,
              "--regions", proxy_regions]
         ))
 
+    # Resolve profiles after telemetry lands, so Get can fill newly observed
+    # IDs missing from List. Lookup failure leaves usage and cached mappings intact.
+    schedule.append((
+        "inference_profiles", "ingestion.inference_profiles",
+        ["inference_profiles", "--db-url", db_url, "--days", str(days)]
+    ))
+
     # quotas LAST: slowest module at org/multi-region scale (Service Quotas
     # API rate-limits). Appended after invocation_logs so a long/timed-out
     # quotas pass can never starve the primary-data modules above. A partial

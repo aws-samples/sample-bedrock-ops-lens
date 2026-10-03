@@ -97,8 +97,7 @@ Resources:
               - servicequotas:ListAWSDefaultServiceQuotas
               - servicequotas:ListServices
             Resource: '*'
-          # Bedrock — read-only, only for the invocation-logging-config check
-          # (so the dashboard can tell the operator whether logging is on).
+          # Bedrock — logging configuration, model lifecycle, and profile lookup.
           - Sid: BedrockReadOnly
             Effect: Allow
             Action:
@@ -106,6 +105,7 @@ Resources:
               - bedrock:ListFoundationModels
               - bedrock:GetFoundationModel
               - bedrock:ListInferenceProfiles
+              - bedrock:GetInferenceProfile
             Resource: '*'
           # Account name — lets the dashboard label this account with its
           # friendly name instead of the bare 12-digit ID. Self-scoped

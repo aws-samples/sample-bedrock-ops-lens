@@ -88,6 +88,7 @@ class QuotaResolution:
     # that has no published quota in this account+region. The limit is unknown;
     # another family's limit is deliberately not substituted.
     family_missing: bool = False
+    routing_unknown: bool = False
 
     @property
     def known(self) -> bool:
@@ -108,6 +109,7 @@ class QuotaResolution:
             "quota_family": self.family,
             "quota_code": self.quota_code,
             "quota_ambiguous": self.ambiguous,
+            "quota_routing_unknown": self.routing_unknown,
             "quota_candidate_families": [
                 {"family": c.family, "limit_per_minute": c.value}
                 for c in sorted(self.candidates, key=lambda c: c.value)
@@ -126,7 +128,8 @@ def resolve_quota(rows,
                   model_id: str,
                   metric: str = "TPM",
                   family_hint: str | None = None,
-                  matcher=None) -> QuotaResolution:
+                  matcher=None,
+                  routing_unknown: bool = False) -> QuotaResolution:
     """Resolve the applicable per-minute quota from pre-fetched f_quotas rows.
 
     `rows` are dicts with accountid/accountId, region, model_name, metric,
@@ -186,6 +189,11 @@ def resolve_quota(rows,
             prev.collides = True
 
     candidates = list(by_family.values())
+    if routing_unknown:
+        # AIP APIs expose regional foundation models, not modelSource.copyFrom.
+        # A resolved bare model ID must not silently become an on-demand hint.
+        return QuotaResolution(candidates=candidates, ambiguous=True,
+                               routing_unknown=True)
     if not candidates:
         return QuotaResolution()
 

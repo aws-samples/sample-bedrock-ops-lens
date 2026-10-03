@@ -181,6 +181,7 @@ async def quota_drilldown(
         """
         SELECT
           (event_date::timestamp + (hour || ' hours')::interval) AS ts,
+          has_application_profile,
           total_requests::float / 60.0                            AS rpm,
           -- Quota-accurate TPM. AWS's own EstimatedTPMQuotaUsage is preferred
           -- when the hour has one: AWS computes it with the real, current policy
@@ -250,10 +251,13 @@ async def quota_drilldown(
     # resolver returned 50K and 160% for the same Mistral 24.07 input. Letting it
     # use its ranked default keeps the two paths in agreement.
     family_hint = family_hint_from_model_id(model_id)
+    routing_unknown = any(r.get("has_application_profile", False) for r in rows)
     tpm_res = resolve_quota(quota_rows, account_id, region, model_id,
-                            metric="TPM", family_hint=family_hint)
+                            metric="TPM", family_hint=family_hint,
+                            routing_unknown=routing_unknown)
     rpm_res = resolve_quota(quota_rows, account_id, region, model_id,
-                            metric="RPM", family_hint=family_hint)
+                            metric="RPM", family_hint=family_hint,
+                            routing_unknown=routing_unknown)
     tpm_limit, rpm_limit = tpm_res.value, rpm_res.value
     # Surface the traffic family that actually matched. If TPM and RPM disagree,
     # prefer TPM's — that's what oncalls look at first.

@@ -168,7 +168,7 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
     # (CacheRead excluded). total_input_tokens = InputTokenCount; add cache-write.
     rows = await db.fetch(
         f"""
-        SELECT accountId, modelId, region, event_date,
+        SELECT accountId, modelId, region, event_date, has_application_profile,
           total_requests,
           (total_input_tokens + COALESCE(total_cache_write_input_tokens, 0)) AS input_quota_tokens,
           total_output_tokens,
@@ -200,6 +200,7 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
                 "accountId": key[0], "modelId": mid, "region": key[2],
                 "burndown_rate": rate,
                 "peak_requests_hour": 0,
+                "has_application_profile": False,
                 "peak_input_tpm": 0,    # InputTokenCount + CacheWriteInputTokens
                 "peak_output_tpm": 0,   # raw output, 1:1
                 "peak_quota_tpm": 0,    # native metric, else doc formula
@@ -210,6 +211,7 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
                 "quota_tpm_source": "unavailable",
                 "_sources": set(),
             }
+        a["has_application_profile"] |= bool(r.get("has_application_profile", False))
         rate = a["burndown_rate"]
         req = int(r["total_requests"] or 0)
         out = int(r["total_output_tokens"] or 0)
@@ -314,7 +316,7 @@ async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
     # write. This block is Claude-only (see LIKE filter) on bedrock-runtime.
     hourly = await db.fetch(
         f"""
-        SELECT h.accountId, h.modelId, h.region, h.event_date,
+        SELECT h.accountId, h.modelId, h.region, h.event_date, h.has_application_profile,
           (h.total_input_tokens + COALESCE(h.total_cache_write_input_tokens, 0)) AS input_quota_tokens,
           h.total_output_tokens,
           -- Prefer AWS's own estimate for the hour when it published one.
@@ -343,8 +345,10 @@ async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
                 "burndown_rate_source": res.source,
                 "burndown_rate_verified": res.verified,
                 "peak_output_tpm": 0, "peak_quota_tpm": 0,
+                "routing_unknown": False,
                 "_sources": set(),
             }
+        p["routing_unknown"] |= bool(r.get("has_application_profile", False))
         out = int(r["total_output_tokens"] or 0)
         native = r.get("estimated_tpm_quota_usage")
         p["peak_output_tpm"] = max(p["peak_output_tpm"], out)
@@ -394,7 +398,8 @@ async def ops_burndown_risk(f: FilterSet = Depends(parse_filters)):
         # lookup is only ambiguous for bare ids that have several families.
         q = resolve_quota(quota_rows, p["accountId"], p["region"], p["modelId"],
                           metric="TPM",
-                          family_hint=family_hint_from_model_id(p["modelId"]))
+                          family_hint=family_hint_from_model_id(p["modelId"]),
+                          routing_unknown=p["routing_unknown"])
         # Hourly SUMs -> hourly-average per-minute rate. f_hourly_peak stores
         # Period=3600 Sum, so comparing it to a per-minute limit directly was
         # 60x too high. This is a lower bound on the true minute peak; the field

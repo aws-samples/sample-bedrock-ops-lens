@@ -29,7 +29,10 @@ ps:
 	docker compose ps
 
 schema:
-	docker exec -i bedrock-lens-pg psql -U bedrock_lens -d bedrock_lens < db/schema.sql
+	docker exec -i bedrock-lens-pg psql -v ON_ERROR_STOP=1 -U bedrock_lens -d bedrock_lens < db/schema.sql
+	@for migration in db/migrations/*.sql; do \
+		docker exec -i bedrock-lens-pg psql -v ON_ERROR_STOP=1 -U bedrock_lens -d bedrock_lens < "$$migration" || exit; \
+	done
 
 seed:
 	python db/seed.py --db-url "$(DB_URL)"

@@ -20,7 +20,7 @@
 import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, Box, ColumnLayout, Grid, BarChart, LineChart,
-  SegmentedControl, StatusIndicator, Button, Tabs,
+  SegmentedControl, StatusIndicator, Button, Tabs, Alert,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtPct, accountName, useAccountNames } from '../api.js';
 import { ChartLoading, SectionHeader, KpiCard, CHART_I18N } from '../components/Common.jsx';
@@ -101,6 +101,8 @@ function QuotasBody({ filters, onInfo }) {
   }, [quotas.data]);
 
   function findQuota(accountId, modelId, region, metric) {
+    // An unresolved profile ARN/opaque ID has no model identity to match.
+    if (!modelId?.includes('.') || modelId.startsWith('arn:')) return null;
     const key = `${accountId}|${region}|${metric}`;
     const candidates = quotaIndex.get(key) || [];
     if (!candidates.length) return null;
@@ -137,12 +139,18 @@ function QuotasBody({ filters, onInfo }) {
         ? Number(r.peak_quota_tpm)
         : Number(r.peak_input_tpm || 0) + Number(r.peak_output_tpm || 0);
       const rpmHour = Number(r.peak_requests_hour || 0);
-      const peakTpmMin = tpmHour / 60;
-      const peakRpmMin = rpmHour / 60;
-      const tpmQ = findQuota(accountId, modelId, region, 'TPM');
-      const rpmQ = findQuota(accountId, modelId, region, 'RPM');
+      // Current responses already include hourly-average per-minute rates.
+      // Divide only legacy hourly totals; dividing the new fields again is 60x low.
+      const peakTpmMin = r.busiest_hour_avg_quota_tpm != null
+        ? Number(r.busiest_hour_avg_quota_tpm) : tpmHour / 60;
+      const peakRpmMin = r.busiest_hour_avg_rpm != null
+        ? Number(r.busiest_hour_avg_rpm) : rpmHour / 60;
+      const routingUnknown = !!r.has_application_profile;
+      const tpmQ = routingUnknown ? null : findQuota(accountId, modelId, region, 'TPM');
+      const rpmQ = routingUnknown ? null : findQuota(accountId, modelId, region, 'RPM');
       out.push({
-        group: trafficGroup(modelId),
+        group: routingUnknown ? 'Unknown' : trafficGroup(modelId),
+        routing_unknown: routingUnknown,
         accountId, modelId, region,
         peak_tpm_min:    peakTpmMin,
         peak_rpm_min:    peakRpmMin,
@@ -160,7 +168,7 @@ function QuotasBody({ filters, onInfo }) {
   // KPIs
   const kpis = useMemo(() => {
     const k = {
-      max_tpm_util: 0, max_rpm_util: 0,
+      max_tpm_util: null, max_rpm_util: null,
       over_80: 0, at_limit: 0, no_quota: 0,
     };
     for (const r of utilizationRows) {
@@ -168,8 +176,8 @@ function QuotasBody({ filters, onInfo }) {
       const top = Math.max(r.tpm_util_pct ?? 0, r.rpm_util_pct ?? 0);
       if (top > 100) k.at_limit++;
       else if (top > 80) k.over_80++;
-      if ((r.tpm_util_pct ?? 0) > k.max_tpm_util) k.max_tpm_util = r.tpm_util_pct ?? 0;
-      if ((r.rpm_util_pct ?? 0) > k.max_rpm_util) k.max_rpm_util = r.rpm_util_pct ?? 0;
+      if (r.tpm_util_pct != null) k.max_tpm_util = Math.max(k.max_tpm_util ?? 0, r.tpm_util_pct);
+      if (r.rpm_util_pct != null) k.max_rpm_util = Math.max(k.max_rpm_util ?? 0, r.rpm_util_pct);
     }
     return k;
   }, [utilizationRows]);
@@ -185,12 +193,15 @@ function QuotasBody({ filters, onInfo }) {
         x.peak_rpm = Math.max(x.peak_rpm, r.peak_rpm_min);
         x.tpm_lim  = Math.max(x.tpm_lim,  r.tpm_limit || 0);
         x.rpm_lim  = Math.max(x.rpm_lim,  r.rpm_limit || 0);
+        x.routing_unknown = x.routing_unknown || r.routing_unknown;
         m.set(k, x);
       }
       return [...m.values()].map(r => ({
         ...r,
-        tpm_util: r.tpm_lim ? (r.peak_tpm / r.tpm_lim) * 100 : null,
-        rpm_util: r.rpm_lim ? (r.peak_rpm / r.rpm_lim) * 100 : null,
+        tpm_lim: r.routing_unknown ? null : r.tpm_lim,
+        rpm_lim: r.routing_unknown ? null : r.rpm_lim,
+        tpm_util: !r.routing_unknown && r.tpm_lim ? (r.peak_tpm / r.tpm_lim) * 100 : null,
+        rpm_util: !r.routing_unknown && r.rpm_lim ? (r.peak_rpm / r.rpm_lim) * 100 : null,
       })).sort((a, b) => (b.tpm_util ?? 0) - (a.tpm_util ?? 0));
     } else {
       const m = new Map();
@@ -201,12 +212,15 @@ function QuotasBody({ filters, onInfo }) {
         x.peak_rpm = Math.max(x.peak_rpm, r.peak_rpm_min);
         x.tpm_lim  = Math.max(x.tpm_lim,  r.tpm_limit || 0);
         x.rpm_lim  = Math.max(x.rpm_lim,  r.rpm_limit || 0);
+        x.routing_unknown = x.routing_unknown || r.routing_unknown;
         m.set(k, x);
       }
       return [...m.values()].map(r => ({
         ...r,
-        tpm_util: r.tpm_lim ? (r.peak_tpm / r.tpm_lim) * 100 : null,
-        rpm_util: r.rpm_lim ? (r.peak_rpm / r.rpm_lim) * 100 : null,
+        tpm_lim: r.routing_unknown ? null : r.tpm_lim,
+        rpm_lim: r.routing_unknown ? null : r.rpm_lim,
+        tpm_util: !r.routing_unknown && r.tpm_lim ? (r.peak_tpm / r.tpm_lim) * 100 : null,
+        rpm_util: !r.routing_unknown && r.rpm_lim ? (r.peak_rpm / r.rpm_lim) * 100 : null,
       })).sort((a, b) => (b.tpm_util ?? 0) - (a.tpm_util ?? 0));
     }
   }, [utilizationRows, scope]);
@@ -217,11 +231,17 @@ function QuotasBody({ filters, onInfo }) {
 
   return (
     <SpaceBetween size="l">
+      {utilizationRows.some(r => r.routing_unknown) && (
+        <Alert type="info">
+          Application profile usage is included, but its quota routing family is
+          unknown. Limits and utilization are unavailable for affected rows.
+        </Alert>
+      )}
       {/* KPI ribbon — fleet-wide quota health at a glance. Above the
            drill-down so the oncall sees the summary first, then drills. */}
       <Grid gridDefinition={[{ colspan: 3 }, { colspan: 3 }, { colspan: 3 }, { colspan: 3 }]}>
-        <KpiCard title="Peak TPM utilization" value={fmtPct(kpis.max_tpm_util)} />
-        <KpiCard title="Peak RPM utilization" value={fmtPct(kpis.max_rpm_util)} />
+        <KpiCard title="Peak TPM utilization" value={kpis.max_tpm_util == null ? 'Unknown' : fmtPct(kpis.max_tpm_util)} />
+        <KpiCard title="Peak RPM utilization" value={kpis.max_rpm_util == null ? 'Unknown' : fmtPct(kpis.max_rpm_util)} />
         <KpiCard title="At quota limit (>100%)"  value={fmt(kpis.at_limit)} />
         <KpiCard title="Approaching limit (80-100%)" value={fmt(kpis.over_80)} />
       </Grid>

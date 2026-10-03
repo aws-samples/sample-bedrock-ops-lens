@@ -23,6 +23,7 @@ from .routers import (
     errors as errors_router,
     extras as extras_router,
     governance as governance_router,
+    inference_profiles as inference_profiles_router,
     latency as latency_router,
     model_insights as model_insights_router,
     model_lifecycle as model_lifecycle_router,
@@ -88,6 +89,7 @@ app.include_router(extras_router.router,     prefix="/api", tags=["extras"])
 app.include_router(cost_router.router,       prefix="/api", tags=["cost"])
 app.include_router(tags_router.router,       prefix="/api", tags=["tags"])
 app.include_router(model_insights_router.router, prefix="/api", tags=["model-insights"])
+app.include_router(inference_profiles_router.router, prefix="/api", tags=["model-insights"])
 app.include_router(model_lifecycle_router.router, prefix="/api", tags=["model-lifecycle"])
 app.include_router(opsreview_router.router,  prefix="/api", tags=["ops-review"])
 app.include_router(quota_drilldown_router.router, prefix="/api", tags=["quota-drilldown"])

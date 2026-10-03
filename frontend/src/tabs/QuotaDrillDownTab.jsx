@@ -40,7 +40,7 @@ function utilSeverity(pct) {
   return 'success';
 }
 
-function KpiStrip({ limit, isDerived, peak, peakAt, avg, util, fmtVal }) {
+function KpiStrip({ limit, isDerived, peak, peakAt, avg, util, fmtVal, routingUnknown }) {
   return (
     <Box color="text-body-secondary" fontSize="body-s">
       <SpaceBetween direction="horizontal" size="m">
@@ -51,7 +51,8 @@ function KpiStrip({ limit, isDerived, peak, peakAt, avg, util, fmtVal }) {
                 {fmtVal(limit)}
                 {isDerived && <span style={{ color: '#aaa' }}> (derived from TPM ÷ avg tokens/req)</span>}
               </>
-            : <span style={{ color: '#aaa' }}>not published by AWS</span>}
+            : <span style={{ color: '#aaa' }}>{routingUnknown
+                ? 'unknown — profile routing unavailable' : 'not published by AWS'}</span>}
         </span>
         <span>·</span>
         <span><b>Peak:</b> {fmtVal(peak)} <span style={{ color: '#aaa' }}>@ {fmtAt(peakAt)}</span></span>
@@ -75,6 +76,7 @@ function MetricCard({
   series,
   limit,
   limitDerived,
+  routingUnknown,
   peak, peakAt, avg, util,
   fmtVal,
   ariaLabel,
@@ -158,6 +160,7 @@ function MetricCard({
     <Container fitHeight header={<Header variant="h3" actions={headerActions}>{title}</Header>}>
       <SpaceBetween size="s">
         <KpiStrip
+          routingUnknown={routingUnknown}
           limit={effectiveLimit} isDerived={isDerived}
           peak={peak} peakAt={peakAt} avg={avg} util={util}
           fmtVal={fmtVal}
@@ -305,6 +308,7 @@ export default function QuotaDrillDownTab({ onInfo }) {
             ariaLabel="Tokens per minute"
             series={tpmSeries}
             limit={data?.tpm_limit ?? null}
+            routingUnknown={data?.quota_tpm?.quota_routing_unknown}
             peak={k.peak_tpm} peakAt={k.peak_tpm_at}
             avg={k.avg_tpm} util={k.util_pct_tpm}
             fmtVal={fmt}
@@ -317,6 +321,7 @@ export default function QuotaDrillDownTab({ onInfo }) {
             ariaLabel="Requests per minute"
             series={rpmSeries}
             limit={data?.rpm_limit ?? null}
+            routingUnknown={data?.quota_rpm?.quota_routing_unknown}
             limitDerived={data?.rpm_limit_derived ?? null}
             peak={k.peak_rpm} peakAt={k.peak_rpm_at}
             avg={k.avg_rpm} util={k.util_pct_rpm}

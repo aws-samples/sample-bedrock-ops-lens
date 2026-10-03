@@ -161,6 +161,7 @@ async def distinct_filters():
         """
         SELECT
           CASE
+            WHEN has_application_profile AND modelId = invoked_model_id THEN NULL
             WHEN split_part(modelId, '.', 1) IN
                  ('us','eu','apac','jp','au','ca','amer','global')
               THEN split_part(modelId, '.', 2)

@@ -365,7 +365,7 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
                   : <span>{fmt(r.effective_tpm)}{r.quota_ambiguous ? ' *' : ''}</span>,
                 exportValue: r => r.effective_tpm ?? '' },
               { id: 'qf', header: 'Quota family',
-                cell: r => r.quota_family
+                cell: r => r.quota_routing_unknown ? 'Unknown (application profile)' : r.quota_family
                   ? <span>{r.quota_family}{r.quota_ambiguous ? ' (ambiguous)' : ''}</span>
                   : '—',
                 exportValue: r => r.quota_family || '' },
@@ -384,7 +384,8 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
             bounds. <b>*</b> marks a quota whose traffic family could not be
             determined (On-demand / Cross-region / Global CRIS publish different
             limits and the hourly table carries no family dimension); the
-            On-demand limit is shown where available.
+            On-demand limit is shown where available. Application profiles with
+            unknown routing have no estimated limit or utilization.
           </Box>
         </Container>
       )}

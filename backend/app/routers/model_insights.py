@@ -128,6 +128,7 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
         f"""
         SELECT
             modelId,
+            BOOL_OR(has_application_profile AND modelId = invoked_model_id) AS unresolved_profile,
             SUM(total_requests)::BIGINT          AS total_requests,
             SUM(failed_requests)::BIGINT         AS failed_requests,
             SUM(status_429_count)::BIGINT        AS throttled,
@@ -195,7 +196,8 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
         cache_read    = int(r["cache_read_tokens"] or 0)
         cache_write   = int(r["cache_write_tokens"] or 0)
 
-        provider = _provider_of(mid)
+        unresolved_profile = bool(r.get("unresolved_profile", False))
+        provider = "unknown" if unresolved_profile else _provider_of(mid)
         avg_in   = (input_tokens / total_req) if total_req else 0
         avg_out  = (output_tokens / total_req) if total_req else 0
         io_ratio = (input_tokens / output_tokens) if output_tokens else 0
@@ -211,8 +213,10 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
 
         out.append({
             "modelId":          mid,
-            "public_name":      _public_name(mid),
+            "public_name":      (f"Unresolved profile ({mid.rsplit('/', 1)[-1]})"
+                                 if unresolved_profile else _public_name(mid)),
             "provider":         provider,
+            "unresolved_application_profile": unresolved_profile,
             "total_requests":   total_req,
             "failed_requests":  failed,
             "throttled":        throttled,
@@ -229,7 +233,7 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
             "io_ratio":         round(io_ratio, 2),
             "error_rate":       round(error_rate, 3),
             "unique_accounts":  int(r["unique_accounts"] or 0),
-            "cost_estimate_usd": round(cost_est, 2),
+            "cost_estimate_usd": None if unresolved_profile else round(cost_est, 2),
             "accounts_detail":  detail_by_model.get(mid, []),
         })
     return out

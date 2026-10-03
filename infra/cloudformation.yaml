@@ -896,6 +896,7 @@ Resources:
 
   BackendLambda:
     Type: AWS::Lambda::Function
+    DependsOn: SchemaInit
     Properties:
       FunctionName: !Sub '${AWS::StackName}-backend'
       PackageType: Image
@@ -1056,9 +1057,9 @@ Resources:
       - PrivateSubnet2Assoc
     Properties:
       ServiceToken: !GetAtt SchemaInitLambda.Arn
-      # Bumping this string forces re-run on stack-update (e.g. after schema
-      # changes). Default value tied to stack name keeps it stable per stack.
-      SchemaVersion: !Sub '${AWS::StackName}-v1'
+      # Run the bundled migrations whenever the deployed image changes.
+      # A stack-name-only version skipped migrations on existing deployments.
+      SchemaVersion: !Ref BackendImageUri
       # Bound the blast radius if the callback is ever lost again: CloudFormation
       # waits this long instead of the default hour. The comment above this
       # resource previously CLAIMED this cap was in place, but the property was
@@ -1179,6 +1180,7 @@ Resources:
 
   IngesterLambda:
     Type: AWS::Lambda::Function
+    DependsOn: SchemaInit
     Properties:
       FunctionName: !Sub '${AWS::StackName}-ingester'
       PackageType: Image

@@ -135,13 +135,13 @@ async def _detect_quota_utilization(conn, th: dict) -> list[dict]:
     # then reduced to a peak.
     rows = await conn.fetch(
         """
-        SELECT accountId, modelId, region, event_date, hour,
+        SELECT accountId, modelId, region, event_date, hour, has_application_profile,
                total_requests::float / 60.0                      AS rpm,
                estimated_tpm_quota_usage                         AS native_hour,
                (COALESCE(total_input_tokens,0)
                 + COALESCE(total_cache_write_input_tokens,0))    AS input_quota_tokens,
                COALESCE(total_output_tokens,0)                   AS output_tokens
-        FROM f_hourly_peak
+        FROM lens_read.f_hourly_peak
         WHERE event_date >= current_date - 7 AND endpoint = 'runtime'
           AND total_requests > 0
         """)
@@ -167,7 +167,9 @@ async def _detect_quota_utilization(conn, th: dict) -> list[dict]:
         a = agg.get(key)
         if a is None:
             a = agg[key] = {"peak_tpm": None, "peak_rpm": 0.0,
-                            "sources": set(), "unknown_hours": 0}
+                            "sources": set(), "unknown_hours": 0,
+                            "routing_unknown": False}
+        a["routing_unknown"] |= bool(r.get("has_application_profile", False))
         rate = cat.rate_for(r["modelid"], on_date=r.get("event_date")).rate
         value, source = quota_consumption(
             r["native_hour"], r["input_quota_tokens"], r["output_tokens"], rate)
@@ -194,7 +196,7 @@ async def _detect_quota_utilization(conn, th: dict) -> list[dict]:
             # region-scoped, ambiguity reported rather than resolved by taking
             # the larger limit.
             res = resolve_quota(quota_rows, acct, region, model,
-                                metric=metric_name)
+                                metric=metric_name, routing_unknown=a["routing_unknown"])
             if not res.known or res.ambiguous:
                 continue          # unknown limit is not a finding, it is a gap
             limit_value = float(res.value)
@@ -250,7 +252,7 @@ async def _detect_throttle_rate(conn, th: dict) -> list[dict]:
         SELECT accountId, modelId, region,
                SUM(total_requests)  AS reqs,
                SUM(COALESCE(status_429_count,0)) AS throttles
-        FROM f_hourly_peak
+        FROM lens_read.f_hourly_peak
         WHERE event_date = current_date - 1
         GROUP BY accountId, modelId, region
         HAVING SUM(total_requests) >= 100
@@ -344,7 +346,7 @@ async def _detect_model_eol(conn, th: dict) -> list[dict]:
                l.lifecycle_policy, l.api_visible,
                SUM(p.total_requests) AS reqs
         FROM dim_model_lifecycle l
-        JOIN f_hourly_peak p
+        JOIN lens_read.f_hourly_peak p
              -- CloudWatch records cross-region inference-profile traffic with a
              -- geo prefix (us./eu./apac./us-gov./global.), but dim_model_lifecycle
              -- stores the base modelId from ListFoundationModels. Strip the prefix

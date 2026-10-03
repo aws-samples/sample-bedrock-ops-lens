@@ -138,13 +138,17 @@ async def latency_cris_vs_od(f: FilterSet = Depends(parse_filters)):
         SELECT modelId, traffic_type,
           SUM(sample_count)::BIGINT AS sample_count,
           SUM(avg_e2e * sample_count) / NULLIF(SUM(sample_count), 0) AS avg_e2e,
-          SUM(p50_e2e * sample_count) / NULLIF(SUM(sample_count), 0) AS p50_e2e,
-          SUM(p90_e2e * sample_count) / NULLIF(SUM(sample_count), 0) AS p90_e2e,
-          SUM(p99_e2e * sample_count) / NULLIF(SUM(sample_count), 0) AS p99_e2e,
-          SUM(avg_ttft * sample_count) / NULLIF(SUM(sample_count), 0) AS avg_ttft,
-          SUM(p50_ttft * sample_count) / NULLIF(SUM(sample_count), 0) AS p50_ttft,
-          SUM(p90_ttft * sample_count) / NULLIF(SUM(sample_count), 0) AS p90_ttft,
-          SUM(p99_ttft * sample_count) / NULLIF(SUM(sample_count), 0) AS p99_ttft
+          MAX(p50_e2e) AS p50_e2e,
+          MAX(p90_e2e) AS p90_e2e,
+          MAX(p99_e2e) AS p99_e2e,
+          SUM(ttft_sample_count)::BIGINT AS ttft_sample_count,
+          SUM(avg_ttft * ttft_sample_count) FILTER (WHERE ttft_sample_count > 0)
+            / NULLIF(SUM(ttft_sample_count) FILTER (WHERE ttft_sample_count > 0), 0)
+            AS avg_ttft,
+          MAX(p50_ttft) FILTER (WHERE ttft_sample_count > 0) AS p50_ttft,
+          MAX(p90_ttft) FILTER (WHERE ttft_sample_count > 0) AS p90_ttft,
+          MAX(p99_ttft) FILTER (WHERE ttft_sample_count > 0) AS p99_ttft,
+          'worst_bucket_upper_bound' AS percentile_basis
         FROM f_latency_daily
         WHERE {w.sql}
         GROUP BY modelId, traffic_type
@@ -173,9 +177,10 @@ async def operation_latency(f: FilterSet = Depends(parse_filters)):
         SELECT traffic_type,
           SUM(sample_count)::BIGINT AS sample_count,
           SUM(avg_e2e * sample_count) / NULLIF(SUM(sample_count), 0) AS avg_e2e,
-          SUM(p50_e2e * sample_count) / NULLIF(SUM(sample_count), 0) AS p50_e2e,
-          SUM(p90_e2e * sample_count) / NULLIF(SUM(sample_count), 0) AS p90_e2e,
-          SUM(p99_e2e * sample_count) / NULLIF(SUM(sample_count), 0) AS p99_e2e
+          MAX(p50_e2e) AS p50_e2e,
+          MAX(p90_e2e) AS p90_e2e,
+          MAX(p99_e2e) AS p99_e2e,
+          'worst_bucket_upper_bound' AS percentile_basis
         FROM f_latency_daily
         WHERE {w.sql}
         GROUP BY traffic_type

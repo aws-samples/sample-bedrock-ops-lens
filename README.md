@@ -155,6 +155,7 @@ The commands in these guides are run from the repository root unless stated othe
 | <a id="dashboard-tabs"></a><a id="how-quota-consumption-is-measured"></a><a id="which-attribution-source-when"></a>Understand dashboard views, quotas, and attribution | [Dashboard and data guide](docs/dashboard-guide.md) |
 | <a id="workloads-per-workload-attribution-and-client-telemetry-optional"></a><a id="setup-3-steps"></a><a id="how-this-relates-to-aws-native-attribution"></a>Add workload or direct-provider telemetry | [Workloads setup](docs/workloads.md), [client emitters](tools/client-telemetry/README.md) |
 | Compare Bedrock Runtime and Mantle telemetry | [Endpoint comparison](docs/mantle-vs-runtime-telemetry.md) |
+| Resolve application inference profiles to models | [Inference profile support](docs/inference-profiles.md) |
 | <a id="local-development"></a><a id="tests"></a>Develop locally, run tests, or contribute | [Contributing](CONTRIBUTING.md#local-development) |
 
 ## Cost

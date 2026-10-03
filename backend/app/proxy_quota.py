@@ -70,6 +70,7 @@ class QuotaVerdict:
     # True when the model id NAMED its family (a CRIS prefix) but that family has
     # no published quota here, so another family's limit would be the wrong one.
     family_missing: bool = False
+    routing_unknown: bool = False
 
     @property
     def known(self) -> bool:
@@ -80,6 +81,9 @@ class QuotaVerdict:
         """Why the limit is unknown, in the words the UI shows."""
         if self.known:
             return ""
+        if self.routing_unknown:
+            return ("application inference profile quota routing family is unknown; "
+                    "List/GetInferenceProfile do not identify it")
         if self.family_missing:
             return (f"this model id specifies the {self.family} quota family, "
                     "which has no published limit in this account and region; "
@@ -99,10 +103,14 @@ async def load_tpm_quota_rows() -> list[dict]:
 
 
 def resolve(rows: list[dict], model_id: str, region: str,
-            account: str | None) -> QuotaVerdict:
+            account: str | None, routing_unknown: bool = False) -> QuotaVerdict:
     """Resolve the TPM ceiling for one (model, region, account)."""
     hint = family_hint_from_model_id(model_id)
     acct = (account or "").strip()
+    if routing_unknown:
+        return QuotaVerdict(
+            account_known=bool(acct and acct not in ("__none__", "__unknown__")),
+            ambiguous=True, routing_unknown=True)
     if acct and acct not in ("__none__", "__unknown__"):
         res = resolve_quota(rows, acct, region, model_id, "TPM", hint)
         if res.value is not None:
@@ -179,6 +187,7 @@ async def score(rows: list[dict], group_key: str = "dim_value") -> dict:
     meta: dict[tuple, tuple] = {}
     direct_peak: dict[tuple, float] = defaultdict(float)
     direct_meta: dict[tuple, tuple] = {}
+    unknown_routing: set[tuple] = set()
 
     for r in rows:
         val = r.get(group_key) or r.get(group_key.lower())
@@ -199,6 +208,8 @@ async def score(rows: list[dict], group_key: str = "dim_value") -> dict:
         rate = 1 if ep == "mantle" else output_burndown_rate(mid, is_mantle=False)
         tpm = hourly_total_to_per_minute(in_tok + out_tok * rate)
         key = (val, mid, acct, region, ep)
+        if r.get("has_application_profile", False):
+            unknown_routing.add(key)
         if tpm > peak[key]:
             peak[key] = tpm
             meta[key] = (ep, region, acct)
@@ -206,7 +217,8 @@ async def score(rows: list[dict], group_key: str = "dim_value") -> dict:
     # One candidate per quota key, each with its OWN limit and utilization.
     candidates: list[dict] = []
     for (val, mid, acct, region, ep), tpm in peak.items():
-        v = resolve(quota_rows, mid, region, acct)
+        v = resolve(quota_rows, mid, region, acct,
+                    routing_unknown=(val, mid, acct, region, ep) in unknown_routing)
         util = (tpm / v.limit * 100.0) if v.known and v.limit else None
         cand = {
             "workload": val,
@@ -222,6 +234,7 @@ async def score(rows: list[dict], group_key: str = "dim_value") -> dict:
             "quota_ambiguous": v.ambiguous,
             "quota_family": v.family,
             "quota_family_missing": v.family_missing,
+            "quota_routing_unknown": v.routing_unknown,
             "tpm_limit": round(v.limit, 1) if v.known and v.limit else None,
             "utilization_pct": round(util, 2) if util is not None else None,
         }

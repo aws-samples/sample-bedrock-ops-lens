@@ -38,6 +38,8 @@ services:
       POSTGRES_DB: bedrock_lens
     volumes:
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/init-migrations.sh:/docker-entrypoint-initdb.d/02_migrations.sh:ro
+      - ./db/migrations:/docker-entrypoint-initdb.d/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bedrock_lens -d bedrock_lens"]
       interval: 3s

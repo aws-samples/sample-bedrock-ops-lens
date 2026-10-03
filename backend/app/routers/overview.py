@@ -108,7 +108,8 @@ async def daily_breakdown(
     if group_by == "model":
         cat_expr = "modelId"
     elif group_by == "provider":
-        cat_expr = "split_part(modelId, '.', 1)"
+        cat_expr = ("CASE WHEN has_application_profile AND modelId = invoked_model_id "
+                    "THEN 'Unknown' ELSE split_part(modelId, '.', 1) END")
     elif group_by == "traffic":
         cat_expr = "traffic_type"
     else:  # region
