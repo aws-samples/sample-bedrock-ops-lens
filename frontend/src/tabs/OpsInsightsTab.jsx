@@ -336,6 +336,45 @@ function OpsInsightsBody({ filters, onInfo, endpoint }) {
                 exportValue: r => r.busiest_hour_avg_output_tpm ?? r.peak_output_tpm },
               { id: 'rq', header: 'Requests in that hour', cell: r => fmt(r.requests_busiest_hour_total ?? r.peak_requests_hour),
                 exportValue: r => r.requests_busiest_hour_total ?? r.peak_requests_hour },
+              // MEASURED busiest minute (f_minute_peak, CloudWatch Period=60).
+              // AWS enforces per minute, so this is what predicts throttling;
+              // the hourly columns above are an average and a lower bound.
+              // "Estimated" is deliberate: EstimatedTPMQuotaUsage excludes
+              // max_tokens reservation, so it is not the enforcement counter.
+              { id: 'mtpm', header: 'Peak est. quota TPM (1 min)',
+                cell: r => r.peak_minute_estimated_quota_tpm != null
+                  ? <Box fontWeight="bold">{fmt(r.peak_minute_estimated_quota_tpm)}{' '}
+                      <Badge color={r.peak_minute_quota_tpm_source === 'aws_estimate' ? 'green' : 'grey'}>
+                        {r.peak_minute_quota_tpm_source === 'aws_estimate' ? 'AWS est.'
+                          : r.peak_minute_quota_tpm_source === 'mixed' ? 'mixed' : 'computed'}
+                      </Badge>
+                    </Box>
+                  : <Box color="text-status-inactive">unavailable</Box>,
+                exportValue: r => r.peak_minute_estimated_quota_tpm ?? '' },
+              { id: 'mcoverage', header: 'Minute coverage',
+                cell: r => {
+                  const c = r.minute_collection;
+                  const label = r.minute_coverage_status === 'stale' ? 'Mapping or rate changed'
+                    : r.minute_coverage_complete ? 'Complete to collection time' : 'Partial / unavailable';
+                  return <Box>{label}{c ? ` (${c.days_complete}/${c.days_expected} days)` : ''}</Box>;
+                },
+                exportValue: r => r.minute_coverage_status || 'not_collected' },
+              { id: 'mrpm', header: 'Peak RPM (1 min)',
+                cell: r => r.peak_minute_rpm != null ? fmt(r.peak_minute_rpm) : '—',
+                exportValue: r => r.peak_minute_rpm ?? '' },
+              // How badly the hourly average understates the measured minute.
+              { id: 'burst', header: 'Burstiness vs hourly avg',
+                cell: r => r.quota_tpm_burstiness_x
+                  ? <Box color={r.quota_tpm_burstiness_x >= 10 ? 'text-status-warning' : undefined}>
+                      {r.quota_tpm_burstiness_x}x
+                    </Box>
+                  : '—',
+                exportValue: r => r.quota_tpm_burstiness_x ?? '' },
+              { id: 'mat', header: 'Peak minute (UTC)',
+                cell: r => r.peak_minute_quota_tpm_at
+                  ? String(r.peak_minute_quota_tpm_at).slice(0, 16).replace('T', ' ')
+                  : '—',
+                exportValue: r => r.peak_minute_quota_tpm_at ?? '' },
             ]}
             empty="No peak data"
           />

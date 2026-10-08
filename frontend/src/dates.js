@@ -59,6 +59,14 @@ export function fmtHourUTC(ts) {
   return `${fmtDayUTC(d)}, ${String(d.getUTCHours()).padStart(2, '0')}:00`;
 }
 
+/** "Sep 8, 14:05" - the UTC minute. */
+export function fmtMinuteUTC(ts) {
+  const d = new Date(ts);
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mm = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${fmtDayUTC(d)}, ${hh}:${mm}`;
+}
+
 /** Two-digit UTC hour, for labels that add their own ":00 UTC" suffix. */
 export function utcHour(ts) {
   return String(new Date(ts).getUTCHours()).padStart(2, '0');

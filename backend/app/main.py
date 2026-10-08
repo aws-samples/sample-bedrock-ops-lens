@@ -16,6 +16,7 @@ from .routers import (
     agents as agents_router,
     attribution as attribution_router,
     burndown_rates as burndown_rates_router,
+    live_pull as live_pull_router,
     notifications as notifications_router,
     by_user as by_user_router,
     compliance as compliance_router,
@@ -97,6 +98,7 @@ app.include_router(workload_usage_router.router, prefix="/api", tags=["workload-
 app.include_router(attribution_router.router, prefix="/api", tags=["attribution"])
 app.include_router(notifications_router.router, prefix="/api", tags=["notifications"])
 app.include_router(burndown_rates_router.router, prefix="/api", tags=["burndown-rates"])
+app.include_router(live_pull_router.router, prefix="/api", tags=["live-pull"])
 
 # SPA static mount goes LAST so /api/* takes precedence.
 _static_dir = Path(__file__).parent.parent / "static"

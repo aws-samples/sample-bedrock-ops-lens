@@ -633,7 +633,18 @@ aws ecr get-login-password --region "$REGION" \
     | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com" >/dev/null
 docker tag bedrock-ops-lens-backend:lambda "$ECR_URI:latest"
 docker push "$ECR_URI:latest"
-echo "    pushed: $ECR_URI:latest"
+# Deploy by digest. With the unchanging ":latest" string, CloudFormation saw no
+# change on an upgrade: it left every function on its old image and never
+# re-ran SchemaInit (its SchemaVersion is this URI), so new migrations did not
+# apply, and a SchemaInit that did run used the previous release's SQL.
+IMAGE_DIGEST="$(aws ecr describe-images --repository-name "${ECR_URI#*/}" --region "$REGION" \
+    --image-ids imageTag=latest --query 'imageDetails[0].imageDigest' --output text)"
+if [[ "$IMAGE_DIGEST" != sha256:* ]]; then
+    echo "ERROR: could not read the pushed image digest from ECR (got '$IMAGE_DIGEST')." >&2
+    exit 1
+fi
+BACKEND_IMAGE_URI="$ECR_URI@$IMAGE_DIGEST"
+echo "    pushed: $BACKEND_IMAGE_URI"
 
 # -----------------------------------------------------------------------------
 # Pass 2: Main stack
@@ -650,7 +661,7 @@ trap 'rm -f "$PARAMS_JSON"' EXIT
 cat > "$PARAMS_JSON" <<EOF
 [
   {"ParameterKey":"AllowedEmailDomains","ParameterValue":"$ALLOWED_EMAIL_DOMAINS"},
-  {"ParameterKey":"BackendImageUri","ParameterValue":"$ECR_URI:latest"},
+  {"ParameterKey":"BackendImageUri","ParameterValue":"$BACKEND_IMAGE_URI"},
   {"ParameterKey":"BedrockLogsBucket","ParameterValue":"$BEDROCK_LOGS_BUCKET"},
   {"ParameterKey":"BedrockLogsRegion","ParameterValue":"$BEDROCK_LOGS_REGION"},
   {"ParameterKey":"ProxyEventsBucket","ParameterValue":"${PROXY_EVENTS_BUCKET:-}"},
@@ -758,10 +769,10 @@ fi
 # -----------------------------------------------------------------------------
 BACKEND_FN="${MAIN_STACK}-backend"
 echo "    publishing new Backend Lambda version + rolling 'live' alias..."
-# Same staleness problem as the ingester below: CFN resolved ":latest" to a
-# digest at create time and won't re-pull on a code-only redeploy. Refresh
-# $LATEST explicitly BEFORE publish-version, otherwise the published version
-# freezes the OLD image.
+# The stack update above already set $LATEST to the pushed digest; refreshing
+# it again is a no-op then, and still corrects a stack whose template pinned
+# ":latest". Either way $LATEST must be current BEFORE publish-version, or the
+# published version freezes the OLD image.
 aws lambda update-function-code \
     --function-name "$BACKEND_FN" \
     --image-uri "$ECR_URI:latest" \
@@ -801,17 +812,15 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# Roll the Ingester + Schema-init Lambdas to the just-pushed image.
+# Roll the Ingester, Schema-init and Live-pull Lambdas to the just-pushed image.
 #
-# Both are PackageType=Image Lambdas pinned to ":latest". CFN resolves that
-# tag to a digest at create time and does NOT re-pull when the tag string is
-# unchanged, so on a code-only redeploy (same image tag, new digest) these
-# Lambdas keep running the STALE image. update-function-code with the same
-# :latest URI forces Lambda to resolve the tag to the new digest. The
-# backend Lambda is handled above via publish-version; these two have no
-# alias so a direct code update is the right tool.
+# The stack now deploys them by digest, so this is normally a no-op. It stays as
+# a safety net: a stack still pinned to ":latest" never re-pulls on a code-only
+# redeploy, and update-function-code with :latest forces Lambda to resolve the
+# tag to the new digest. The backend Lambda is handled above via
+# publish-version; these have no alias so a direct code update is the right tool.
 # -----------------------------------------------------------------------------
-for FN in "${MAIN_STACK}-ingester" "${MAIN_STACK}-schema-init"; do
+for FN in "${MAIN_STACK}-ingester" "${MAIN_STACK}-schema-init" "${MAIN_STACK}-live-pull"; do
     if aws lambda get-function --function-name "$FN" --region "$REGION" >/dev/null 2>&1; then
         echo "    refreshing $FN to latest image digest..."
         aws lambda update-function-code \

@@ -9,24 +9,22 @@
 //   2. Per-Account / Per-Model utilization table with severity-coded Avg
 //      TPM % (>100% red, >80% amber, ≤80% green), CSV export.
 //
-// Data sources:
-//   /api/ops-peak-rpm     — peak hourly counters per (account, model, region)
-//   /api/quotas           — applied quota per (account, model, region, metric)
-//                            (added below — uses f_quotas)
+// /api/ops-peak-rpm supplies measured minute peaks, hourly averages and the
+// matching quota per account, model, Region and endpoint.
 //
-// The applied-quota join is done client-side for now; the JOIN is small
-// enough that pushing it server-side doesn't change perceived latency.
+// Applied limits use the backend's shared model/version/routing-family resolver.
 
 import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, Box, ColumnLayout, Grid, BarChart, LineChart,
-  SegmentedControl, StatusIndicator, Button, Tabs, Alert,
+  SegmentedControl, StatusIndicator, Button, Tabs, Badge,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtPct, accountName, useAccountNames } from '../api.js';
 import { ChartLoading, SectionHeader, KpiCard, CHART_I18N } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import QuotaDrillDown from './QuotaDrillDownTab.jsx';
 import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
+import { summarizeQuotaRows, quotaUtilization } from '../quotaSummary.js';
 
 // Percentile selector removed for now — the underlying f_hourly_peak table
 // only stores max-over-hour values from CloudWatch, so there is no p50/p90/p99
@@ -52,6 +50,12 @@ function severityForUtil(pct) {
   return pct >= 100 ? 'error' : pct >= 80 ? 'warning' : pct > 0 ? 'success' : 'info';
 }
 
+// KPI value: "≥" marks a lower bound; "Unknown" only when no row has a limit.
+function fmtUtil(value, lowerBound) {
+  if (value == null) return 'Unknown';
+  return (lowerBound ? '≥ ' : '') + fmtPct(value);
+}
+
 export default function QuotasTab({ filters, onInfo }) {
   // bedrock-mantle quotas are not in AWS Service Quotas (managed internally),
   // so Mantle gets coverage='defaults'. The tab's utilization view needs
@@ -59,7 +63,8 @@ export default function QuotasTab({ filters, onInfo }) {
   // sub-tab when such volumetric data exists (else hide it — no blank view).
   const distinct = useApi('/distinct-filters', {}, []).data || {};
   const mantleAvailable = !!distinct.mantle_available?.volumetric;
-  const [endpoint, setEndpoint] = useState(filters.endpoint || 'all');
+  const [endpoint, setEndpoint] = useState(
+    filters.endpoint && filters.endpoint !== 'all' ? filters.endpoint : 'runtime');
   const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
   return (
     <EndpointSubTabs
@@ -69,7 +74,9 @@ export default function QuotasTab({ filters, onInfo }) {
       mantleCoverage="defaults"
       mantleAvailable={mantleAvailable}
     >
-      {() => <QuotasBody filters={filtersWithEp} onInfo={onInfo} />}
+      {({ endpoint: activeEndpoint }) => (
+        <QuotasBody filters={{ ...filtersWithEp, endpoint: activeEndpoint }} onInfo={onInfo} />
+      )}
     </EndpointSubTabs>
   );
 }
@@ -78,50 +85,9 @@ function QuotasBody({ filters, onInfo }) {
   useAccountNames();   // resolve account names for the Account name cells
   const [scope, setScope] = useState('per-account');
 
-  const peak = useApi('/ops-peak-rpm', filters, [JSON.stringify(filters)]);
+  const peak = useApi('/ops-peak-rpm', { ...filters, include_quotas: true }, [JSON.stringify(filters)]);
   const throttle = useApi('/ops-throttle-rate', filters, [JSON.stringify(filters)]);
   const burndown = useApi('/ops-burndown-risk', filters, [JSON.stringify(filters)]);
-
-  // f_quotas via /api/quotas — endpoint is added in extras.py if not present.
-  const quotas = useApi('/quotas', filters, [JSON.stringify(filters)]);
-
-  // Build a (account, modelId, region) → applied-quota map keyed by metric.
-  // Quota rows come keyed by model_name (e.g. "Anthropic Claude Opus 4.7"),
-  // but our peak rows are keyed by modelId (e.g. "us.anthropic.claude-opus-4-7").
-  // Matching uses substring against the model_name's lowercase tokens.
-  const quotaIndex = useMemo(() => {
-    if (!quotas.data) return new Map();
-    const map = new Map();
-    for (const q of quotas.data) {
-      const key = `${q.accountId}|${q.region}|${q.metric}`;
-      if (!map.has(key)) map.set(key, []);
-      map.get(key).push(q);
-    }
-    return map;
-  }, [quotas.data]);
-
-  function findQuota(accountId, modelId, region, metric) {
-    // An unresolved profile ARN/opaque ID has no model identity to match.
-    if (!modelId?.includes('.') || modelId.startsWith('arn:')) return null;
-    const key = `${accountId}|${region}|${metric}`;
-    const candidates = quotaIndex.get(key) || [];
-    if (!candidates.length) return null;
-    // Pick the candidate whose model_name appears in the modelId (case-
-    // insensitive substring of any non-stop word). Fall back to first match.
-    const m = (modelId || '').toLowerCase();
-    let best = null;
-    for (const q of candidates) {
-      const name = (q.model_name || '').toLowerCase();
-      if (!name) continue;
-      // simple heuristic: if every space-separated word > 2 chars in the
-      // quota model_name appears in modelId, count as a match.
-      const words = name.split(/\s+/).filter(w => w.length > 2 && !['the','for','and'].includes(w));
-      if (words.length && words.every(w => m.includes(w.replace(/\./g, '').toLowerCase()))) {
-        if (!best || (q.applied_value || 0) > (best.applied_value || 0)) best = q;
-      }
-    }
-    return best || candidates[0];
-  }
 
   // Aggregate peak data per (group, accountId, modelId, region), join with quotas.
   const utilizationRows = useMemo(() => {
@@ -146,24 +112,57 @@ function QuotasBody({ filters, onInfo }) {
       const peakRpmMin = r.busiest_hour_avg_rpm != null
         ? Number(r.busiest_hour_avg_rpm) : rpmHour / 60;
       const routingUnknown = !!r.has_application_profile;
-      const tpmQ = routingUnknown ? null : findQuota(accountId, modelId, region, 'TPM');
-      const rpmQ = routingUnknown ? null : findQuota(accountId, modelId, region, 'RPM');
+      const tpmLimit = routingUnknown ? null : r.quota_tpm?.limit_per_minute;
+      const rpmLimit = routingUnknown ? null : r.quota_rpm?.limit_per_minute;
+      // MEASURED busiest minute, when the minute collector has data for this
+      // row. AWS enforces per minute, so this is the number that predicts
+      // throttling; the hourly average is retained beside it as a baseline and
+      // is a lower bound. Never silently substitute one for the other.
+      const minuteTpm = r.measured_minute_available && r.peak_minute_estimated_quota_tpm != null
+        ? Number(r.peak_minute_estimated_quota_tpm) : null;
+      const minuteRpm = r.measured_minute_available && r.peak_minute_rpm != null
+        ? Number(r.peak_minute_rpm) : null;
+      const coverageComplete = r.minute_coverage_complete === true;
+      const tpm = quotaUtilization(minuteTpm, peakTpmMin, tpmLimit,
+        r.minute_quota_complete ?? coverageComplete);
+      const rpm = quotaUtilization(minuteRpm, peakRpmMin, rpmLimit,
+        r.minute_rpm_complete ?? coverageComplete);
       out.push({
         group: routingUnknown ? 'Unknown' : trafficGroup(modelId),
         routing_unknown: routingUnknown,
-        accountId, modelId, region,
-        peak_tpm_min:    peakTpmMin,
-        peak_rpm_min:    peakRpmMin,
-        tpm_limit:       tpmQ?.applied_value ?? null,
-        rpm_limit:       rpmQ?.applied_value ?? null,
-        tpm_util_pct:    tpmQ?.applied_value ? (peakTpmMin / Number(tpmQ.applied_value)) * 100 : null,
-        rpm_util_pct:    rpmQ?.applied_value ? (peakRpmMin / Number(rpmQ.applied_value)) * 100 : null,
+        accountId, modelId, region, endpoint: r.endpoint,
+        // Both bases kept explicitly so a reader can tell them apart.
+        measured_minute: minuteTpm != null,
+        minute_tpm:      minuteTpm,
+        minute_rpm:      minuteRpm,
+        hourly_avg_tpm:  peakTpmMin,
+        hourly_avg_rpm:  peakRpmMin,
+        burstiness_x:    r.quota_tpm_burstiness_x ?? null,
+        quota_src:       r.peak_minute_quota_tpm_source || 'unavailable',
+        minute_at:       r.peak_minute_quota_tpm_at || null,
+        minute_days:     r.minute_days_with_data ?? 0,
+        minute_coverage: r.minute_collection || null,
+        minute_coverage_complete: coverageComplete,
+        minute_coverage_status: r.minute_coverage_status || 'not_collected',
+        tpm_limit:       tpmLimit ?? null,
+        rpm_limit:       rpmLimit ?? null,
+        // Utilization is EXACT only from a measured minute with complete
+        // coverage. Otherwise the row's best observation — the larger of any
+        // observed minute peak and its busiest-hour average, both lower bounds
+        // on the true minute peak — divided by the row's OWN limit is a lower
+        // bound, flagged so the UI prefixes it with "≥". Withholding it instead
+        // blanked every percentage whenever the still-open current day was in
+        // the window, which is always.
+        tpm_util_pct: tpm.percentage,
+        rpm_util_pct: rpm.percentage,
+        tpm_util_lower_bound: tpm.lowerBound,
+        rpm_util_lower_bound: rpm.lowerBound,
       });
     }
     return out.sort((a, b) =>
       (b.tpm_util_pct ?? 0) - (a.tpm_util_pct ?? 0)
       || (b.rpm_util_pct ?? 0) - (a.rpm_util_pct ?? 0));
-  }, [peak.data, quotaIndex]);
+  }, [peak.data]);
 
   // KPIs
   const kpis = useMemo(() => {
@@ -176,78 +175,74 @@ function QuotasBody({ filters, onInfo }) {
       const top = Math.max(r.tpm_util_pct ?? 0, r.rpm_util_pct ?? 0);
       if (top > 100) k.at_limit++;
       else if (top > 80) k.over_80++;
-      if (r.tpm_util_pct != null) k.max_tpm_util = Math.max(k.max_tpm_util ?? 0, r.tpm_util_pct);
-      if (r.rpm_util_pct != null) k.max_rpm_util = Math.max(k.max_rpm_util ?? 0, r.rpm_util_pct);
+      if (r.tpm_util_pct != null && (k.max_tpm_util == null || r.tpm_util_pct > k.max_tpm_util)) {
+        k.max_tpm_util = r.tpm_util_pct; k.max_tpm_lb = r.tpm_util_lower_bound;
+      }
+      if (r.rpm_util_pct != null && (k.max_rpm_util == null || r.rpm_util_pct > k.max_rpm_util)) {
+        k.max_rpm_util = r.rpm_util_pct; k.max_rpm_lb = r.rpm_util_lower_bound;
+      }
     }
     return k;
   }, [utilizationRows]);
 
   // Aggregate by scope (account or model) for the table.
-  const aggregated = useMemo(() => {
-    if (scope === 'per-account') {
-      const m = new Map();
-      for (const r of utilizationRows) {
-        const k = r.accountId;
-        const x = m.get(k) || { key: k, accountId: r.accountId, peak_tpm: 0, peak_rpm: 0, tpm_lim: 0, rpm_lim: 0 };
-        x.peak_tpm = Math.max(x.peak_tpm, r.peak_tpm_min);
-        x.peak_rpm = Math.max(x.peak_rpm, r.peak_rpm_min);
-        x.tpm_lim  = Math.max(x.tpm_lim,  r.tpm_limit || 0);
-        x.rpm_lim  = Math.max(x.rpm_lim,  r.rpm_limit || 0);
-        x.routing_unknown = x.routing_unknown || r.routing_unknown;
-        m.set(k, x);
-      }
-      return [...m.values()].map(r => ({
-        ...r,
-        tpm_lim: r.routing_unknown ? null : r.tpm_lim,
-        rpm_lim: r.routing_unknown ? null : r.rpm_lim,
-        tpm_util: !r.routing_unknown && r.tpm_lim ? (r.peak_tpm / r.tpm_lim) * 100 : null,
-        rpm_util: !r.routing_unknown && r.rpm_lim ? (r.peak_rpm / r.rpm_lim) * 100 : null,
-      })).sort((a, b) => (b.tpm_util ?? 0) - (a.tpm_util ?? 0));
-    } else {
-      const m = new Map();
-      for (const r of utilizationRows) {
-        const k = `${r.modelId}|${r.region}`;
-        const x = m.get(k) || { key: k, modelId: r.modelId, region: r.region, peak_tpm: 0, peak_rpm: 0, tpm_lim: 0, rpm_lim: 0 };
-        x.peak_tpm = Math.max(x.peak_tpm, r.peak_tpm_min);
-        x.peak_rpm = Math.max(x.peak_rpm, r.peak_rpm_min);
-        x.tpm_lim  = Math.max(x.tpm_lim,  r.tpm_limit || 0);
-        x.rpm_lim  = Math.max(x.rpm_lim,  r.rpm_limit || 0);
-        x.routing_unknown = x.routing_unknown || r.routing_unknown;
-        m.set(k, x);
-      }
-      return [...m.values()].map(r => ({
-        ...r,
-        tpm_lim: r.routing_unknown ? null : r.tpm_lim,
-        rpm_lim: r.routing_unknown ? null : r.rpm_lim,
-        tpm_util: !r.routing_unknown && r.tpm_lim ? (r.peak_tpm / r.tpm_lim) * 100 : null,
-        rpm_util: !r.routing_unknown && r.rpm_lim ? (r.peak_rpm / r.rpm_lim) * 100 : null,
-      })).sort((a, b) => (b.tpm_util ?? 0) - (a.tpm_util ?? 0));
-    }
-  }, [utilizationRows, scope]);
+  const aggregated = useMemo(
+    () => summarizeQuotaRows(utilizationRows, scope), [utilizationRows, scope]);
+  const sourceLabel = r => scope === 'per-account'
+    ? `${r.modelId} · ${r.region}` : r.accountId;
+  const peakTpmCell = r => (
+    <Box>
+      {r.minute_tpm != null
+        ? <>{fmt(r.minute_tpm)}{' '}
+            <Badge color="grey">{r.quota_src === 'aws_estimate' ? 'AWS est.'
+              : r.quota_src === 'mixed' ? 'mixed' : 'computed'}</Badge>
+          </>
+        : 'unavailable'}
+      <Box fontSize="body-s" color="text-body-secondary">
+        {sourceLabel(r.tpm_observation)}
+      </Box>
+    </Box>
+  );
+  const peakRpmCell = r => (
+    <Box>
+      {r.peak_rpm != null ? fmt(r.peak_rpm) : 'unavailable'}
+      <Box fontSize="body-s" color="text-body-secondary">
+        {sourceLabel(r.rpm_observation)}
+      </Box>
+    </Box>
+  );
 
-  if (peak.loading || quotas.loading) {
+  // A percentage is shown whenever a limit and a measurement exist. A lower
+  // bound is prefixed with "≥" rather than hidden.
+  const utilCell = (value, lowerBound) => value == null ? '—' : (
+    <StatusIndicator type={severityForUtil(value)}>
+      {(lowerBound ? '≥ ' : '') + fmtPct(value)}
+    </StatusIndicator>
+  );
+  // Application-profile traffic has no known quota family, so it has no limit.
+  const limitCell = (limit, routingUnknown) => limit ? fmt(limit)
+    : routingUnknown ? <Box color="text-status-inactive">routing unknown</Box> : '—';
+
+  if (peak.loading) {
     return <ChartLoading height={320} label="Loading capacity + quota data..." />;
+  }
+  if (peak.error) {
+    return <StatusIndicator type="error">Could not load quota utilization. Refresh to try again.</StatusIndicator>;
   }
 
   return (
     <SpaceBetween size="l">
-      {utilizationRows.some(r => r.routing_unknown) && (
-        <Alert type="info">
-          Application profile usage is included, but its quota routing family is
-          unknown. Limits and utilization are unavailable for affected rows.
-        </Alert>
-      )}
       {/* KPI ribbon — fleet-wide quota health at a glance. Above the
            drill-down so the oncall sees the summary first, then drills. */}
       <Grid gridDefinition={[{ colspan: 3 }, { colspan: 3 }, { colspan: 3 }, { colspan: 3 }]}>
-        <KpiCard title="Peak TPM utilization" value={kpis.max_tpm_util == null ? 'Unknown' : fmtPct(kpis.max_tpm_util)} />
-        <KpiCard title="Peak RPM utilization" value={kpis.max_rpm_util == null ? 'Unknown' : fmtPct(kpis.max_rpm_util)} />
+        <KpiCard title="Highest known TPM utilization" value={fmtUtil(kpis.max_tpm_util, kpis.max_tpm_lb)} />
+        <KpiCard title="Highest known RPM utilization" value={fmtUtil(kpis.max_rpm_util, kpis.max_rpm_lb)} />
         <KpiCard title="At quota limit (>100%)"  value={fmt(kpis.at_limit)} />
         <KpiCard title="Approaching limit (80-100%)" value={fmt(kpis.over_80)} />
       </Grid>
 
       {/* Drill-down chart: per-(account · model · region) time series. */}
-      <QuotaDrillDown onInfo={onInfo} />
+      <QuotaDrillDown endpoint={filters.endpoint} onInfo={onInfo} />
 
       {/* Scope + percentile toggle */}
       <Container header={
@@ -264,6 +259,10 @@ function QuotasBody({ filters, onInfo }) {
           }
         />
       }>
+        <Box variant="p" color="text-body-secondary">
+          Each metric shows the most utilized account, model and Region within the group,
+          with its own limit. A percentage marked ≥ is a lower bound because coverage is incomplete.
+        </Box>
         <PaginatedTable
           items={aggregated}
           pageSize={15}
@@ -274,30 +273,40 @@ function QuotasBody({ filters, onInfo }) {
               ? [
                   { id: 'a', header: 'Account ID', cell: r => r.accountId, exportValue: r => r.accountId },
                   { id: 'an', header: 'Account name', cell: r => accountName(r.accountId) || '—', exportValue: r => accountName(r.accountId) },
-                  { id: 'ptpm',  header: 'Peak TPM/min',     cell: r => fmt(Math.round(r.peak_tpm)) },
-                  { id: 'tlim',  header: 'TPM limit',        cell: r => r.tpm_lim ? fmt(r.tpm_lim) : '—' },
-                  { id: 'tutil', header: 'TPM util %',       cell: r => r.tpm_util != null
-                                                                       ? <StatusIndicator type={severityForUtil(r.tpm_util)}>{fmtPct(r.tpm_util)}</StatusIndicator>
-                                                                       : '—' },
-                  { id: 'prpm',  header: 'Peak RPM/min',     cell: r => fmt(Math.round(r.peak_rpm)) },
-                  { id: 'rlim',  header: 'RPM limit',        cell: r => r.rpm_lim ? fmt(r.rpm_lim) : '—' },
-                  { id: 'rutil', header: 'RPM util %',       cell: r => r.rpm_util != null
-                                                                       ? <StatusIndicator type={severityForUtil(r.rpm_util)}>{fmtPct(r.rpm_util)}</StatusIndicator>
-                                                                       : '—' },
+                  { id: 'ptpm',  header: 'Peak est. quota TPM (1 min)',
+                    cell: peakTpmCell,
+                    exportValue: r => r.measured_minute ? Math.round(r.minute_tpm) : '' },
+                  { id: 'coverage', header: 'Minute coverage',
+                    cell: r => r.incomplete ? 'Partial / unavailable' : 'Complete to collection time' },
+                  { id: 'havg',  header: 'Hourly avg TPM/min',
+                    cell: r => fmt(Math.round(r.hourly_avg_tpm)) },
+                  { id: 'burst', header: 'Burstiness',
+                    cell: r => r.burstiness_x ? `${r.burstiness_x}x` : '—' },
+                  { id: 'tlim',  header: 'TPM limit',        cell: r => limitCell(r.tpm_lim, r.routing_unknown) },
+                  { id: 'tutil', header: 'TPM util %',       cell: r => utilCell(r.tpm_util, r.tpm_util_lower_bound) },
+                  { id: 'prpm',  header: 'Peak RPM (1 min)', cell: peakRpmCell,
+                    exportValue: r => r.peak_rpm ?? '' },
+                  { id: 'rlim',  header: 'RPM limit',        cell: r => limitCell(r.rpm_lim, r.routing_unknown) },
+                  { id: 'rutil', header: 'RPM util %',       cell: r => utilCell(r.rpm_util, r.rpm_util_lower_bound) },
                 ]
               : [
                   { id: 'm',     header: 'Model',            cell: r => r.modelId },
                   { id: 'r',     header: 'Region',           cell: r => r.region },
-                  { id: 'ptpm',  header: 'Peak TPM/min',     cell: r => fmt(Math.round(r.peak_tpm)) },
-                  { id: 'tlim',  header: 'TPM limit',        cell: r => r.tpm_lim ? fmt(r.tpm_lim) : '—' },
-                  { id: 'tutil', header: 'TPM util %',       cell: r => r.tpm_util != null
-                                                                       ? <StatusIndicator type={severityForUtil(r.tpm_util)}>{fmtPct(r.tpm_util)}</StatusIndicator>
-                                                                       : '—' },
-                  { id: 'prpm',  header: 'Peak RPM/min',     cell: r => fmt(Math.round(r.peak_rpm)) },
-                  { id: 'rlim',  header: 'RPM limit',        cell: r => r.rpm_lim ? fmt(r.rpm_lim) : '—' },
-                  { id: 'rutil', header: 'RPM util %',       cell: r => r.rpm_util != null
-                                                                       ? <StatusIndicator type={severityForUtil(r.rpm_util)}>{fmtPct(r.rpm_util)}</StatusIndicator>
-                                                                       : '—' },
+                  { id: 'ptpm',  header: 'Peak est. quota TPM (1 min)',
+                    cell: peakTpmCell,
+                    exportValue: r => r.measured_minute ? Math.round(r.minute_tpm) : '' },
+                  { id: 'coverage', header: 'Minute coverage',
+                    cell: r => r.incomplete ? 'Partial / unavailable' : 'Complete to collection time' },
+                  { id: 'havg',  header: 'Hourly avg TPM/min',
+                    cell: r => fmt(Math.round(r.hourly_avg_tpm)) },
+                  { id: 'burst', header: 'Burstiness',
+                    cell: r => r.burstiness_x ? `${r.burstiness_x}x` : '—' },
+                  { id: 'tlim',  header: 'TPM limit',        cell: r => limitCell(r.tpm_lim, r.routing_unknown) },
+                  { id: 'tutil', header: 'TPM util %',       cell: r => utilCell(r.tpm_util, r.tpm_util_lower_bound) },
+                  { id: 'prpm',  header: 'Peak RPM (1 min)', cell: peakRpmCell,
+                    exportValue: r => r.peak_rpm ?? '' },
+                  { id: 'rlim',  header: 'RPM limit',        cell: r => limitCell(r.rpm_lim, r.routing_unknown) },
+                  { id: 'rutil', header: 'RPM util %',       cell: r => utilCell(r.rpm_util, r.rpm_util_lower_bound) },
                 ]
           }
           empty="No utilization data yet — run the ingester to populate f_hourly_peak + f_quotas."

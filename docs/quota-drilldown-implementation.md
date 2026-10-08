@@ -26,9 +26,8 @@ one tuple so the answer is yes/no:
   (per-key throttling, regional incident, etc.). Look at the Errors
   tab.
 
-The reference design is the AWS-internal CRIS dashboard chart that a
-colleague shared (peak TPM and peak RPM, each plotted against a
-dashed quota line, with a KPI strip showing Limit / Peak / Avg / Util %).
+The design plots peak TPM and peak RPM, each against a dashed quota
+line, with a KPI strip showing Limit / Peak / Avg / Util %.
 
 ---
 
@@ -549,6 +548,29 @@ metric-specific narrative. SectionInfo entries live in
 
 ---
 
+### 4.8 Minute-by-minute (live)
+
+`LivePullPanel` in the same file, below the hourly cards. Nothing is stored.
+
+| Piece | File | Role |
+|---|---|---|
+| `GET /api/live-pull` | `backend/app/routers/live_pull.py` | `{enabled, hours, cooldown_seconds}`; the button is disabled when the deployment has no live-pull function |
+| `POST /api/live-pull` | same | Validates `{account_id, region, model_id, hours, endpoint}`, refuses a combination Lens has no runtime usage for (422, never 404: CloudFront serves the SPA for every 404), resolves the model plus its application inference profiles and the catalog burndown rate, then invokes the function. A repeat within 15 seconds returns the same result |
+| `<stack>-live-pull` function | `ingestion/live_pull.py` | Runs under the ingester's role. Reads the ingester's current account scope, reader-role name and external ID from its configuration, refuses any account outside that scope before an STS call, then reads `Period=60` sums and combines them with `cw_minute_peak.combine_minutes` |
+
+The backend may invoke only this function (`lambda:InvokeFunction` on its ARN);
+it never assumes monitored-account roles and cannot invoke the ingester.
+
+`combine_minutes` applies `reduce_day`'s rules per minute, and a test pins that
+its maxima equal the stored daily peaks. A minute without any datapoint is drawn
+as zero (Bedrock publishes nothing for a minute without requests). A minute with
+activity whose value cannot be established is omitted and marks the peak as a
+lower bound (`≥`).
+
+Failure states shown in the panel: not configured, bedrock-runtime only,
+account not monitored, reader role not assumable (`no_access`), CloudWatch
+throttling, and an unexpected non-JSON response.
+
 ## 5. Where it lives in the UI
 
 The drill-down is a **section inside the Quotas tab**, not its own
@@ -598,7 +620,7 @@ host wants it.
 
 | Limitation | Why | Mitigation / future work |
 |---|---|---|
-| Hourly granularity, not minute | CW `Period=3600` keeps 14d retention; `Period=60` only keeps 14d at 1-min and 60x's payload | Switch the ingester to `Period=60` if anyone hits an actual minute-burst question. Honest labelling: "per-minute rate derived from hourly bucket" |
+| Stored series is hourly, not minute | Hourly buckets are what Lens keeps for 14 days | The Quotas table shows the measured busiest minute per day; **Pull live data** charts the last 1–24 hours minute by minute (§4.8). The hourly charts stay labelled as per-minute rates derived from hourly buckets |
 | No URL deep-links | Picker state lives in component-local React state | Add `react-router` later. Pattern: `/accounts/{id}/models/{modelId}/{region}` |
 | Tuple list capped at 500 | `LIMIT 500` in the options query | Bump it for very large fleets, or paginate the dropdown |
 | RPM gap for some models | AWS doesn't publish per-model RPM quotas for all SKUs | Derived ceiling = TPM ÷ avg tokens/req. Honest fallback |

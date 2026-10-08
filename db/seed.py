@@ -19,7 +19,7 @@ import math
 import os
 import random
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 try:
     import psycopg
@@ -451,21 +451,31 @@ def seed_hourly_peak(cur, today: date, rng: random.Random) -> int:
                     for region in rng.sample(REGIONS, k=2):
                         base = 6000 * acct_factor * m_factor * wd_mult * h_mult * rng.uniform(0.7, 1.3)
                         total = max(1, int(base))
-                        in_tok, out_tok, cache_read, _cw = tokens_for(model, total, rng)
+                        in_tok, out_tok, cache_read, cache_write = tokens_for(model, total, rng)
+                        # EstimatedTPMQuotaUsage, as AWS computes it: input +
+                        # cache WRITE + output * burndown rate. Cache reads
+                        # consume no Runtime TPM quota (they are still billed).
+                        # Seeding it lets the demo show quota_tpm_source =
+                        # aws_estimate instead of only the reconstruction.
+                        _rate = 10 if ("sonnet-5" in model or "opus-5" in model) else (
+                            5 if model.startswith("anthropic.") else 1)
+                        est_tpm = in_tok + cache_write + out_tok * _rate
                         # Throttling is a pair-level property (~4% of pairs); reuse
                         # the same characteristic rate so hourly agrees with daily.
                         pair_rate = pair_throttle_rate(acct, model, rng)
                         tr = 0.0 if pair_rate == 0.0 else min(1.0, pair_rate * rng.uniform(0.5, 1.5))
                         s429 = int(total * tr)
                         rows.append((d, hour, acct, model, region, total,
-                                     in_tok, out_tok, cache_read, s429))
+                                     in_tok, out_tok, cache_read, cache_write,
+                                     est_tpm, s429))
     cur.executemany(
         """
         INSERT INTO f_hourly_peak (
             event_date, hour, accountId, modelId, region,
             total_requests, total_input_tokens, total_output_tokens,
-            total_cache_read_input_tokens, status_429_count
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            total_cache_read_input_tokens, total_cache_write_input_tokens,
+            estimated_tpm_quota_usage, status_429_count
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         rows,
     )
@@ -1229,6 +1239,327 @@ def seed_account_names(cur) -> int:
     return len(ACCOUNT_NAMES)
 
 
+# ---------------------------------------------------------------------------
+# Application inference profiles (AIPs)
+# ---------------------------------------------------------------------------
+# Customers who invoke through an AIP pass the profile's ARN (or its bare
+# 12-character id) as modelId, so CloudWatch and the invocation logs record the
+# PROFILE, not the model. Lens resolves it through the lens_read views.
+#
+# These fixtures rewrite the modelId on a slice of ALREADY-SEEDED rows rather
+# than inserting new traffic, so every fleet total — requests, tokens, errors,
+# cost — is byte-identical with and without them. Only the identifier changes,
+# which is exactly what happens in a real deployment.
+#
+# Deliberate coverage:
+#   * two profiles resolving to the SAME model (a per-profile breakdown must keep
+#     one correct model total);
+#   * a multi-Region profile (several destination Regions are ONE model);
+#   * a retained mapping for a deleted profile (api_visible = false);
+#   * an identifier with traffic and NO cache row, which must stay labelled as an
+#     unresolved profile with unknown provider and no cost estimate.
+AIP_MODEL_A = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+AIP_MODEL_B = "amazon.nova-lite-v1:0"
+AIP_MODEL_C = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+# The proxy/gateway telemetry uses a CRIS-prefixed id and a 10x burndown rate.
+AIP_MODEL_D = "us.anthropic.claude-sonnet-5"
+
+AIP_PROFILES = [
+    # (profile_id, name, model, destination_regions, api_visible, source_region, account)
+    ("a1c7f2e49b03", "expense-assistant",  AIP_MODEL_A, ["us-east-1"], True,
+     "us-east-1", "482915037461"),
+    ("b4e8d1a65c92", "support-summarizer", AIP_MODEL_A, ["us-east-1"], True,
+     "us-east-1", "482915037461"),
+    ("c9f3b7d20e58", "doc-indexer",        AIP_MODEL_B,
+     ["us-east-1", "us-west-2", "eu-west-1"], True, "us-west-2", "739104826355"),
+    ("d2a6c8e13f74", "legacy-chatbot",     AIP_MODEL_C, ["us-east-1"], False,
+     "us-east-1", "108462973558"),
+    # Gateway path. The proxy telemetry table attributes traffic to a dimension
+    # (team / workload / user) rather than an account, so its rows carry the
+    # '__none__' account sentinel and a CRIS-prefixed model. Covering it keeps
+    # the attribution tabs honest for customers whose gateway fronts Bedrock,
+    # and Sonnet 5 exercises the 10x output burndown rate.
+    ("f5d0a93b1c67", "gateway-router",     AIP_MODEL_D, ["us-east-1"], True,
+     "us-east-1", "__none__"),
+]
+# Traffic exists for this one but no profile is cached, so it must render as
+# "Unresolved profile (...)" with an unknown provider and no cost estimate.
+AIP_UNRESOLVED_ID = "e7b1f4906d35"
+AIP_UNRESOLVED_ACCOUNT = "651037298144"
+AIP_UNRESOLVED_REGION = "us-east-1"
+AIP_UNRESOLVED_MODEL = "amazon.nova-micro-v1:0"
+
+# Raw telemetry tables whose modelId is the identifier the caller passed.
+# f_minute_peak is deliberately absent: the ingester writes it ALREADY resolved,
+# because per-identifier maxima cannot be recombined into a true peak later.
+_AIP_RAW_TABLES = ("f_daily", "f_daily_tagged", "f_hourly_peak", "f_hourly_errors",
+                   "f_hourly_status", "f_daily_by_identity", "f_latency_daily",
+                   "f_context_length", "f_proxy_dim_hourly")
+
+
+def _profile_arn(account: str, region: str, profile_id: str) -> str:
+    return f"arn:aws:bedrock:{region}:{account}:application-inference-profile/{profile_id}"
+
+
+def seed_inference_profiles(cur, today: date, rng: random.Random) -> int:
+    """Insert the profile cache, then relabel a slice of existing traffic.
+
+    Returns the number of relabelled rows. Totals are conserved: this only
+    rewrites modelId in place.
+    """
+    cur.execute("SELECT to_regclass('dim_inference_profiles')")
+    if cur.fetchone()[0] is None:
+        return 0
+
+    rows = []
+    for pid, name, model, dests, visible, region, account in AIP_PROFILES:
+        arn = _profile_arn(account, region, pid)
+        model_arns = [f"arn:aws:bedrock:{r}::foundation-model/{model}" for r in dests]
+        rows.append((account, region, pid, arn, name, model, model_arns, dests, visible))
+    cur.executemany(
+        """
+        INSERT INTO dim_inference_profiles (
+            accountId, region, profile_id, profile_arn, profile_name,
+            model_id, model_arns, destination_regions, last_seen_at, api_visible
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s, now(), %s)
+        ON CONFLICT (accountId, region, profile_id) DO NOTHING
+        """,
+        rows,
+    )
+
+    # Relabel. Each profile claims a deterministic slice of its model's rows in
+    # its own account/Region so the two same-model profiles stay distinguishable.
+    # The ARN form is used for some and the bare id for others, because
+    # CloudWatch and the invocation logs are both observed in the wild.
+    relabelled = 0
+    plans = [
+        # (identifier, model, account, region, day_predicate)
+        # expense-assistant is invoked BOTH ways: the full ARN on some days and
+        # the bare 12-character id on others. Real callers do this (different code
+        # paths, copied from different places), and the usage table must combine
+        # them into one profile row rather than showing the profile twice.
+        (_profile_arn("482915037461", "us-east-1", "a1c7f2e49b03"), AIP_MODEL_A,
+         "482915037461", "us-east-1",
+         "EXTRACT(DAY FROM event_date)::int %% 4 = 0"),
+        ("a1c7f2e49b03", AIP_MODEL_A,
+         "482915037461", "us-east-1",
+         "EXTRACT(DAY FROM event_date)::int %% 4 = 2"),
+        ("b4e8d1a65c92", AIP_MODEL_A,
+         "482915037461", "us-east-1", "EXTRACT(DAY FROM event_date)::int %% 2 = 1"),
+        (_profile_arn("739104826355", "us-west-2", "c9f3b7d20e58"), AIP_MODEL_B,
+         "739104826355", "us-west-2", "TRUE"),
+        ("d2a6c8e13f74", AIP_MODEL_C,
+         "108462973558", "us-east-1", "TRUE"),
+        (AIP_UNRESOLVED_ID, AIP_UNRESOLVED_MODEL,
+         AIP_UNRESOLVED_ACCOUNT, AIP_UNRESOLVED_REGION, "TRUE"),
+        # Gateway/proxy path: dimension-attributed rows under the '__none__'
+        # account sentinel.
+        ("f5d0a93b1c67", AIP_MODEL_D, "__none__", "us-east-1", "TRUE"),
+    ]
+    for table in _AIP_RAW_TABLES:
+        cur.execute("SELECT to_regclass(%s)", (table,))
+        if cur.fetchone()[0] is None:
+            continue
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name=%s", (table,))
+        cols = {r[0] for r in cur.fetchall()}
+        if not {"modelid", "accountid", "region", "event_date"} <= cols:
+            continue
+        # Runtime rows ONLY. These are bedrock-runtime application inference
+        # profiles, and the lens_read projection deliberately guards resolution
+        # by endpoint. Relabelling a mantle row with a Runtime profile ARN would
+        # invent traffic that cannot exist, and the view would correctly refuse
+        # to resolve it — silently moving the model's total.
+        endpoint_guard = " AND endpoint = 'runtime'" if "endpoint" in cols else ""
+        # Leave SOME of the model's traffic on its bare id in the same
+        # account/Region/day, so profile and direct series are coincident. That
+        # is the realistic case (an app moving only some call paths onto a
+        # profile) and the one that forces the collector to sum both series
+        # minute by minute before reducing to a peak.
+        if "hour" in cols:
+            split = " AND hour %% 2 = 0"
+        elif "operation" in cols:
+            split = " AND operation = 'Converse'"
+        else:
+            split = ""
+        for identifier, model, account, region, day_pred in plans:
+            cur.execute(
+                sql.SQL(
+                    "UPDATE {} SET modelId = %s "
+                    " WHERE modelId = %s AND accountId = %s AND region = %s AND "
+                    + day_pred + endpoint_guard + split
+                ).format(sql.Identifier(table)),
+                (identifier, model, account, region),
+            )
+            relabelled += cur.rowcount
+    return relabelled
+
+
+def seed_minute_peak(cur, today: date, rng: random.Random) -> int:
+    """Measured busiest-MINUTE rows, derived from the seeded hourly rows.
+
+    Shape, not invention: each row's peak minute is a burstiness multiple of that
+    day's busiest hourly average, clamped so a single minute can never exceed its
+    own hour's total. Chatty embedding traffic is near-flat; interactive Claude
+    traffic is spiky, which is what makes the hourly average misleading.
+
+    Rows are written ALREADY RESOLVED (profile identifiers mapped to their model,
+    contributing identifiers listed in source_ids), matching what
+    ingestion/cw_minute_peak.py produces. The quota peak and the request peak get
+    their own timestamps because they genuinely occur in different minutes.
+    """
+    cur.execute("SELECT to_regclass('f_minute_peak')")
+    if cur.fetchone()[0] is None:
+        return 0
+
+    # Resolve profile identifiers back to models so these rows look like the
+    # collector's output rather than the raw telemetry's.
+    cur.execute("SELECT profile_arn, profile_id, model_id FROM dim_inference_profiles")
+    resolve = {}
+    for arn, pid, model in cur.fetchall():
+        if model:
+            resolve[arn] = model
+            resolve[pid] = model
+
+    # Busiest hour per (day, account, model, region) from the seeded hourly rows.
+    cur.execute(
+        """
+        SELECT event_date, accountId, modelId, region,
+               MAX(total_requests), MAX(total_input_tokens), MAX(total_output_tokens),
+               MAX(COALESCE(total_cache_write_input_tokens, 0)),
+               MAX(COALESCE(estimated_tpm_quota_usage, 0))
+          FROM f_hourly_peak
+         WHERE endpoint = 'runtime' AND event_date >= %s
+         GROUP BY event_date, accountId, modelId, region
+        """,
+        (today - timedelta(days=13),),
+    )
+    source = cur.fetchall()
+
+    # Collapse profile identifiers into their model, exactly as the collector
+    # does, summing the contributing series before any peak is taken.
+    merged: dict[tuple, dict] = {}
+    for d, acct, raw_model, region, req, inp, out, cwrite, native in source:
+        model = resolve.get(raw_model, raw_model)
+        key = (d, acct, model, region)
+        m = merged.setdefault(key, {"req": 0, "inp": 0, "out": 0, "cwrite": 0,
+                                    "native": 0, "ids": set(), "profile": False})
+        m["req"] += int(req or 0)
+        m["inp"] += int(inp or 0)
+        m["out"] += int(out or 0)
+        m["cwrite"] += int(cwrite or 0)
+        m["native"] += int(native or 0)
+        m["ids"].add(raw_model)
+        if raw_model in resolve:
+            m["profile"] = True
+
+    rows = []
+    for (d, acct, model, region), m in merged.items():
+        if m["req"] <= 0:
+            continue
+        # Burstiness: embeddings and micro models are near-flat; interactive
+        # Claude traffic arrives in bursts.
+        if "embed" in model or "micro" in model:
+            burst = rng.uniform(1.5, 4.0)
+            burst_rpm = rng.uniform(1.5, 3.5)
+        elif "nova" in model:
+            burst = rng.uniform(3.0, 9.0)
+            burst_rpm = rng.uniform(2.5, 7.0)
+        else:
+            burst = rng.uniform(8.0, 30.0)
+            burst_rpm = rng.uniform(4.0, 15.0)
+
+        # A minute cannot exceed its own hour.
+        def minute_of(hourly_total: int, factor: float) -> int:
+            return int(min(hourly_total, (hourly_total / 60.0) * factor))
+
+        rate = 10 if ("sonnet-5" in model or "opus-5" in model) else (
+            5 if "claude" in model else 1)
+        peak_in = minute_of(m["inp"] + m["cwrite"], burst)
+        peak_out = minute_of(m["out"], burst)
+        peak_rpm = max(1, minute_of(m["req"], burst_rpm))
+        if m["native"] > 0:
+            peak_quota = minute_of(m["native"], burst)
+            source_label = "aws_estimate"
+        else:
+            peak_quota = peak_in + peak_out * rate
+            source_label = "reconstructed"
+        # Partial native coverage is a per-MODEL property in practice: AWS
+        # publishes EstimatedTPMQuotaUsage for some models and not others, so a
+        # given model is consistently native, consistently reconstructed, or
+        # mixed. Keying this on the day instead made almost every model read
+        # "mixed" once the API unioned a 14-day window, which told the operator
+        # the fleet was guessing when it was not.
+        if source_label == "aws_estimate" and "haiku" in model:
+            source_label = "mixed"
+
+        base = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        quota_minute = base + timedelta(minutes=rng.randrange(0, 1440))
+        rpm_minute = base + timedelta(minutes=rng.randrange(0, 1440))
+        rows.append((d, acct, model, region, "runtime",
+                     peak_rpm, rpm_minute, peak_in, peak_out,
+                     peak_quota, quota_minute, source_label, rate, "bundled_catalog",
+                     sorted(m["ids"]), m["profile"],
+                     rng.randrange(20, 1200), False))
+
+    cur.executemany(
+        """
+        INSERT INTO f_minute_peak (
+            event_date, accountId, modelId, region, endpoint,
+            peak_rpm, peak_rpm_at, peak_input_tpm, peak_output_tpm,
+            peak_quota_tpm, peak_quota_tpm_at, quota_tpm_source,
+            burndown_rate, burndown_rate_source, source_ids,
+            has_application_profile, active_minutes, resolution_stale
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (event_date, accountId, modelId, region, endpoint) DO NOTHING
+        """,
+        rows,
+    )
+
+    # Collection coverage, separate from active datapoints. Today is partial by
+    # definition; one older day is marked incomplete so the UI must disclose it.
+    cov = []
+    for (d, acct, _model, region) in merged:
+        cov.append((d, acct, region))
+    now_utc = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    seen = set()
+    cov_rows = []
+    for d, acct, region in cov:
+        if (d, acct, region) in seen:
+            continue
+        seen.add((d, acct, region))
+        start = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        # Match the collector's semantics exactly. The current day is still
+        # open (partial_day=true) but a successful pull of it so far is status
+        # 'complete'; 'partial' means a source series came back incomplete. An
+        # earlier revision marked today 'partial', which made every window that
+        # included today look incompletely collected.
+        open_day = (d == today)
+        # Genuinely incomplete pulls: a few (account, day) pairs, so the demo
+        # shows some exact percentages and some lower bounds side by side.
+        failed_pull = (d.toordinal() + int(acct[-2:])) % 17 == 0 and not open_day
+        status = "partial" if failed_pull else "complete"
+        end = now_utc if open_day else start + timedelta(days=1)
+        cov_rows.append((d, acct, region, "runtime", start, end,
+                         status,
+                         "a source series returned PartialData" if failed_pull else None,
+                         45, 41 if failed_pull else 45, open_day,
+                         end))
+    cur.executemany(
+        """
+        INSERT INTO f_minute_collection (
+            event_date, accountId, region, endpoint, window_start, window_end,
+            status, detail, series_requested, series_complete, partial_day,
+            last_success_at
+        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (event_date, accountId, region, endpoint) DO NOTHING
+        """,
+        cov_rows,
+    )
+    return len(rows)
+
+
 def truncate_facts(cur) -> None:
     cur.execute(
         """
@@ -1244,7 +1575,8 @@ def truncate_facts(cur) -> None:
     # TRUNCATE would abort the transaction and undo the truncate above) so
     # seeding still works against an older DB that predates them.
     for tbl in ("f_daily_by_identity", "f_daily_guardrails", "f_daily_agentcore",
-                "f_proxy_dim_hourly", "dim_proxy_dimensions"):
+                "f_proxy_dim_hourly", "dim_proxy_dimensions",
+                "dim_inference_profiles", "f_minute_peak", "f_minute_collection"):
         cur.execute("SELECT to_regclass(%s)", (tbl,))
         if cur.fetchone()[0] is not None:
             cur.execute(sql.SQL("TRUNCATE {}").format(sql.Identifier(tbl)))
@@ -1349,6 +1681,20 @@ def main() -> int:
             if _has("dim_account"):
                 print("[7f/8] seeding dim_account (account names)...")
                 n = seed_account_names(cur)
+                print(f"      {n:,} rows")
+
+            # AIPs LAST among the fact seeders: it relabels modelId on rows the
+            # seeders above wrote, so it must see all of them. Totals are
+            # conserved — only the identifier changes.
+            if _has("dim_inference_profiles"):
+                print("[7g/8] seeding application inference profiles (relabel, totals conserved)...")
+                n = seed_inference_profiles(cur, today, rng)
+                print(f"      {n:,} rows relabelled to profile identifiers")
+            # Minute peaks AFTER the relabel, so profile identifiers resolve and
+            # their series are summed before the peak is taken.
+            if _has("f_minute_peak"):
+                print("[7h/8] seeding f_minute_peak (measured busiest minute)...")
+                n = seed_minute_peak(cur, today, rng)
                 print(f"      {n:,} rows")
 
             print("[8/8] seeding f_quotas + dim_tags + meta...")

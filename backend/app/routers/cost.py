@@ -264,7 +264,7 @@ async def cost_by_model_detailed(f: FilterSet = Depends(parse_filters)):
     usage_rows = await db.fetch(
         f"""
         SELECT modelId,
-               SUM(total_input_tokens + total_output_tokens)::BIGINT AS total_tokens,
+               SUM(COALESCE(total_input_tokens, 0) + COALESCE(total_output_tokens, 0))::BIGINT AS total_tokens,
                SUM(total_input_tokens)::BIGINT  AS input_tokens,
                SUM(total_output_tokens)::BIGINT AS output_tokens,
                SUM(total_requests)::BIGINT      AS total_requests

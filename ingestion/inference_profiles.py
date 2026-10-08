@@ -27,7 +27,7 @@ _PROFILE_ARN = re.compile(
 _MODEL_ARN = re.compile(
     r"^arn:aws[a-z-]*:bedrock:([a-z0-9-]+)::foundation-model/([^/]+)$"
 )
-_OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_OPAQUE_ID = re.compile(r"^[A-Za-z0-9]{12}$")
 
 
 def profile_record(profile: dict, account: str, region: str) -> tuple:
@@ -92,11 +92,27 @@ def read_profiles(client, account: str, region: str,
         attempted.add(pid)
         try:
             profile = client.get_inference_profile(inferenceProfileIdentifier=identifier)
-            row = profile_record(profile, account, region)
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "ClientError")
             if code != "ResourceNotFoundException":
                 warnings.append(f"GetInferenceProfile: {code}")
+            continue
+        # A cross-Region (CRIS) identifier such as "us.anthropic.claude-sonnet-5"
+        # is a valid Get target and returns type=SYSTEM_DEFINED. That is an
+        # ordinary, expected answer meaning "not an application profile", so skip
+        # it quietly. Letting profile_record raise here aborted discovery for the
+        # WHOLE Region: observed live on 2026-10-06, where one CRIS id in
+        # us-east-1 left every application profile in that Region unresolved
+        # while us-west-2 resolved 19. Any region with cross-Region traffic — most
+        # of them — would silently stop resolving profile hashes.
+        if profile.get("type") != "APPLICATION":
+            continue
+        try:
+            row = profile_record(profile, account, region)
+        except ValueError as exc:
+            # A genuinely malformed or foreign-owned record: report it and keep
+            # going, rather than discarding this Region's discovery.
+            warnings.append(f"GetInferenceProfile: {exc}")
             continue
         records[row[2]] = row
         aliases.update((row[2], row[3]))
@@ -133,6 +149,11 @@ async def refresh_region(conn, client, account: str, region: str, days: int = 14
     unresolved_observed = {
         r["modelid"] for r in observed
         if is_profile_reference(r["modelid"], account, region)
+        # System profile ARNs may be probed, but they are not missing AIP
+        # mappings. Bare model names such as claude-sonnet-5 are not IDs either.
+        and ("/" not in r["modelid"]
+             or ":application-inference-profile/" in r["modelid"]
+             or _OPAQUE_ID.fullmatch(r["modelid"].rsplit("/", 1)[-1]))
         and r["modelid"] not in resolved_aliases
     }
     # No delete/reinsert: a deleted profile's mapping is still needed by history.

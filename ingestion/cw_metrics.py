@@ -147,20 +147,11 @@ def _safe_id(prefix: str, idx: int) -> str:
 
 
 def _native_or_none(bucket: dict, key: str) -> int | None:
-    """Preserve the difference between "AWS returned no datapoint" and "AWS
-    returned zero" for EstimatedTPMQuotaUsage.
+    """Keep absent measurements distinct from an observed zero.
 
-    Every other counter here is a Sum where absent and zero mean the same thing,
-    so `or 0` is right for them. This one is different: it is the only
-    AWS-COMPUTED quota-consumption observation we store, and consumers choose
-    between it and a locally reconstructed estimate. Flattening a missing
-    datapoint to 0 asserted "AWS measured no quota consumption in this hour",
-    which made a model with no published metric look permanently idle and
-    suppressed the reconstruction fallback that should have covered it.
-
-    The column (f_hourly_peak.estimated_tpm_quota_usage) is already nullable, so
-    only the loader was destroying the distinction. Rows written before this fix
-    are ambiguous zeros and cannot be retroactively classified.
+    Cache advice and quota reconstruction depend on this distinction. Existing
+    nullable columns preserve it; historical zeroes cannot be reclassified
+    without collecting their metrics again.
     """
     v = bucket.get(key)
     return None if v is None else int(v)
@@ -347,10 +338,10 @@ async def _ingest_region(conn: asyncpg.Connection, account: str, region: str,
             total,                          # total_requests = attempts
             successes,                      # successful (Invocations, as reported)
             failed,                         # failed (4xx + 5xx; throttles separate)
-            int(m.get("total_input_tokens", 0) or 0),
+            _native_or_none(m, "total_input_tokens"),
             int(m.get("total_output_tokens", 0) or 0),
-            int(m.get("total_cache_read_input_tokens", 0) or 0),
-            int(m.get("total_cache_write_input_tokens", 0) or 0),
+            _native_or_none(m, "total_cache_read_input_tokens"),
+            _native_or_none(m, "total_cache_write_input_tokens"),
             non_throttle_4xx, 0, c429,      # status_400 (non-throttle 4xx), 403=0, status_429 (real)
             c5xx, 0,                        # status_500 = ALL 5xx (aggregate); 503=0
             int(m.get("total_input_text_tokens", 0) or 0),

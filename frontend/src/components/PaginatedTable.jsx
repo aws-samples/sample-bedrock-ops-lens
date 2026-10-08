@@ -102,6 +102,8 @@ export default function PaginatedTable({
   // `downloadFileName` names the file (defaults to bedrock-ops-lens-export.csv).
   downloadable = true,
   downloadFileName = 'bedrock-ops-lens-export.csv',
+  // Wrap long cell text instead of scrolling the table sideways.
+  wrapLines = false,
 }) {
   const [pageSize, setPageSize] = useState(initialPageSize);
   const [visible, setVisible] = useState(columnDefinitions.map(c => c.id));
@@ -203,6 +205,7 @@ export default function PaginatedTable({
       header={header}
       columnDefinitions={visibleCols}
       items={displayItems}
+      wrapLines={wrapLines}
       sortingDisabled
       {...(tableTrackBy ? { trackBy: tableTrackBy } : {})}
       filter={

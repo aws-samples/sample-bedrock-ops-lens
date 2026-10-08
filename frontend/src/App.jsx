@@ -283,7 +283,7 @@ function FilterBar({ filters, setFilters, hideTraffic }) {
     return { valid: true };
   };
 
-  // Label-less filter row — matches the internal Bedrock Lens convention.
+  // Label-less filter row.
   // Every control's SELECTED VALUE is its own label:
   //   "All Providers" / "Last 14 days" / "All Regions" — the placeholder /
   //   default option text tells the user what the field controls. When a
@@ -612,8 +612,7 @@ function AppShell() {
         identity={{
           href: '#/overview',
           title: 'Bedrock Ops Lens',
-          // Public AWS-hosted "smile" mark — same image the internal Bedrock
-          // Lens uses in its TopNavigation. Hosted at awsstatic.com (CDN);
+          // Public AWS-hosted "smile" mark, served from awsstatic.com (CDN);
           // no auth required.
           logo: {
             src: 'https://a0.awsstatic.com/libra-css/images/logos/aws_smile-header-desktop-en-white_59x35@2x.png',
@@ -621,11 +620,11 @@ function AppShell() {
           },
         }}
         utilities={[
-          // Theme toggle. Icon-only button matching the internal Bedrock Lens:
-          // moon glyph in light mode (clicking switches to dark) and a sun
-          // glyph in dark mode (clicking switches back to light). No text
-          // label — the icon itself is the affordance, and the aria-label
-          // covers screen-reader users.
+          // Theme toggle. Icon-only button: moon glyph in light mode
+          // (clicking switches to dark) and a sun glyph in dark mode
+          // (clicking switches back to light). No text label — the icon
+          // itself is the affordance, and the aria-label covers
+          // screen-reader users.
           {
             type: 'button',
             iconSvg: theme === 'dark' ? (

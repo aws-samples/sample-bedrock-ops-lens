@@ -1,0 +1,106 @@
+{
+  "_about": "Reviewed prompt-caching capabilities for exact Amazon Bedrock model IDs. Ops Review builds its caching section only from this file and measured CloudWatch cache metrics. A model that is not listed gets no recommendation. Update entries when AWS documentation changes, and bump catalog_version.",
+  "catalog_version": "2026-10-07",
+  "reviewed_on": "2026-10-07",
+  "guide_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html",
+  "families": {
+    "anthropic": {
+      "support": "documented",
+      "implicit": true,
+      "explicit": true,
+      "max_checkpoints": 4,
+      "checkpoint_fields": ["tools", "system", "messages"],
+      "ttl": ["5 minutes", "1 hour"],
+      "api_guidance": {
+        "Converse": "a `cachePoint` block",
+        "InvokeModel": "`cache_control: {\"type\": \"ephemeral\"}` on the last stable block"
+      },
+      "input_tokens_exclude_cache": true,
+      "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html"
+    },
+    "amazon_nova": {
+      "support": "documented",
+      "implicit": true,
+      "explicit": true,
+      "min_tokens_per_checkpoint": 1000,
+      "min_tokens_display": "1K",
+      "max_checkpoints": 4,
+      "max_cached_tokens": 20000,
+      "max_cached_tokens_display": "20K",
+      "checkpoint_fields": ["system", "messages"],
+      "ttl": ["5 minutes"],
+      "api_guidance": {
+        "Converse": "a `cachePoint` block",
+        "InvokeModel": "a `cachePoint` block"
+      },
+      "input_tokens_exclude_cache": true
+    },
+    "openai_explicit": {
+      "support": "documented",
+      "implicit": true,
+      "explicit": true,
+      "min_tokens_per_checkpoint": 1024,
+      "max_checkpoints": 4,
+      "ttl": ["30 minutes"],
+      "api_guidance": {
+        "Responses": "`prompt_cache_breakpoint: {\"mode\": \"explicit\"}` on the content block that ends the prefix"
+      },
+      "input_tokens_exclude_cache": false,
+      "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html"
+    },
+    "openai_implicit": {
+      "support": "documented",
+      "implicit": true,
+      "explicit": false,
+      "min_tokens_per_checkpoint": 1024,
+      "input_tokens_exclude_cache": false,
+      "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html"
+    },
+    "not_documented": {
+      "support": "not_documented",
+      "implicit": false,
+      "explicit": false,
+      "input_tokens_exclude_cache": false
+    }
+  },
+  "models": [
+    {"name": "Claude Sonnet 5.5", "family": "anthropic", "model_ids": ["anthropic.claude-sonnet-5-5"], "min_tokens_per_checkpoint": 512},
+    {"name": "Claude Opus 5.5", "family": "anthropic", "model_ids": ["anthropic.claude-opus-5-5"], "min_tokens_per_checkpoint": 512},
+    {"name": "Claude Fable 5.1", "family": "anthropic", "model_ids": ["anthropic.claude-fable-5-1"], "min_tokens_per_checkpoint": 512},
+    {"name": "Claude Mythos 5.1", "family": "anthropic", "model_ids": ["anthropic.claude-mythos-5-1"], "min_tokens_per_checkpoint": 512, "release": "Gated"},
+    {"name": "Claude Fable 5", "family": "anthropic", "model_ids": ["anthropic.claude-fable-5"], "min_tokens_per_checkpoint": 512},
+    {"name": "Claude Mythos 5", "family": "anthropic", "model_ids": ["anthropic.claude-mythos-5"], "min_tokens_per_checkpoint": 512, "release": "Gated"},
+    {"name": "Claude Opus 5", "family": "anthropic", "model_ids": ["anthropic.claude-opus-5"], "min_tokens_per_checkpoint": 512},
+    {"name": "Claude Opus 4.8", "family": "anthropic", "model_ids": ["anthropic.claude-opus-4-8"], "min_tokens_per_checkpoint": 1024},
+    {"name": "Claude Opus 4.7", "family": "anthropic", "model_ids": ["anthropic.claude-opus-4-7"], "min_tokens_per_checkpoint": 4096},
+    {"name": "Claude Opus 4.6", "family": "anthropic", "model_ids": ["anthropic.claude-opus-4-6-v1"], "min_tokens_per_checkpoint": 4096},
+    {"name": "Claude Opus 4.5", "family": "anthropic", "model_ids": ["anthropic.claude-opus-4-5-20251101-v1:0"], "min_tokens_per_checkpoint": 4096},
+    {"name": "Claude Sonnet 5", "family": "anthropic", "model_ids": ["anthropic.claude-sonnet-5"], "min_tokens_per_checkpoint": 1024},
+    {"name": "Claude Sonnet 4.6", "family": "anthropic", "model_ids": ["anthropic.claude-sonnet-4-6"], "min_tokens_per_checkpoint": 1024},
+    {"name": "Claude Sonnet 4.5", "family": "anthropic", "model_ids": ["anthropic.claude-sonnet-4-5-20250929-v1:0"], "min_tokens_per_checkpoint": 1024},
+    {"name": "Claude 3.7 Sonnet", "family": "anthropic", "model_ids": ["anthropic.claude-3-7-sonnet-20250219-v1:0"], "min_tokens_per_checkpoint": 1024, "ttl": ["5 minutes"]},
+    {"name": "Claude 3.5 Sonnet v2", "family": "anthropic", "model_ids": ["anthropic.claude-3-5-sonnet-20241022-v2:0"], "min_tokens_per_checkpoint": 1024, "ttl": ["5 minutes"], "release": "Preview"},
+    {"name": "Claude Haiku 4.5", "family": "anthropic", "model_ids": ["anthropic.claude-haiku-4-5-20251001-v1:0"], "min_tokens_per_checkpoint": 4096},
+
+    {"name": "Nova Micro", "family": "amazon_nova", "model_ids": ["amazon.nova-micro-v1:0"], "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-micro.html"},
+    {"name": "Nova Lite", "family": "amazon_nova", "model_ids": ["amazon.nova-lite-v1:0"], "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-lite.html"},
+    {"name": "Nova Pro", "family": "amazon_nova", "model_ids": ["amazon.nova-pro-v1:0"], "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-pro.html"},
+    {"name": "Nova 2 Lite", "family": "amazon_nova", "model_ids": ["amazon.nova-2-lite-v1:0"], "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-amazon-nova-2-lite.html"},
+
+    {"name": "GPT-6.1 Sol", "family": "openai_explicit", "model_ids": ["openai.gpt-6.1-sol"],
+     "api_guidance": {
+       "Responses": "`prompt_cache_breakpoint: {\"mode\": \"explicit\"}` on the `input_text` block that ends the prefix",
+       "Chat Completions": "`prompt_cache_breakpoint: {\"mode\": \"explicit\"}` on the `text` content part that ends the prefix",
+       "InvokeModel": "`prompt_cache_breakpoint: {\"mode\": \"explicit\"}` on the `text` content part that ends the prefix"
+     },
+     "notes": "Converse does not support explicit caching for this model."},
+    {"name": "GPT-5.6 Sol", "family": "openai_explicit", "model_ids": ["openai.gpt-5.6-sol"]},
+    {"name": "GPT-5.6 Terra", "family": "openai_explicit", "model_ids": ["openai.gpt-5.6-terra"]},
+    {"name": "GPT-5.6 Luna", "family": "openai_explicit", "model_ids": ["openai.gpt-5.6-luna"]},
+    {"name": "GPT-5.5", "family": "openai_implicit", "model_ids": ["openai.gpt-5.5"]},
+    {"name": "GPT-5.4", "family": "openai_implicit", "model_ids": ["openai.gpt-5.4"]},
+
+    {"name": "gpt-oss-120b", "family": "not_documented", "model_ids": ["openai.gpt-oss-120b-1:0", "openai.gpt-oss-120b"], "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-oss-120b.html"},
+    {"name": "gpt-oss-20b", "family": "not_documented", "model_ids": ["openai.gpt-oss-20b-1:0", "openai.gpt-oss-20b"], "doc_url": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-openai-gpt-oss-20b.html"}
+  ]
+}

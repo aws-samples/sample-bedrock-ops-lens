@@ -57,6 +57,12 @@ role to collect data. Both sides must allow the call:
 * The target reader's trust policy allows the central ingester's IAM role ARN.
   An optional external-ID condition must also match.
 
+The Quota drill-down's **Pull live data** runs in its own function under the same
+`IngesterLambdaRole`. On every pull it reads the ingester's current account scope,
+reader-role name and external ID from the ingester function's configuration, so
+target accounts need nothing extra and the pull reaches only the accounts
+ingestion is configured to read.
+
 The reader policy allows CloudWatch metric reads, Service Quotas reads, selected
 Bedrock configuration/model reads, and `account:GetAccountInformation`. It does
 not allow model invocation or IAM administration. The complete policy is in

@@ -7,12 +7,20 @@ about that: the burndown-risk widget compared the hourly total directly against
 a per-minute quota (60x too high), and the Ops Review multiplied an hourly
 request total by 60 to get "RPM" (3,600x the true hourly-average rate).
 
-There is no minute-resolution source in this schema, so a TRUE minute peak is
-not derivable. What we can state honestly is the *hourly-average* per-minute
-rate: hourly_total / 60. Six thousand calls in one minute and six thousand
-spread evenly across an hour share an hourly total of 6,000 but have real peaks
-of 6,000 and 100 RPM respectively — so this value is a LOWER BOUND on the true
-peak, and every label must say "hourly-average", never "peak".
+For rows sourced from `f_hourly_peak` a TRUE minute peak is not derivable. What
+we can state honestly is the *hourly-average* per-minute rate: hourly_total / 60.
+Six thousand calls in one minute and six thousand spread evenly across an hour
+share an hourly total of 6,000 but have real peaks of 6,000 and 100 RPM
+respectively — so this value is a LOWER BOUND on the true peak, and every label
+must say "hourly-average", never "peak".
+
+Migration 014 added `f_minute_peak`, which IS minute-resolution (CloudWatch
+Period=60, reduced per UTC day). Measured on 2026-10-06 for
+us.anthropic.claude-sonnet-5, the hourly average read 2,838 TPM while the true
+busiest minute was 90,888 — a 32x gap, which is why the lower bound could not be
+left as the only available number. Values from that table use
+MEASURED_MINUTE_BASIS; values derived from hourly totals keep PER_MINUTE_BASIS.
+Never put the two in the same field.
 
 Helpers here are deliberately tiny; the point is that exactly one definition
 exists and both call sites import it.
@@ -24,6 +32,13 @@ MINUTES_PER_HOUR = 60
 # Name used in API payloads/labels so the approximation travels with the value.
 PER_MINUTE_BASIS = "hourly_average"
 PER_MINUTE_BASIS_LABEL = "hourly average (per-minute rate derived from hourly totals)"
+
+# Since migration 014 a minute-resolution source DOES exist: f_minute_peak,
+# collected at CloudWatch Period=60 and reduced per UTC day. Values read from it
+# carry this basis instead, so a reader can tell a measured minute from a derived
+# hourly average. The two must never be mixed in one field.
+MEASURED_MINUTE_BASIS = "measured_minute"
+MEASURED_MINUTE_BASIS_LABEL = "measured busiest minute (CloudWatch Period=60)"
 
 
 def hourly_total_to_per_minute(hourly_total: float | int | None) -> float:

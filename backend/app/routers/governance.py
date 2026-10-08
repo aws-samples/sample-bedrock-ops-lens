@@ -51,7 +51,7 @@ async def _observed(f: FilterSet) -> list[dict]:
             SELECT COALESCE(NULLIF(principal_group, ''), principal_arn) AS app,
                    modelId,
                    SUM(total_requests)::BIGINT AS invocations,
-                   SUM(total_input_tokens + total_output_tokens)::BIGINT AS tokens
+                   SUM(COALESCE(total_input_tokens, 0) + COALESCE(total_output_tokens, 0))::BIGINT AS tokens
             FROM f_daily_by_identity
             WHERE event_date BETWEEN $1::date AND $2::date
             GROUP BY 1, 2

@@ -12,71 +12,79 @@
 
 *Figure 3: Overview tab showing fleet-wide KPI tiles and a 7-day request volume breakdown by model across all accounts*
 
-## Quotas
-![Quota utilization charts (TPM and RPM vs. limits) with a filterable table](../images/screenshots/quotas.png)
+![Application inference profiles table with invoked identifiers, resolved model, account, Region and requests](../images/screenshots/overview-inference-profiles.png)
 
-*Figure 4: Quotas tab comparing peak TPM/RPM against applied Service Quotas limits, with a filterable utilization table per account and model*
+*Figure 4: Overview tab's application inference profile table: each profile's name, how it was invoked (ARN or short ID), the foundation model it resolved to, and its usage*
+
+## Quotas
+![Quota utilization KPIs and the per-account, model and Region drill-down against the applied limit](../images/screenshots/quotas.png)
+
+*Figure 5: Quotas tab with the highest known TPM and RPM utilization (a value marked ≥ is a lower bound) and the per-account, model and Region drill-down against the applied Service Quotas limit*
 
 ## Cost Insights
 ![Daily spend by model family stacked chart with a sortable cost table](../images/screenshots/cost-insights.png)
 
-*Figure 5: Cost Insights tab with daily spend stacked by model family and a per-model cost breakdown table*
+*Figure 6: Cost Insights tab with daily spend stacked by model family and a per-model cost breakdown table*
 
 ## Health & Errors
 ![Error status code timeline, throttled vs. 4xx/5xx stacked area, and error rate trend](../images/screenshots/health-errors.png)
 
-*Figure 6: Health & Errors tab with status-code timeline, throttle vs. server-error stacked area, and fleet-wide error-rate trend*
+*Figure 7: Health & Errors tab with status-code timeline, throttle vs. server-error stacked area, and fleet-wide error-rate trend*
 
 ## Latency
 ![Horizontal bar chart of end-to-end latency by model at p50/p90/p99](../images/screenshots/latency.png)
 
-*Figure 7: Latency tab showing end-to-end latency by model at p50/p90/p99 with a sortable details table*
+*Figure 8: Latency tab showing end-to-end latency by model at p50/p90/p99 with a sortable details table*
 
 ## Capacity & Adoption
 ![CRIS vs. On-Demand capacity donut, regional distribution donut, adoption table, and adoption trend line](../images/screenshots/capacity-adoption.png)
 
-*Figure 8: Capacity & Adoption tab with CRIS vs. On-Demand breakdown, regional distribution, per-model adoption table, and adoption trend*
+*Figure 9: Capacity & Adoption tab with CRIS vs. On-Demand breakdown, regional distribution, per-model adoption table, and adoption trend*
 
 ## Model Lifecycle
 ![Lifecycle table with severity indicators for legacy/EOL models](../images/screenshots/model-lifecycle.png)
 
-*Figure 9: Model Lifecycle tab tracking legacy, extended-access, and end-of-life milestones for models still receiving traffic*
+*Figure 10: Model Lifecycle tab tracking legacy, extended-access, and end-of-life milestones for models still receiving traffic*
 
 ## Model Insights
 ![Provider share donut and spend-by-model-family donut charts](../images/screenshots/model-insights.png)
 
-*Figure 10: Model Insights tab with provider share, spend-by-model-family breakdown, and per-model deep-dive*
+*Figure 11: Model Insights tab with provider share, spend-by-model-family breakdown, and per-model deep-dive*
 
 ## Usage · Custom Attributes
 ![Endpoint switcher (bedrock-runtime, bedrock-mantle, anthropic-api, openai-api) with tokens-by-workload chart](../images/screenshots/workloads-client-telemetry.png)
 
-*Figure 11: Usage · Custom Attributes tab with the endpoint switcher (bedrock-runtime, bedrock-mantle, anthropic-api, openai-api) and per-workload token consumption*
+*Figure 12: Usage · Custom Attributes tab with the endpoint switcher (bedrock-runtime, bedrock-mantle, anthropic-api, openai-api) and per-workload token consumption*
 
 ![Throttle rate chart and usage table by workload](../images/screenshots/workloads-by-provider.png)
 
-*Figure 12: Usage · Custom Attributes tab showing per-workload quota utilization and the detailed usage table from client-reported telemetry*
+*Figure 13: Usage · Custom Attributes tab showing per-workload quota utilization and the detailed usage table from client-reported telemetry*
 
 ## By User / App / Principal
 ![Top callers bar chart with a paginated callers table](../images/screenshots/by-user.png)
 
-*Figure 13: By User tab ranking top callers by request volume, pivotable by App/Group, User, or IAM Principal*
+*Figure 14: By User tab ranking top callers by request volume, pivotable by App/Group, User, or IAM Principal*
 
 ## Agents & MCP
 ![AgentCore runtimes table and MCP tools inventory](../images/screenshots/agents-mcp.png)
 
-*Figure 14: Agents & MCP tab with AgentCore runtime inventory and MCP tool invocations, sessions, errors, and latency*
+*Figure 15: Agents & MCP tab with AgentCore runtime inventory and MCP tool invocations, sessions, errors, and latency*
 
 ## Compliance (Guardrails)
 ![Guardrails interventions-by-policy bar chart and detail table](../images/screenshots/compliance.png)
 
-*Figure 15: Compliance tab with Guardrails intervention counts by policy type and a per-guardrail detail table*
+*Figure 16: Compliance tab with Guardrails intervention counts by policy type and a per-guardrail detail table*
 
 ## Governance
 ![Shadow-AI reconciliation table with status indicators](../images/screenshots/governance.png)
 
-*Figure 16: Governance tab reconciling the declared AI-app registry against observed usage to surface undeclared shadow-AI traffic*
+*Figure 17: Governance tab reconciling the declared AI-app registry against observed usage to surface undeclared shadow-AI traffic*
 
 ## Ops Review (AI Agent)
 ![At-a-glance ribbon with alert counts and an executive summary written by the Ops Review AI agent](../images/screenshots/ops-review.png)
 
-*Figure 17: Ops Review tab with the at-a-glance ribbon and an executive summary written by the Ops Review AI agent, grounded in fleet telemetry*
+*Figure 18: Ops Review tab with the at-a-glance ribbon and an executive summary written by the Ops Review AI agent, grounded in fleet telemetry*
+
+![Prompt caching table with documented support, observed cache use and a recommendation per model](../images/screenshots/ops-review-prompt-caching.png)
+
+*Figure 19: Ops Review's prompt caching section, built from reviewed AWS documentation and measured CloudWatch cache metrics rather than by the AI agent: documented support per model, observed cache reads and writes, and a recommendation only where support is documented*

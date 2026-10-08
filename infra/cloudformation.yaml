@@ -893,6 +893,13 @@ Resources:
               - Effect: Allow
                 Action: [ sns:Publish, sns:Subscribe ]
                 Resource: !Sub 'arn:${AWS::Partition}:sns:*:${AWS::AccountId}:*'
+              # Live pull: invoke ONLY the dedicated live-pull function, which
+              # reads CloudWatch under the ingester's role. The backend never
+              # assumes monitored-account roles itself, and cannot invoke the
+              # ingester or its maintenance actions.
+              - Effect: Allow
+                Action: [ lambda:InvokeFunction ]
+                Resource: !GetAtt LivePullFunction.Arn
 
   BackendLambda:
     Type: AWS::Lambda::Function
@@ -923,6 +930,9 @@ Resources:
           COGNITO_REGION: !Ref AWS::Region
           COGNITO_DOMAIN: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
           SESSION_COOKIE_NAME: bedrock_lens_id
+          # Quota drill-down "Pull live data". Unset = the button reports that
+          # live pull is not configured.
+          LIVE_PULL_FUNCTION_NAME: !Ref LivePullFunction
           DB_HOST: !GetAtt DbCluster.Endpoint.Address
           DB_PORT: !GetAtt DbCluster.Endpoint.Port
           DB_USER: bedrock_lens
@@ -1130,6 +1140,13 @@ Resources:
               - Effect: Allow
                 Action: sts:AssumeRole
                 Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/${ReaderRoleName}'
+              # Live pull (same role) reads the ingester's account scope,
+              # reader-role name and external ID from its live configuration,
+              # which setup-pipeline.sh changes in place. Named by string so the
+              # role does not depend on the function.
+              - Effect: Allow
+                Action: lambda:GetFunctionConfiguration
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-ingester'
               # Notifications (009): publish finding transitions to the
               # admin-configured alerts topic (central account only — the one
               # AWS write in the notifications feature).
@@ -1177,6 +1194,34 @@ Resources:
                     - !Sub 'arn:${AWS::Partition}:s3:::${ProxyEventsBucket}'
                     - !Sub 'arn:${AWS::Partition}:s3:::${ProxyEventsBucket}/*'
                 - !Ref AWS::NoValue
+
+  # On-demand per-minute CloudWatch read for the Quota drill-down's "Pull live
+  # data". Same image, its own entry point, and the ingester's role: the only
+  # principal monitored accounts' reader roles trust, so no member account needs
+  # a trust-policy change. No VPC: it reaches only Lambda (the ingester's
+  # settings), Organizations, STS and CloudWatch, and never the database. The
+  # backend resolves identifiers and rates and passes them in; this function
+  # re-validates every field and refuses accounts outside the ingester's scope
+  # before any AWS call into them.
+  LivePullFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-live-pull'
+      PackageType: Image
+      Code:
+        ImageUri: !Ref BackendImageUri
+      ImageConfig:
+        Command: [ 'ingestion.live_pull.handler' ]
+      Role: !GetAtt IngesterLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Architectures: [ x86_64 ]
+      Environment:
+        Variables:
+          # Account scope, reader-role name and external ID are read from this
+          # function's live configuration on every pull.
+          INGESTER_FUNCTION_NAME: !Sub '${AWS::StackName}-ingester'
+          BEDROCK_OPS_LENS_ROLE_NAME: !Ref ReaderRoleName
 
   IngesterLambda:
     Type: AWS::Lambda::Function

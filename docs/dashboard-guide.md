@@ -55,6 +55,17 @@ dimension.
 Hourly data means these are hourly-average per-minute rates, not measured
 minute peaks. The API says so in `rate_basis`; the UI repeats it.
 
+**Minute by minute, on demand.** Below the hourly charts, **Pull live data**
+reads the selected account · model · Region from CloudWatch at one-minute
+resolution for the last 1, 3, 6, 12 or 24 hours and plots quota TPM and RPM
+against the same applied limits. It uses the same per-minute rules as the stored
+busiest-minute peak: the native estimate where published, otherwise the
+reconstruction, with direct calls and the application inference profiles that
+resolve to the model summed minute by minute. A value marked `≥` is a lower
+bound because some minutes reported only part of their metrics. Nothing is
+stored. The pull runs under the ingester's role and reaches only accounts the
+ingester is configured to monitor; it covers the bedrock-runtime endpoint.
+
 **Editing the rates.** The multipliers are data, not code: **Settings → Quota
 burndown rates**. An admin can add a SKU or change a rate and the backend and the
 scheduled findings job pick it up within 60 seconds — no rebuild, no redeploy.
@@ -71,6 +82,32 @@ on first boot; "Restore AWS defaults" puts them back.
 Note AWS's own caveat: `EstimatedTPMQuotaUsage` is an approximation and does not
 reflect the reservation-based accounting that actually drives throttling
 decisions. Use it alongside observed throttles, not instead of them.
+
+## Prompt caching in Ops Review
+
+Ops Review's prompt-caching section is built from a reviewed catalog of exact
+model IDs (`backend/app/ops_review/prompt_caching_catalog.json`, taken from the
+[AWS prompt-caching guide](https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html)
+and model cards) and this window's CloudWatch cache-read and cache-write token
+counts. The AI agent does not write it; anything the agent says about caching is
+removed before the section is inserted, so the UI, the downloaded report and the
+MCP `ops_review` tool show the same rows.
+
+- **Support** is stated only for listed models. A model that is not listed, or
+  whose documentation does not describe prompt caching (for example
+  `openai.gpt-oss-120b-1:0`), gets no enablement advice. Support is never
+  inferred from the provider name.
+- **Use** is measured, not assumed. Cache reads above zero mean caching is in
+  use. Zero reads do not prove caching is off. bedrock-mantle publishes no cache
+  metrics, so its usage is unknown. The cached share is shown only where the
+  input-token count excludes cached tokens.
+- **Advice** is at most "evaluate": check for a stable prefix above the model's
+  checkpoint minimum before adding checkpoints. Savings are not guaranteed, and
+  input-heavy request shape alone never triggers a caching recommendation.
+
+When AWS documentation changes, update the catalog and its `catalog_version`;
+report caches key on that version and on the policy version in
+`backend/app/ops_review/caching.py`.
 
 ## Which attribution source when?
 

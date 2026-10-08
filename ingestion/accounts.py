@@ -184,6 +184,15 @@ def session_for(account_id: str, role_name: str = DEFAULT_ROLE_NAME,
     return session_cache().session_for(account_id, role_name, external_id)
 
 
+def new_session_cache() -> _SessionCache:
+    """A session cache that is not shared with the rest of the process.
+
+    For on-demand callers in long-lived warm processes, where the process-wide
+    cache would hand out an assumed-role session after its STS credentials
+    expired."""
+    return _SessionCache()
+
+
 # ---------------------------------------------------------------------------
 # CLI for ad-hoc inspection
 # ---------------------------------------------------------------------------

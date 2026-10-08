@@ -15,6 +15,15 @@ router = APIRouter()
 
 @router.get("/errors-by-model")
 async def errors_by_model(f: FilterSet = Depends(parse_filters)):
+    """One row per MODEL. Application inference profile traffic is already
+    resolved to its model by the lens_read projection, so a customer invoking
+    through profiles sees model names here instead of opaque 12-character ids.
+
+    The grain stays per-model deliberately. Grouping by profile would change what
+    this table means and repeat the same model label on several rows; the profile
+    breakdown lives in /errors-by-profile and is shown as expandable detail.
+    `has_application_profile` tells the UI which rows have that detail.
+    """
     w = build_where(f)
     rows = await db.fetch(
         f"""
@@ -25,12 +34,57 @@ async def errors_by_model(f: FilterSet = Depends(parse_filters)):
           SUM(status_403_count)::BIGINT AS status_403,
           SUM(status_429_count)::BIGINT AS status_429,
           SUM(status_500_count)::BIGINT AS status_500,
-          SUM(status_503_count)::BIGINT AS status_503
+          SUM(status_503_count)::BIGINT AS status_503,
+          BOOL_OR(has_application_profile) AS has_application_profile,
+          COUNT(DISTINCT application_profile_arn) FILTER (
+              WHERE application_profile_arn IS NOT NULL)::INT AS profile_count
         FROM f_daily
         WHERE {w.sql}
         GROUP BY modelId
         HAVING SUM(failed_requests) > 0
         ORDER BY failed_requests DESC
+        """,
+        *w.params,
+    )
+    return db.rows_to_dicts(rows)
+
+
+@router.get("/errors-by-profile")
+async def errors_by_profile(f: FilterSet = Depends(parse_filters)):
+    """Per-profile error detail behind a model row.
+
+    Keyed by account, Region AND profile id, because profile NAMES are not
+    unique — two profiles in different accounts, or even in one account, can
+    share a name while resolving to different models. `invoked_model_id` is the
+    raw identifier the caller actually passed, so an unresolved profile is still
+    identifiable; `modelId` is what it resolved to.
+
+    Model totals are unaffected: summing these rows for one model reproduces that
+    model's row in /errors-by-model.
+    """
+    w = build_where(f)
+    rows = await db.fetch(
+        f"""
+        SELECT modelId, accountId, region,
+          invoked_model_id,
+          application_profile_arn,
+          application_profile_name,
+          has_application_profile,
+          SUM(total_requests)::BIGINT   AS total_requests,
+          SUM(failed_requests)::BIGINT  AS failed_requests,
+          SUM(status_400_count)::BIGINT AS status_400,
+          SUM(status_403_count)::BIGINT AS status_403,
+          SUM(status_429_count)::BIGINT AS status_429,
+          SUM(status_500_count)::BIGINT AS status_500,
+          SUM(status_503_count)::BIGINT AS status_503
+        FROM f_daily
+        WHERE {w.sql} AND has_application_profile
+        GROUP BY modelId, accountId, region, invoked_model_id,
+                 application_profile_arn, application_profile_name,
+                 has_application_profile
+        HAVING SUM(total_requests) > 0
+        ORDER BY failed_requests DESC, total_requests DESC
+        LIMIT 500
         """,
         *w.params,
     )
@@ -49,7 +103,8 @@ async def errors_by_account(f: FilterSet = Depends(parse_filters)):
           SUM(status_403_count)::BIGINT AS status_403,
           SUM(status_429_count)::BIGINT AS status_429,
           SUM(status_500_count)::BIGINT AS status_500,
-          SUM(status_503_count)::BIGINT AS status_503
+          SUM(status_503_count)::BIGINT AS status_503,
+          BOOL_OR(has_application_profile) AS has_application_profile
         FROM f_daily
         WHERE {w.sql}
         GROUP BY accountId, modelId, region

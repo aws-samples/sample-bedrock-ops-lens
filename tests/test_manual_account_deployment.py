@@ -191,7 +191,9 @@ raise SystemExit(int(os.environ.get(prefix + "_RC", "0")))
     environment = {
         "PATH": f"{bin_dir}:/usr/bin:/bin", "FAKE_CALLS": str(calls),
         "PARAMS_JSON": str(result_file), "ALLOWED_EMAIL_DOMAINS": "example.com",
-        "ECR_URI": "example.invalid/lens", "BEDROCK_LOGS_BUCKET": "",
+        "ECR_URI": "example.invalid/lens",
+        "BACKEND_IMAGE_URI": "example.invalid/lens@sha256:" + "0" * 64,
+        "BEDROCK_LOGS_BUCKET": "",
         "BEDROCK_LOGS_REGION": "", "COGNITO_DOMAIN_PREFIX": "lens-example",
         "COGNITO_SELF_SIGNUP": "disabled", "MAIN_STACK": "BedrockOpsLens-example",
         "EDGE_SHA_VERSION_ARN": "fixture-edge-arn", "WEB_ACL_ARN": "fixture-waf-arn",
@@ -370,3 +372,14 @@ def test_c_uses_target_reader_roles_and_local_credentials_for_itself(monkeypatch
         for call in sts.assume_role.call_args_list
     )
     assert local.credentials == {}
+
+
+def test_the_stack_gets_the_pushed_image_by_digest(deployment_settings):
+    """A ":latest" string never changes, so CloudFormation left every function on
+    its old image and never re-ran SchemaInit on an upgrade."""
+    completed, _, params = deployment_settings.run()
+    assert completed.returncode == 0, completed.stderr
+    assert params["BackendImageUri"] == "example.invalid/lens@sha256:" + "0" * 64
+    source = (ROOT / "deploy.sh").read_text()
+    assert '"ParameterValue":"$ECR_URI:latest"' not in source
+    assert "describe-images" in source and 'BACKEND_IMAGE_URI="$ECR_URI@$IMAGE_DIGEST"' in source

@@ -5,9 +5,7 @@ interface; backend is selected by env var:
   * MEMCACHED_HOST set → ElastiCache Memcached. cache_generation atomic
     invalidation: a single integer key is bumped by the pre-warm Lambda
     after every ingester run; cached values store the generation they
-    were written under, and reads fail if the gen doesn't match. This
-    is exactly the pattern from the internal Bedrock Lens (sqlite-mirror
-    `cache_generation` file), ported to AWS-managed Memcached.
+    were written under, and reads fail if the gen doesn't match.
   * REDIS_URL set     → Redis (kept for compatibility, not used in v1).
   * neither           → in-memory dict (local dev, no infra).
 

@@ -103,7 +103,7 @@ export const SECTION_INFO = {
     title: 'Spend by model',
     body: 'Daily Bedrock spend in dollars. Sourced from AWS Cost Explorer (`ce:GetCostAndUsage`) at daily granularity, grouped by linked-account × service. Cost Explorer data lags 24-48h. When Cost Explorer returns a single consolidated "Amazon Bedrock" line item (most non-EDP customers), the per-model breakdown is derived by allocating the daily total in proportion to each model\'s token volume from CloudWatch — that case is disclosed in the chart description.',
     why: 'Spend is the truth metric — request and token counts are useful but cost is what gets reviewed. Pairing daily spend with token mix lets you spot the small handful of expensive workloads driving most of the bill.',
-    action: 'High-cost models with low cache hit rate (see Capacity & Adoption tab) are the strongest cost-reduction candidates. For Claude families, prompt caching cuts ~90% of cached-portion cost; CRIS doesn\'t change cost but unblocks throttle headroom.',
+    action: 'Review the largest billed workloads and their model-specific rates. For repeated prompt prefixes, check documented caching support and measured use in Ops Review before evaluating changes; low cache usage alone is not evidence of savings.',
     docLink: 'https://aws.amazon.com/bedrock/pricing/',
   },
 
@@ -138,9 +138,9 @@ export const SECTION_INFO = {
   },
   'cache-trend': {
     title: 'Cached prompt tokens trend',
-    body: 'Daily fleet-wide ratio of cache_read_input_tokens / total_input_tokens. Tracks adoption growth over time.',
-    why: 'Cached prompt tokens skip reprocessing, lowering both TTFT and cost. A flat line indicates caching is not yet being used - there is adoption upside. This is the share of prompt TOKENS read from cache (of input + cache-read + cache-write), not the fraction of requests that hit cache: Bedrock publishes no per-request cache dimension.',
-    action: 'Flat line → prioritize prompt-caching outreach. Spike → find the workload that drove it and use it as an internal case study.',
+    body: 'Daily share of prompt tokens read from cache, where compatible input, cache-read and cache-write counters are available. This is a token share, not the fraction of requests with a cache hit.',
+    why: 'Positive reads establish cache use. Zero or missing reads do not establish that caching is disabled or that prompts repeat. Consult Ops Review for model-specific support and measurement completeness.',
+    action: 'Investigate changes in the contributing workloads and available metrics. Evaluate repeated prefixes only where the model and API document caching support.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
   },
   'region-matrix': {
@@ -160,8 +160,8 @@ export const SECTION_INFO = {
   'request-shape': {
     title: 'Request shape by model',
     body: 'Per-model average input tokens, average output tokens, and the in:out ratio. Typical workloads are around 10:1 (input-heavier than output).',
-    why: 'Outliers signal specific optimization plays. Input-heavy (ratio > 50:1) means the workload is paying to re-process the same context every call — prompt caching cuts that ~90% on the cached portion. Output-heavy (ratio < 2:1) on Claude 4+ amplifies burndown — max_tokens tuning becomes critical.',
-    action: 'Input-heavy → enable prompt caching for stable system prompts and shared context. Output-heavy on Claude 4+ → tune max_tokens close to actual output length, consider a smaller model (Haiku) if quality tolerates it.',
+    why: 'Input-heavy traffic uses long prompts; the ratio does not establish repeated context or caching eligibility. Output-heavy traffic can amplify quota use when the model has an output-token burndown multiplier.',
+    action: 'Review prompt length and output requirements. Check Ops Review for documented caching support and measured cache use before evaluating repeated prefixes. Set max_tokens to a suitable output budget.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
   },
   'avg-rpm-tpm': {
@@ -180,9 +180,9 @@ export const SECTION_INFO = {
   },
   'caching': {
     title: 'Prompt caching adoption',
-    body: 'Per model: total input tokens, cache-read tokens (served from cache), cache-write tokens (newly cached), and hit rate = cache_read / total_input × 100.',
-    why: 'For supported models, cached input tokens are roughly 90% cheaper than uncached and reduce TTFT by up to 85%. For workloads with stable system prompts (chatbots, agents, RAG), enabling caching is the single highest-impact, lowest-effort cost lever.',
-    action: 'Models with > 1M daily input tokens and < 10% hit rate → enable caching on the long stable parts of your prompts (system instructions, tool definitions, retrieved context above the cache breakpoint).',
+    body: 'Per model: reported input, cache-read and cache-write tokens. Where input excludes cached tokens, cached share is cache-read / (input + cache-read + cache-write) × 100. Incompatible or incomplete counters cannot establish a share.',
+    why: 'Caching can reduce repeated-prefix processing on supported models. A positive read count establishes use; a small share does not mean caching needs to be enabled. Savings depend on reuse, cache writes and model-specific prices.',
+    action: 'Use the Prompt caching section in Ops Review to check documented model/API support and observed use. Evaluate stable prefixes that meet the documented minimum and reuse window. Automatic caching has no enablement switch.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
   },
   'context-routing': {
@@ -199,7 +199,7 @@ export const SECTION_INFO = {
     title: 'Latency by model',
     body: 'p50/p90/p99 latency percentiles per model. Toggle between End-to-End (full request duration) and Time-to-First-Token (streaming UX).',
     why: 'TTFT is critical for streaming UX (chatbots, agents). p99 shows the worst-case user experience. Compare against published model baselines for sanity check.',
-    action: 'p99 ≫ baseline → enable prompt caching (cuts TTFT ~85% on cached portions) and verify CRIS is on (multi-region spill reduces queueing). p99/p50 ratio > 5× → check Context length routing; the workload may be routing to larger variants than necessary.',
+    action: 'Investigate prompt length, generated output, throttling and request routing when latency rises. If prompts repeat, consult Ops Review for documented caching support and observed use, then measure any latency improvement. A high percentile alone does not establish a caching opportunity.',
   },
   'latency-table': {
     title: 'Latency table',
@@ -292,7 +292,7 @@ export const SECTION_INFO = {
   },
   'ops-burndown': {
     title: 'Claude burndown risk',
-    body: 'Recent Anthropic Claude models count each output token as more than 1 against TPM: 15× for Claude Opus 4.8, 5× for other Claude 3.7+ (Sonnet/Opus/Haiku 3.7, 4, 4.x), 1× otherwise. Bedrock also deducts (total input tokens + max_tokens) at the start of each request, adjusts as output is generated, and replenishes the unused remainder when the request completes; the burndown rate applies to the tokens actually generated, not to that reservation. "Peak TPM (quota)" applies the per-model rate to output per-hour ((input − cache-read) + output × rate) before taking the peak, and "Quota util %" is that peak against the applied TPM limit. Cache-read input tokens are excluded (they don\'t count toward the quota); hours predating the cache-read column are excluded from the peak rather than counted inflated. NOTE: this peak is from hourly-averaged data — TPM quotas are enforced per-minute, so treat CloudWatch EstimatedTPMQuotaUsage (Sum, 1-minute) as the authoritative throttling ceiling.',
+    body: 'The output-token burndown multiplier is model-specific. The review reconstructs quota usage within each hour as InputTokenCount + CacheWriteInputTokenCount + OutputTokenCount × the model multiplier, then divides by 60. Cache-read tokens do not consume Runtime TPM quota and are not subtracted again from InputTokenCount. These hourly averages are lower bounds on the busiest minute; use the minute measurements in Quotas to examine bursts. Bedrock initially deducts input tokens + max_tokens for a request; the output multiplier applies to generated tokens, not to that initial reservation.',
     why: 'If max_tokens is left at the model maximum but real output averages a few hundred tokens, every request still reserves (input + max_tokens) up front, so the workload can hit ThrottlingException while much of the reserved budget is never used. It is a one-line client change with no quota increase and no cost, which is why it is worth checking first. Note that Bedrock Ops Lens cannot observe max_tokens: it reads CloudWatch metrics, which do not carry it.',
     action: 'Set max_tokens close to actual expected output - the Avg output column shows what this traffic actually produces - rather than leaving it at the model maximum. One-line client change, no quota increase needed.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html',
@@ -300,15 +300,22 @@ export const SECTION_INFO = {
   'ops-request-shape': {
     title: 'Request shape outliers',
     body: 'Typical Bedrock workloads have an input:output token ratio around 10:1. This table flags accounts/models outside that band. Input-heavy (ratio > 50:1) means long context or system prompts; output-heavy (ratio < 2:1) means generation workloads.',
-    why: 'Outliers signal specific optimization plays. Input-heavy = paying to re-process the same context every call → prompt caching cuts that ~90% on the cached portion and reduces TTFT ~85%. Output-heavy on Claude 4+ amplifies burndown (see Burndown) so max_tokens tuning becomes critical.',
-    action: 'Input-heavy → enable prompt caching for stable system prompts and shared context. Output-heavy on Claude 4+ → tune max_tokens, consider a smaller model (Haiku) if quality tolerates it.',
-    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
+    why: 'The ratio describes token volume; model-specific prices and quota multipliers determine cost and quota use. Shape alone does not establish repeated prefixes or caching eligibility. See Prompt caching for documented support and measured use.',
+    action: 'Use measured minute quota usage to size requests, including the output multiplier where applicable. Match max_tokens to expected output length and verify that responses are not truncated.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html',
   },
   'ops-engagement': {
     title: 'Engagement opportunities',
-    body: 'Two cheap wins: (1) CRIS gap = accounts using on-demand for a Claude model that has a CRIS variant available, with > 10K OD requests and zero CRIS adoption. (2) Caching gap = high-volume Claude models (> 100M input tokens) with under 5% cache hit rate.',
-    why: 'CRIS migration: ~2x quota at zero additional cost, single-line code change. Multi-region resilience as a bonus. Prompt caching: ~90% cost reduction on cached portions and ~85% TTFT reduction. Both are reversible, both are quick to ship, both materially improve user experience.',
-    action: 'CRIS gap → switch model ID prefix to `us.` / `eu.` / `global.` for the affected models. Caching gap → enable caching breakpoints on stable system prompts. Track adoption in the next ops review.',
+    body: 'CRIS gap: more than 10K on-demand requests for a Claude model with no cross-Region traffic observed. This identifies candidates for evaluation; usage alone does not prove that a system inference profile is available. Prompt caching has its own section based on documented support and measured use.',
+    why: 'An available cross-Region profile may offer different quotas and routing options. The benefit depends on the model, source Region and applied limits.',
+    action: 'Check profile availability, destination Regions, current pricing and applied quotas before changing the invocation profile. Track the resulting traffic and throttling.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html',
+  },
+  'ops-prompt-caching': {
+    title: 'Prompt caching',
+    body: 'One row per model with traffic in the window. Documented support comes from a reviewed catalog of exact model IDs, taken from the AWS prompt-caching guide and model cards: implicit (automatic) and explicit (cache checkpoints), the checkpoint minimum and the TTL. Observed use comes from CloudWatch cache-read and cache-write token counts on bedrock-runtime. Cached share is shown only where the input-token count excludes cached tokens, so the share has a valid denominator. The same rows appear in the Ops Review report and in chat; the AI agent does not write this section.',
+    why: 'Prompt caching helps only when a model documents it and requests repeat a long, stable prefix. Cache reads above zero mean caching is in use, however small the share. Zero reads do not prove caching is off or that prompts repeat. bedrock-mantle publishes no cache metrics, so its usage is unknown. A model that is not in the catalog, or whose documentation does not describe caching (for example gpt-oss-120b), gets no enablement advice.',
+    action: 'Evaluate → check whether requests share a stable prefix above the checkpoint minimum; if they do, add cache checkpoints and compare cost and latency. Savings are not guaranteed. Cache writes without reads → keep the cached prefix identical between requests and repeat requests within the TTL. Automatic → there is nothing to enable; put static content first.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
   },
   /* --------------------------------------------------------------------- */
@@ -343,18 +350,25 @@ export const SECTION_INFO = {
     action: 'Util ≥100% → throttling is happening, request a quota increase or shift load to CRIS. Util 70-99% → no growth runway; plan an increase. Util <30% with throttle errors → the cap is somewhere else (per-key throttling, regional outage); check the Errors tab.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/quotas.html',
   },
+  'quota-drilldown-live': {
+    title: 'Minute-by-minute (live)',
+    body: 'When you press Pull live data, Lens reads the selected account · model · Region from CloudWatch at one-minute resolution for the last 1, 3, 6, 12 or 24 hours. Quota TPM per minute is AWS\'s EstimatedTPMQuotaUsage wherever CloudWatch publishes it, otherwise input + cache-write + output × the model\'s burndown multiplier: the same rule as the stored busiest-minute peak. Direct calls and the application inference profiles that resolve to the model are summed minute by minute before the peak is taken. The red line is the applied Service Quotas limit, as in the hourly charts. Nothing is stored.',
+    why: 'Hourly averages hide bursts. A workload averaging 20% of its TPM quota can still reach 100% for a few minutes and be throttled. The minute view shows the shape of the burst and exactly when it happened, which is what you compare with throttling errors and cite in a quota-increase request.',
+    action: 'Peak at or above the limit → throttling is a quota problem: request an increase, or smooth the burst (backoff and retry, queueing, cross-Region inference). Peak well below the limit while throttles occur → the cause is elsewhere; check the Errors tab. A value marked ≥ is a lower bound because some minutes reported only part of their metrics. Live pull uses the same reader role in the monitored account as ingestion.',
+    docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html',
+  },
   'quota-drilldown-rpm': {
     title: 'Requests per minute (RPM)',
     body: 'Hourly peak requests-per-minute for the selected (account · model · region). When AWS publishes an RPM quota for the model, the red line is the applied limit. When AWS does NOT publish an RPM quota (true for some Anthropic SKUs including Claude Opus 4.7), the red line is a derived effective ceiling: the TPM limit ÷ the average tokens-per-request observed in this window. That number is the rate at which TPM would cap you, which is the real ceiling even when no nominal RPM exists.',
-    why: 'The colleague-reference dashboard shipped with both TPM and RPM views because oncalls reach for whichever is more familiar. RPM is also the right metric for low-token, high-request workloads (chatbots, classifiers) where TPM is rarely the binding constraint. Showing the derived ceiling — instead of an empty card — keeps the drill-down useful even on models where AWS\'s quota catalogue has gaps.',
+    why: 'Both TPM and RPM views are shown because oncalls reach for whichever is more familiar. RPM is also the right metric for low-token, high-request workloads (chatbots, classifiers) where TPM is rarely the binding constraint. Showing the derived ceiling — instead of an empty card — keeps the drill-down useful even on models where AWS\'s quota catalogue has gaps.',
     action: 'Published RPM limit + util ≥100% → quota increase. Derived ceiling + util ≥80% → look at TPM in parallel, you are about to hit the underlying TPM cap. Util <30% but throttling shows in Errors → cap is elsewhere; investigate per-key or per-account throttling, or regional Bedrock issues.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/quotas.html',
   },
   'insights-cards': {
     title: 'Top models',
     body: 'The 12 highest-volume models in your fleet for the selected window. Each card shows requests, tokens, average request shape, cache hit %, error rate, and unique accounts using the model.',
-    why: 'Per-model fingerprint at a glance: high I/O ratio + low cache hit % is a caching opportunity; high error rate is a stability problem; low cache hit % on a high-input model is leaving money on the table.',
-    action: 'High I/O ratio + low cache hit % → enable prompt caching. High error rate → open the Errors tab for that model. Long avg input + short avg output → consider a smaller / cheaper model.',
+    why: 'These measurements describe workload shape and stability. Input-heavy traffic or a low cached share alone does not establish repeated prefixes, caching support or savings.',
+    action: 'Use Errors to investigate failures and Ops Review to check documented caching support and observed use. Evaluate changes against the workload’s quality, cost and latency requirements.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
   },
   'insights-table': {
@@ -367,8 +381,8 @@ export const SECTION_INFO = {
   'insights-request-shape': {
     title: 'Request shape by model',
     body: 'Per-model average input tokens per request, average output tokens per request, the input:output ratio, and total requests over the window. Request shape drives capacity: TPM ≈ RPM × (avg input + avg output tokens per request). A typical chatbot runs around 10:1 input:output.',
-    why: 'You cannot size a quota without knowing the shape of the traffic. Two workloads at the same RPM can have wildly different TPM if one is input-heavy (long context, RAG) and the other output-heavy (generation). Shape also points at the right optimization: input-heavy (ratio > 50:1) is a prompt-caching candidate; output-heavy (ratio < 2:1) on Claude 4+ amplifies TPM burndown, so max_tokens tuning matters most there.',
-    action: 'Input-heavy → enable prompt caching for stable system prompts and shared context (~90% cheaper on the cached portion). Output-heavy on Claude 4+ → tune max_tokens close to actual output length. Use avg input + avg output × RPM to project TPM before filing a Service Quotas increase.',
+    why: 'Two workloads at the same RPM can consume different amounts of quota because prompt and output lengths differ. Input-heavy traffic does not establish prefix reuse. Output tokens may have a model-specific quota multiplier.',
+    action: 'Use measured minute-level quota usage for capacity planning. Input and output peaks may occur in different minutes, so do not add those independent maxima. Check Ops Review before considering caching changes.',
     docLink: 'https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html',
   },
   'insights-multimodal': {

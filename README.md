@@ -20,8 +20,11 @@ open-source solution you deploy in your own AWS account to investigate usage,
 prioritize risks, and decide what to change across configured accounts and Regions.
 
 - **Investigate:** compare quota utilization, throttles, errors, latency, billed
-  spend, and model lifecycle in the dashboard. Add caller or workload attribution
-  with invocation logging or client telemetry.
+  spend, and model lifecycle in the dashboard. Quota views use the measured
+  busiest minute where it is collected, include application inference profile
+  traffic, and can pull the last 1-24 hours minute by minute from CloudWatch on
+  demand. Add caller or workload attribution with invocation logging or client
+  telemetry.
 - **Act on findings:** after ingestion, Lens checks for quota pressure, throttles,
   cost changes, and models approaching end of life. Findings include suggested
   remediation, with CLI commands and console links where available for you to
@@ -31,7 +34,8 @@ prioritize risks, and decide what to change across configured accounts and Regio
   to Claude Code, Cursor, Kiro, and other MCP clients, so you can build workflows
   around the same evidence.
 - **Review priorities:** Ops Review generates an AI-written operational brief
-  grounded in the collected telemetry.
+  grounded in the collected telemetry. Its prompt-caching section is built from
+  documented model support and measured cache metrics, not by the AI.
 
 ![Dashboard walkthrough with synthetic demo data](images/demo.gif)
 

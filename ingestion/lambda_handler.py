@@ -220,6 +220,16 @@ async def _orchestrate(only: list[str] | None, days: int,
         ["inference_profiles", "--db-url", db_url, "--days", str(days)]
     ))
 
+    # Minute peaks AFTER inference_profiles: the collector reads that cache to
+    # resolve profile identifiers and sum their series with the model's direct
+    # traffic BEFORE reducing to a peak. Running it earlier would record
+    # per-identifier maxima, which cannot be recombined into a true peak later.
+    schedule.append((
+        "cw_minute_peak", "ingestion.cw_minute_peak",
+        ["cw_minute_peak", "--db-url", db_url,
+         "--days", str(os.environ.get("MINUTE_PEAK_DAYS", "14"))]
+    ))
+
     # quotas LAST: slowest module at org/multi-region scale (Service Quotas
     # API rate-limits). Appended after invocation_logs so a long/timed-out
     # quotas pass can never starve the primary-data modules above. A partial

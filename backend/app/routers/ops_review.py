@@ -4,10 +4,13 @@ Two endpoints:
   GET  /api/ops-review              — full structured findings JSON
   POST /api/ops-review/synthesize   — Bedrock LLM synthesis (Claude Opus)
 
-Findings shape mirrors the internal reference exactly:
+Findings shape:
   capacity_health, growth_signal, burndown_risk, request_shape,
   engagement_opportunities, lifecycle_alerts, lifecycle_meta,
-  recommended_actions.
+  prompt_caching, recommended_actions.
+
+Prompt caching is evaluated deterministically (../ops_review/caching.py) and
+inserted into the report; the report-writing model never sees or writes it.
 
 The customer-facing prompt is a from-scratch rewrite with public AWS
 references only (no internal tools, no codenames). See ../ops_review/prompt.py.
@@ -27,6 +30,7 @@ from fastapi.responses import StreamingResponse
 from .. import db, rate_catalog
 from ..config import settings
 from ..filters import FilterSet, build_where, parse_filters
+from ..ops_review import caching
 from ..ops_review.prompt import SYSTEM_PROMPT
 from ..units import PER_MINUTE_BASIS, hourly_total_to_per_minute
 from .extras import _load_lifecycle
@@ -77,6 +81,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
     out low-signal rows (< 1000 requests for capacity, < 1M tokens/day for
     growth, etc.) so the report stays actionable."""
     w = build_where(f)
+    hourly_where = build_where(f, has_traffic_type=False)
     days = (f.end - f.start).days + 1
 
     # ---- summary ----
@@ -114,12 +119,14 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
           -- is named accordingly.
           (SELECT MAX(total_requests) / 60.0 FROM f_hourly_peak h
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
-              AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
+              AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date
+              AND (${len(w.params) + 1}::text = 'all' OR h.endpoint = ${len(w.params) + 1}))
             AS busiest_hour_avg_rpm,
           (SELECT MAX((total_input_tokens + COALESCE(total_cache_write_input_tokens,0)) + total_output_tokens) / 60.0
              FROM f_hourly_peak h
             WHERE h.accountId = f_daily.accountId AND h.modelId = f_daily.modelId
-              AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date)
+              AND h.region = f_daily.region AND h.event_date BETWEEN $1::date AND $2::date
+              AND (${len(w.params) + 1}::text = 'all' OR h.endpoint = ${len(w.params) + 1}))
             AS busiest_hour_avg_tpm
         FROM f_daily
         WHERE {w.sql}
@@ -128,7 +135,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         ORDER BY throttle_pct DESC NULLS LAST
         LIMIT 25
         """,
-        *w.params,
+        *w.params, f.endpoint,
     )
     capacity_health = []
     for r in cap_rows:
@@ -170,7 +177,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
             return await db.fetch(
                 f"""
                 SELECT accountId,
-                       (SUM(total_input_tokens + total_output_tokens)
+                       (SUM(COALESCE(total_input_tokens, 0) + COALESCE(total_output_tokens, 0))
                         / GREATEST(($2::date - $1::date + 1), 1))::BIGINT AS tokens_per_day
                 FROM f_daily
                 WHERE {ww.sql}
@@ -230,7 +237,7 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
           (SUM(total_input_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_input,
           (SUM(total_output_tokens) / GREATEST(SUM(total_requests), 1))::BIGINT AS avg_output
         FROM f_daily
-        WHERE {w.sql}
+        WHERE {w.sql} AND endpoint = 'runtime'
         GROUP BY accountId, modelId, region
         HAVING SUM(total_requests) >= 100
         """,
@@ -244,14 +251,14 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
     }
 
     bd_hourly = await db.fetch(
-        """
-        SELECT accountId, modelId, region,
+        f"""
+        SELECT accountId, modelId, region, event_date,
                (total_input_tokens + COALESCE(total_cache_write_input_tokens, 0)) AS input_quota_tokens,
                total_output_tokens
         FROM f_hourly_peak
-        WHERE event_date BETWEEN $1::date AND $2::date
+        WHERE {hourly_where.sql} AND endpoint = 'runtime'
         """,
-        w.params[0], w.params[1],
+        *hourly_where.params,
     )
     # key -> {raw_hour_max, effective_hour_max}
     bd_peaks: dict[tuple, dict] = {}
@@ -263,12 +270,13 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
             continue
         inp = int(r["input_quota_tokens"] or 0)
         out = int(r["total_output_tokens"] or 0)
-        rate = _cat.rate_for(mid).rate
+        rate = _cat.rate_for(mid, on_date=r.get("event_date")).rate
         raw_hour = inp + out
         eff_hour = inp + out * rate          # weighted INSIDE the hour
         p = bd_peaks.setdefault(key, {"raw": 0, "eff": 0, "rate": rate})
         p["raw"] = max(p["raw"], raw_hour)
-        p["eff"] = max(p["eff"], eff_hour)
+        if eff_hour > p["eff"]:
+            p["eff"], p["rate"] = eff_hour, rate
 
     burndown = []
     for key, p in bd_peaks.items():
@@ -323,9 +331,11 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         if ratio is None:
             continue
         if ratio > 50:
-            sev, note = "info", "Input-heavy — high prompt-caching potential"
+            # Request shape alone says nothing about prompt reuse or whether the
+            # model documents prompt caching; see the prompt_caching block.
+            sev, note = "info", "Input-heavy - more input than output tokens; repeated prefixes are not established"
         elif ratio < 2:
-            sev, note = "warning", "Output-heavy — Claude 4+ burndown amplifier"
+            sev, note = "warning", "Output-heavy - check the model's output-token quota multiplier"
         else:
             continue
         shape.append({
@@ -363,38 +373,6 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         """,
         *w.params,
     )
-    # Cache hit rate uses the corrected denominator: cached / (cached + fresh).
-    # CloudWatch's InputTokenCount excludes cache reads, so summing the two
-    # gives the true total prompt tokens billed.
-    caching_gap_rows = await db.fetch(
-        f"""
-        SELECT modelId,
-          SUM(total_input_tokens)::BIGINT AS total_input_tokens,
-          SUM(total_cache_read_input_tokens)::BIGINT AS cache_read_tokens,
-          SUM(total_cache_write_input_tokens)::BIGINT AS cache_write_tokens,
-          -- Finding 14: the denominator must include cache WRITES. inputTokens,
-          -- cacheReadInputTokens and cacheWriteInputTokens are three disjoint
-          -- counters, so leaving writes out overstated the cached share on
-          -- exactly the workloads that are populating a cache - and could
-          -- suppress this "enable caching" finding for a model that has barely
-          -- any cache reads but large writes.
-          ROUND((100.0 * COALESCE(SUM(total_cache_read_input_tokens), 0)
-                  / NULLIF(COALESCE(SUM(total_cache_read_input_tokens), 0)
-                           + COALESCE(SUM(total_cache_write_input_tokens), 0)
-                           + COALESCE(SUM(total_input_tokens), 0), 0))::numeric, 2)
-            AS cache_hit_pct
-        FROM f_daily
-        WHERE {w.sql} AND modelId LIKE 'anthropic.claude-%'
-        GROUP BY modelId
-        HAVING SUM(total_input_tokens) > 100000000
-           AND COALESCE(SUM(total_cache_read_input_tokens), 0)
-               < (COALESCE(SUM(total_cache_read_input_tokens), 0)
-                  + COALESCE(SUM(total_cache_write_input_tokens), 0)
-                  + COALESCE(SUM(total_input_tokens), 0)) * 0.05
-        ORDER BY total_input_tokens DESC LIMIT 10
-        """,
-        *w.params,
-    )
     engagement = []
     for r in cris_gap_rows:
         engagement.append({
@@ -403,17 +381,61 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
             "modelId":   r["modelid"] if "modelid" in r else r["modelId"],
             "od_requests": int(r["od_requests"]),
             "severity": "warning",
-            "note": f"100% on-demand for a Claude model with a CRIS variant available. Migrate to `us.`/`eu.`/`global.` prefix for ~2x quota at no cost.",
+            "note": "Only on-demand traffic was observed for this model. Check whether "
+                    "a system cross-Region inference profile is available in the source "
+                    "Region, then compare its applied quota and routing requirements.",
         })
-    for r in caching_gap_rows:
-        engagement.append({
-            "type": "caching_gap",
-            "modelId":  r["modelid"] if "modelid" in r else r["modelId"],
-            "total_input_tokens": int(r["total_input_tokens"]),
-            "cache_hit_pct":      float(r["cache_hit_pct"] or 0),
-            "severity": "info",
-            "note": f"<5% of prompt tokens served from cache on >100M daily input tokens. Enable prompt caching on stable system prompts for ~90% cost / ~85% TTFT reduction on cached portions.",
-        })
+
+    # ---- prompt_caching ----
+    # Cache counters come only from bedrock-runtime rows: bedrock-mantle
+    # publishes no cache metrics and is stored as zeros, which must not read as
+    # "no cache activity". NULL counters are missing observations.
+    cache_rows = await db.fetch(
+        f"""
+        SELECT modelId,
+          SUM(total_requests)::BIGINT AS requests,
+          COUNT(DISTINCT accountId)::BIGINT AS accounts,
+          COALESCE(SUM(total_requests) FILTER (WHERE endpoint = 'runtime'), 0)::BIGINT
+            AS runtime_requests,
+          COUNT(*) FILTER (WHERE endpoint = 'runtime')::BIGINT AS runtime_rows,
+          COUNT(*) FILTER (WHERE endpoint = 'runtime'
+                             AND (total_cache_read_input_tokens IS NULL
+                                  OR total_cache_write_input_tokens IS NULL))::BIGINT
+            AS rows_missing_cache,
+          COUNT(*) FILTER (WHERE endpoint = 'runtime' AND total_input_tokens IS NULL)::BIGINT
+            AS rows_missing_input,
+          COUNT(*) FILTER (WHERE endpoint = 'runtime' AND
+              (total_input_tokens < 0 OR total_cache_read_input_tokens < 0
+               OR total_cache_write_input_tokens < 0))::BIGINT AS invalid_rows,
+          COALESCE(SUM(total_input_tokens) FILTER (WHERE endpoint = 'runtime'), 0)::BIGINT
+            AS input_tokens,
+          COALESCE(SUM(total_cache_read_input_tokens) FILTER (WHERE endpoint = 'runtime'), 0)::BIGINT
+            AS cache_read_tokens,
+          COALESCE(SUM(total_cache_write_input_tokens) FILTER (WHERE endpoint = 'runtime'), 0)::BIGINT
+            AS cache_write_tokens,
+          COALESCE(SUM(total_requests) FILTER (WHERE endpoint = 'mantle'), 0)::BIGINT
+            AS mantle_requests
+        FROM f_daily
+        WHERE {w.sql}
+        GROUP BY modelId
+        HAVING SUM(total_requests) > 0
+        """,
+        *w.params,
+    )
+    prompt_caching = caching.evaluate_models([
+        caching.ModelCacheMetrics(
+            model_id=r.get("modelid") or r.get("modelId"),
+            requests=int(r["requests"] or 0), accounts=int(r["accounts"] or 0),
+            runtime_requests=int(r["runtime_requests"] or 0),
+            runtime_rows=int(r["runtime_rows"] or 0),
+            rows_missing_cache=int(r["rows_missing_cache"] or 0),
+            rows_missing_input=int(r["rows_missing_input"] or 0),
+            input_tokens=int(r["input_tokens"] or 0),
+            cache_read_tokens=int(r["cache_read_tokens"] or 0),
+            cache_write_tokens=int(r["cache_write_tokens"] or 0),
+            mantle_requests=int(r["mantle_requests"] or 0),
+            invalid_rows=int(r["invalid_rows"] or 0))
+        for r in db.rows_to_dicts(cache_rows)])
 
     # ---- lifecycle_alerts ----
     lifecycle = await _load_lifecycle()
@@ -491,15 +513,12 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
     if any(e["type"] == "cris_gap" for e in engagement):
         actions.append({
             "priority": "warning",
-            "title": "CRIS migration available",
-            "detail": "Switch on-demand Claude calls to a CRIS profile (`us.` / `eu.` / `global.` prefix) for ~2x quota at no extra cost.",
+            "title": "Evaluate cross-Region inference",
+            "detail": "Check profile availability, destination Regions, applied quotas "
+                      "and current pricing before changing on-demand calls. A model ID "
+                      "prefix alone does not establish availability or additional capacity.",
         })
-    if any(e["type"] == "caching_gap" for e in engagement):
-        actions.append({
-            "priority": "info",
-            "title": "Prompt caching opportunity",
-            "detail": "Enable caching on stable system prompts for high-volume Claude models — ~90% cost reduction on cached portions.",
-        })
+    actions.extend(caching.recommended_actions(prompt_caching))
     if any(b["severity"] == "critical" for b in burndown):
         actions.append({
             "priority": "warning",
@@ -521,8 +540,15 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
         actions.append({
             "priority": "success",
             "title": "No urgent actions",
-            "detail": "Throttling, lifecycle, CRIS, caching, burndown, and request shape are all within healthy ranges in this window.",
+            "detail": "Throttling, lifecycle, CRIS, prompt caching, burndown and request shape show nothing to act on in this window.",
         })
+
+    # Name the accounts in every per-account row from the ingester-resolved name
+    # map, keyed by the account IDs the scoped queries returned.
+    named_rows = capacity_health + growth + burndown + shape
+    names = await _account_names({r["accountId"] for r in named_rows})
+    for r in named_rows:
+        r["account_name"] = names.get(r["accountId"])
 
     return {
         "window": {"start": f.start.isoformat(), "end": f.end.isoformat(), "days": days},
@@ -540,35 +566,60 @@ async def ops_review_findings(f: FilterSet = Depends(parse_filters)):
             "updated": lifecycle.get("_updated"),
             "model_count": len(models_meta),
         },
+        "prompt_caching": prompt_caching,
         "recommended_actions": actions,
     }
+
+
+async def _account_names(account_ids: set[str]) -> dict[str, str]:
+    """Account names from dim_account, where the ingester lands its resolved
+    names. A failed lookup leaves rows unnamed; it never fails the review, and an
+    unknown name stays unknown."""
+    ids = sorted(a for a in account_ids if a)
+    if not ids:
+        return {}
+    try:
+        rows = await db.fetch(
+            "SELECT accountId, account_name FROM dim_account WHERE accountId = ANY($1::text[])",
+            ids)
+    except Exception:  # noqa: BLE001 - names are labels, not data the review depends on
+        return {}
+    out: dict[str, str] = {}
+    for r in db.rows_to_dicts(rows):
+        aid, name = r.get("accountid") or r.get("accountId"), r.get("account_name")
+        if aid and name:
+            out[str(aid)] = str(name)
+    return out
 
 
 # ---------------------------------------------------------------------------
 # /api/ops-review/synthesize — Bedrock LLM call
 # ---------------------------------------------------------------------------
 _NARRATIVE_CACHE: dict[str, dict] = {}
+_NARRATIVE_CACHE_LIMIT = 64
 
 
 def _findings_cache_key(findings: dict) -> str:
-    """Hash the structural identity of a findings blob (keys + counts +
-    severities) so trivial timestamp re-orders don't bust the cache."""
+    """Cache only when the model's complete input and prompt are unchanged.
+
+    Counts alone collided for different accounts/models and changing metrics.
+    Cache measurements are still rendered fresh without another model call.
+    """
+    catalog = caching.load_catalog()
     skeleton = {
-        "window": findings.get("window"),
-        "account_count": findings.get("account_count"),
-        "capacity_n": len(findings.get("capacity_health") or []),
-        "growth_n": len(findings.get("growth_signal") or []),
-        "burndown_n": len(findings.get("burndown_risk") or []),
-        "shape_n": len(findings.get("request_shape") or []),
-        "engagement_n": len(findings.get("engagement_opportunities") or []),
-        "lifecycle_n": len(findings.get("lifecycle_alerts") or []),
-        "summary_total": (findings.get("summary") or {}).get("total_requests"),
+        "caching_policy": caching.POLICY_VERSION,
+        "caching_render": caching.RENDER_VERSION,
+        "caching_catalog": f"{catalog.version}:{catalog.digest}",
+        "findings": _report_findings(findings),
+        "system_prompt": SYSTEM_PROMPT,
+        "model": (settings.ops_review_use_mantle, settings.ops_review_model,
+                  settings.bedrock_model_id),
     }
     # MD5 here is a non-cryptographic fingerprint of the skeleton dict, used
     # solely as a cache key. usedforsecurity=False tells bandit/scanners this
     # is not a security-sensitive use; the hash never gates auth or integrity.
     return hashlib.md5(
-        json.dumps(skeleton, sort_keys=True).encode(),
+        json.dumps(skeleton, sort_keys=True, default=str).encode(),
         usedforsecurity=False,
     ).hexdigest()
 
@@ -638,24 +689,41 @@ def _strip_lifecycle_gantt(s: str) -> str:
     return pattern.sub("", s)
 
 
+def _report_findings(findings: dict) -> dict:
+    """What the report-writing model sees: everything except prompt caching,
+    which is evaluated and rendered deterministically instead."""
+    view = {k: v for k, v in findings.items() if k != "prompt_caching"}
+    view["recommended_actions"] = [a for a in findings.get("recommended_actions") or []
+                                   if a.get("topic") != "prompt_caching"]
+    return view
+
+
+def _assemble_report(narrative: str, findings: dict) -> str:
+    """The model's narrative with the deterministic prompt-caching section."""
+    section = caching.render_markdown(findings.get("prompt_caching") or {})
+    return caching.insert_section(narrative, section)
+
+
 @router.post("/ops-review/synthesize")
 async def ops_review_synthesize(
     f: FilterSet = Depends(parse_filters),
     force: bool = False,
 ):
-    """Synthesizes the findings via Bedrock InvokeModel (non-streaming —
-    matches the reference)."""
+    """Synthesizes the findings via Bedrock InvokeModel (non-streaming), then
+    inserts the deterministic prompt-caching section. Chat clients (the MCP
+    ops_review tool) and the UI both receive this same report."""
     findings = await ops_review_findings(f)
     cache_key = _findings_cache_key(findings)
     if not force and cache_key in _NARRATIVE_CACHE:
         cached = _NARRATIVE_CACHE[cache_key]
-        return {**cached, "cached": True}
+        return {**cached, "narrative": _assemble_report(cached["narrative"], findings),
+                "cached": True}
 
     # Keep the prompt compact: this endpoint is fronted by CloudFront, whose
     # origin response timeout is 120s. Trim the findings blob to ~60KB (plenty
     # for a good narrative) so the model has less to read and responds well
     # inside the window.
-    findings_json = json.dumps(findings, default=str, indent=2)
+    findings_json = json.dumps(_report_findings(findings), default=str, indent=2)
     if len(findings_json) > 60_000:
         findings_json = findings_json[:60_000] + "\n... (truncated)"
     prompt = SYSTEM_PROMPT.replace("{findings_json}", findings_json)
@@ -709,6 +777,9 @@ async def ops_review_synthesize(
     narrative = _scrub_punctuation(narrative)
     narrative = _strip_note_preamble(narrative)
     narrative = _strip_lifecycle_gantt(narrative)
+    # Whatever the model wrote about prompt caching goes; the deterministic
+    # section below is the only caching content in the report.
+    narrative = caching.strip_caching_content(narrative)
     narrative = _fix_mermaid_labels(narrative)
 
     out = {
@@ -716,10 +787,16 @@ async def ops_review_synthesize(
         "model_id": f"{model_used} ({source})",
         "input_tokens":  (payload.get("usage") or {}).get("input_tokens"),
         "output_tokens": (payload.get("usage") or {}).get("output_tokens"),
+        "prompt_caching_policy": caching.POLICY_VERSION,
         "cached": False,
     }
+    # Cache the model's text only; the caching section is rendered from the
+    # current findings on every response. Distinct metric updates now get
+    # distinct keys, so bound retention in a long-running backend process.
     _NARRATIVE_CACHE[cache_key] = out
-    return out
+    while len(_NARRATIVE_CACHE) > _NARRATIVE_CACHE_LIMIT:
+        del _NARRATIVE_CACHE[next(iter(_NARRATIVE_CACHE))]
+    return {**out, "narrative": _assemble_report(narrative, findings)}
 
 
 def _synthesize_via_mantle(prompt: str) -> dict:

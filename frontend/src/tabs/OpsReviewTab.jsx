@@ -1,10 +1,10 @@
 // Ops Review tab — the deep operational review.
 //
-// Renders structured findings + Claude-Opus-synthesized markdown narrative.
-// Mirrors the internal reference's component structure: header bar, KPI
-// ribbon, executive summary (LLM markdown with mermaid), model lifecycle
-// alerts (horizontal timeline + table), capacity health, growth signal,
-// burndown risk, request shape outliers, detailed breakdown lazy section.
+// Renders structured findings + an AI-synthesized markdown narrative: header
+// bar, KPI ribbon, executive summary (LLM markdown with mermaid), model
+// lifecycle alerts (horizontal timeline + table), capacity health, growth
+// signal, burndown risk, request shape outliers, prompt caching (built from a
+// reviewed capability catalog, never by the model), detailed breakdown.
 //
 // Markdown→HTML pipeline + render-off-screen mermaid hack live in
 // ../components/Mermaid.js.
@@ -50,6 +50,20 @@ function severityType(s) {
     : s === 'success' ? 'success'
     : 'info';
 }
+
+// Only "evaluate" and "writes without reads" ask for action; "in use" is good
+// news; everything else is a deliberate non-recommendation.
+const CACHING_STATUS = {
+  evaluate:             ['info', 'Evaluate'],
+  writes_without_reads: ['warning', 'Check reuse'],
+  in_use:               ['success', 'In use'],
+  automatic:            ['stopped', 'Automatic'],
+  below_minimum:        ['stopped', 'Below minimum'],
+  low_volume:           ['stopped', 'Low volume'],
+  metrics_unavailable:  ['stopped', 'Usage unknown'],
+  not_documented:       ['stopped', 'Not documented'],
+  unknown_model:        ['stopped', 'Not reviewed'],
+};
 
 function trafficLabel(tt) {
   if (tt === 'CROSS_REGION_OD_INFERENCE_REQUEST') return 'CRIS (destination)';
@@ -235,6 +249,9 @@ export default function OpsReviewTab({ filters, onInfo }) {
   const growth = f.growth_signal || [];
   const burndown = f.burndown_risk || [];
   const shape = f.request_shape || [];
+  const caching = f.prompt_caching || {};
+  const cachingRows = caching.models || [];
+  const cachingUnreviewed = caching.unreviewed_models || [];
 
   const counts = {
     lifecycle: lc.length,
@@ -488,7 +505,64 @@ export default function OpsReviewTab({ filters, onInfo }) {
           </div>
         )}
 
-        {/* 9. Detailed breakdown (lazy) */}
+        {/* 9. Prompt caching: deterministic, from the reviewed catalog and
+            measured CloudWatch cache metrics. The narrative embeds the same rows. */}
+        {(cachingRows.length > 0 || cachingUnreviewed.length > 0) && (
+          <div id="ops-section-caching">
+            <Container header={
+              <SectionHeader
+                title="Prompt caching"
+                description={`From AWS documentation reviewed ${caching.reviewed_on} and this window's CloudWatch cache metrics. Support does not guarantee cache hits.`}
+                sectionId="ops-prompt-caching"
+                onInfo={onInfo}
+              />
+            }>
+              <SpaceBetween size="s">
+                <PaginatedTable
+                  items={cachingRows}
+                  pageSize={15}
+                  trackBy="modelId"
+                  wrapLines
+                  downloadFileName="ops-review-prompt-caching.csv"
+                  columnDefinitions={[
+                    // The cached share is part of the "Observed" text; it is only
+                    // stated where its denominator is valid.
+                    { id: 'm', header: 'Model', minWidth: 190,
+                      cell: r => r.model_name ? `${r.modelId} (${r.model_name})` : r.modelId,
+                      exportValue: r => r.modelId },
+                    { id: 's', header: 'Documented support', minWidth: 190, cell: r => r.support_text },
+                    { id: 'u', header: 'Observed in this window', minWidth: 170, cell: r => r.usage_text },
+                    { id: 'st', header: 'Status', minWidth: 140,
+                      cell: r => {
+                        const [type, label] = CACHING_STATUS[r.advice] || ['stopped', r.advice];
+                        return <StatusIndicator type={type} wrapText={false}>{label}</StatusIndicator>;
+                      },
+                      exportValue: r => r.advice },
+                    { id: 'r', header: 'Recommendation', minWidth: 240,
+                      cell: r => r.recommendation, exportValue: r => r.recommendation },
+                  ]}
+                  empty="No reviewed models with traffic in this window"
+                />
+                {cachingUnreviewed.length > 0 && (
+                  <Box variant="small" color="text-body-secondary">
+                    Not in the reviewed catalog, so no recommendation: {cachingUnreviewed.join(', ')}
+                  </Box>
+                )}
+                <Box variant="small">
+                  AWS Doc:{' '}
+                  {(caching.references || []).map((ref, i) => (
+                    <span key={ref.url}>
+                      {i > 0 ? ' · ' : ''}
+                      <Link external href={ref.url}>{ref.label}</Link>
+                    </span>
+                  ))}
+                </Box>
+              </SpaceBetween>
+            </Container>
+          </div>
+        )}
+
+        {/* 10. Detailed breakdown (lazy) */}
         <ExpandableSection
           variant="container"
           headerText="Detailed breakdown by model, region, and operation"

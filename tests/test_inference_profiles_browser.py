@@ -39,7 +39,8 @@ async def seed_browser(conn):
         "UPDATE public.dim_inference_profiles SET api_visible=FALSE WHERE profile_id=$1",
         b["inferenceProfileId"])
     unknown = f"arn:aws:bedrock:{REGION}:{ACCOUNT}:application-inference-profile/dddddd123456"
-    for mid, count in [(MODEL, 10), (a["inferenceProfileArn"], 20),
+    for mid, count in [(MODEL, 10), (a["inferenceProfileArn"], 12),
+                       (a["inferenceProfileId"], 8),
                        (b["inferenceProfileId"], 30), ("amazon.nova-pro-v1:0", 40),
                        (unknown, 5)]:
         await daily(conn, mid, count)

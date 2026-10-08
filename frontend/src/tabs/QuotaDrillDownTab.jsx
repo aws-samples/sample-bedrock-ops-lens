@@ -1,21 +1,22 @@
 // Quota drill-down tab. Per-(account, model, region) TPM/RPM time series
-// joined to the applied Service Quotas limit, plus headline KPIs. Renders
-// the same diagnostic shape an internal Bedrock CRIS dashboard does (peak
-// vs limit over time), so an oncall can see at a glance whether throttling
-// is a quota problem or a usage problem.
+// joined to the applied Service Quotas limit, plus headline KPIs. Plots peak
+// against the limit over time, so an oncall can see at a glance whether
+// throttling is a quota problem or a usage problem.
 //
 // Source: GET /api/quota-drilldown — hourly buckets normalised to per-minute
-// rates by the backend. Hourly granularity is the finest CW resolution we
-// keep; the chart shape is faithful to the original.
+// rates by the backend. Hourly granularity is the finest resolution Lens
+// stores. "Pull live data" (POST /api/live-pull) reads the last few hours at
+// one-minute resolution straight from CloudWatch on demand; nothing is stored.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  SpaceBetween, Container, Header, Box,
+  SpaceBetween, Container, Header, Box, Button, SegmentedControl,
   Select, LineChart, StatusIndicator, Spinner, Link,
 } from '@cloudscape-design/components';
-import { api, useApi, fmt, fmtPct } from '../api.js';
-import { ChartLoading, SectionHeader, CHART_I18N } from '../components/Common.jsx';
-import { fmtHourUTC } from '../dates';
+import { api, apiSend, useApi, fmt, fmtPct } from '../api.js';
+import { ChartLoading, SectionHeader, InfoLink, CHART_I18N } from '../components/Common.jsx';
+import { fmtHourUTC, fmtMinuteUTC } from '../dates';
+import { liveSeries, seriesAverage, utilPct, lineSegments, drilldownParams, liveQuotaRoutingUnknown } from '../livePull.js';
 
 // -- Helpers ---------------------------------------------------------------
 
@@ -40,7 +41,10 @@ function utilSeverity(pct) {
   return 'success';
 }
 
-function KpiStrip({ limit, isDerived, peak, peakAt, avg, util, fmtVal, routingUnknown }) {
+function KpiStrip({ limit, isDerived, peak, peakAt, avg, util, fmtVal, routingUnknown, lowerBound, peakLabel, peakLowerBound }) {
+  // A lower bound (some minutes could not be established) is prefixed with
+  // "≥" rather than hidden, as on the Quotas table.
+  const lb = lowerBound ? '≥ ' : '';
   return (
     <Box color="text-body-secondary" fontSize="body-s">
       <SpaceBetween direction="horizontal" size="m">
@@ -55,13 +59,13 @@ function KpiStrip({ limit, isDerived, peak, peakAt, avg, util, fmtVal, routingUn
                 ? 'unknown — profile routing unavailable' : 'not published by AWS'}</span>}
         </span>
         <span>·</span>
-        <span><b>Peak:</b> {fmtVal(peak)} <span style={{ color: '#aaa' }}>@ {fmtAt(peakAt)}</span></span>
+        <span><b>{peakLabel}:</b> {peak == null ? '—' : (peakLowerBound ? '≥ ' : '') + fmtVal(peak)} <span style={{ color: '#aaa' }}>@ {fmtAt(peakAt)}</span></span>
         <span>·</span>
-        <span><b>Avg:</b> {fmtVal(avg)}</span>
+        <span><b>Avg:</b> {avg == null ? '—' : fmtVal(avg)}</span>
         <span>·</span>
         <span><b>Util:</b>{' '}
           <StatusIndicator type={utilSeverity(util)}>
-            {util === null || util === undefined ? '—' : fmtPct(util, 1)}
+            {util === null || util === undefined ? '—' : lb + fmtPct(util, 1)}
           </StatusIndicator>
         </span>
       </SpaceBetween>
@@ -78,11 +82,18 @@ function MetricCard({
   limitDerived,
   routingUnknown,
   peak, peakAt, avg, util,
+  peakLabel = 'Peak minute',
+  lowerBound = false,
+  peakLowerBound = lowerBound,
   fmtVal,
   ariaLabel,
   loading,
   sectionId,
   onInfo,
+  seriesTitle,
+  xTickFormatter = fmtHourUTC,
+  emptyText = 'No data in window.',
+  testId,
 }) {
   // Effective limit = published if available, else derived (TPM÷avg-tokens)
   // for cards where AWS doesn't publish one. Derived ceiling is labelled
@@ -109,15 +120,16 @@ function MetricCard({
   const yFloor = useLogScale ? Math.max(peakValue * 0.001, 0.1) : 0;
   const safeSeries = useMemo(() => {
     if (!useLogScale) return series;
-    return series.map(p => ({ x: p.x, y: p.y > 0 ? p.y : yFloor }));
+    return series.map(p => ({ x: p.x, y: p.y == null ? null : p.y > 0 ? p.y : yFloor }));
   }, [series, useLogScale, yFloor]);
 
   const chartSeries = useMemo(() => {
     const out = [];
-    out.push({
-      title: title.includes('Tokens') ? 'Peak TPM' : 'Peak RPM',
+    for (const segment of lineSegments(safeSeries)) out.push({
+      title: seriesTitle || title,
       type: 'line',
-      data: safeSeries,
+      color: '#688ae8',
+      data: segment,
       valueFormatter: fmtVal,
     });
     // Render the limit line as a flat 2-point line. Solid red for a
@@ -137,7 +149,7 @@ function MetricCard({
       });
     }
     return out;
-  }, [safeSeries, effectiveLimit, isDerived, title, fmtVal]);
+  }, [safeSeries, effectiveLimit, isDerived, title, seriesTitle, fmtVal]);
 
   const yDomain = useMemo(() => {
     if (useLogScale) {
@@ -157,12 +169,16 @@ function MetricCard({
     : undefined;
 
   return (
-    <Container fitHeight header={<Header variant="h3" actions={headerActions}>{title}</Header>}>
+    <Container fitHeight data-testid={testId}
+      header={<Header variant="h3" actions={headerActions}>{title}</Header>}>
       <SpaceBetween size="s">
         <KpiStrip
           routingUnknown={routingUnknown}
           limit={effectiveLimit} isDerived={isDerived}
           peak={peak} peakAt={peakAt} avg={avg} util={util}
+          peakLabel={peakLabel}
+          peakLowerBound={peakLowerBound}
+          lowerBound={lowerBound}
           fmtVal={fmtVal}
         />
         {useLogScale && (
@@ -173,70 +189,295 @@ function MetricCard({
         )}
         {loading
           ? <ChartLoading height={260} />
-          : series.length === 0
-            ? <Box textAlign="center" color="text-body-secondary" padding="l">No data in window.</Box>
+          : !series.some(p => Number.isFinite(p.y))
+            ? <Box textAlign="center" color="text-body-secondary" padding="l">{emptyText}</Box>
             : <LineChart
                 series={chartSeries}
                 xScaleType="time"
+                xDomain={[series[0].x, series[series.length - 1].x]}
                 yScaleType={useLogScale ? 'log' : 'linear'}
                 yDomain={yDomain}
                 hideFilter
+                hideLegend
                 ariaLabel={ariaLabel}
                 height={260}
                 i18nStrings={{
                   ...CHART_I18N,
                   yTickFormatter: fmtVal,
-                  xTickFormatter: d => fmtHourUTC(d),
+                  xTickFormatter: d => xTickFormatter(d),
                 }}
               />
         }
+        {series.some(p => Number.isFinite(p.y)) && (
+          <Box color="text-body-secondary" fontSize="body-s">
+            <span style={{ color: '#688ae8' }}>━</span> {seriesTitle || title}
+            {effectiveLimit != null && <> · <span style={{ color: '#d13212' }}>━</span>{' '}
+              {isDerived ? 'Effective ceiling' : 'Applied limit'} ({fmtVal(effectiveLimit)})</>}
+          </Box>
+        )}
       </SpaceBetween>
+    </Container>
+  );
+}
+
+// -- Live per-minute pull --------------------------------------------------
+
+const LIVE_HOURS = [1, 3, 6, 12, 24];
+
+function LivePullPanel({ selection, quota, onInfo }) {
+  const cfg = useApi('/live-pull', {}, []);
+  const [hours, setHours] = useState('3');
+  const [pull, setPull] = useState({ key: null, loading: false, result: null, error: null });
+
+  const key = selection
+    ? [selection.account_id, selection.model_id, selection.region, selection.endpoint].join('|')
+    : null;
+  // A result belongs to the selection it was pulled for. Switching the
+  // selection hides it, and a response that lands after the switch is dropped.
+  const latestKey = useRef(key);
+  latestKey.current = key;
+  const current = pull.key === key ? pull : { loading: false, result: null, error: null };
+
+  const unavailable = !selection
+    ? 'Pick an account · model · Region above.'
+    : cfg.error
+      ? 'Could not check whether live pull is available.'
+      : cfg.data && !cfg.data.enabled
+        ? 'Live pull is not configured in this deployment.'
+        : selection.endpoint !== 'runtime'
+          ? 'Live pull covers the bedrock-runtime endpoint only.'
+          : null;
+
+  const onPull = () => {
+    const forKey = key;
+    setPull({ key: forKey, loading: true, result: null, error: null });
+    apiSend('/live-pull', { body: { ...selection, hours: Number(hours) } })
+      .then(result => {
+        // A success status without the live-pull JSON (for example an HTML
+        // page from an intermediary) is an error, not an empty pull.
+        if (!result || result.ok !== true || !Array.isArray(result.minutes)) {
+          throw new Error('Unexpected response from the live-pull endpoint.');
+        }
+        if (latestKey.current === forKey) setPull({ key: forKey, loading: false, result, error: null });
+      })
+      .catch(e => {
+        if (latestKey.current === forKey) {
+          setPull({ key: forKey, loading: false, result: null, error: String(e.message || e) });
+        }
+      });
+  };
+
+  const r = current.result;
+  const tpmSeries = useMemo(() => liveSeries(r, 'quota_tpm'), [r]);
+  const rpmSeries = useMemo(() => liveSeries(r, 'requests'), [r]);
+
+  let body;
+  if (unavailable) {
+    body = <Box color="text-body-secondary">{unavailable}</Box>;
+  } else if (current.loading) {
+    body = <ChartLoading height={260} label="Reading CloudWatch…" />;
+  } else if (current.error) {
+    body = <StatusIndicator type="error">{current.error}</StatusIndicator>;
+  } else if (!r) {
+    body = (
+      <Box color="text-body-secondary">
+        Press <b>Pull live data</b> to read the last {hours} {hours === '1' ? 'hour' : 'hours'} minute
+        by minute from CloudWatch.
+      </Box>
+    );
+  } else {
+    const partial = r.status === 'partial';
+    const unknown = r.unknown_minutes || {};
+    const peak = r.peak || {};
+    // Application-profile traffic has no known quota family, so a limit
+    // resolved for the model alone does not apply to the combined series.
+    const profileTraffic = liveQuotaRoutingUnknown(r);
+    const tpmLimit = profileTraffic ? null : quota.tpmLimit;
+    const rpmLimit = profileTraffic ? null : quota.rpmLimit;
+    const rpmDerived = profileTraffic ? null : quota.rpmLimitDerived;
+    const tpmLower = partial || unknown.quota_tpm > 0;
+    const rpmLower = partial || unknown.requests > 0;
+    const src = r.quota_sources || {};
+    const sourceParts = [
+      src.aws_estimate ? `AWS EstimatedTPMQuotaUsage for ${fmt(src.aws_estimate)} min` : null,
+      src.reconstructed
+        ? `reconstructed as input + cache write + output × ${r.burndown_rate} for ${fmt(src.reconstructed)} min`
+        : null,
+      src.mixed ? `both, across identifiers, for ${fmt(src.mixed)} min` : null,
+    ].filter(Boolean);
+    const hrs = r.window?.hours;
+    body = (
+      <SpaceBetween size="s">
+        <StatusIndicator type={partial ? 'warning' : 'success'}>
+          Pulled {fmtAt(r.pulled_at)} · last {hrs} {hrs === 1 ? 'hour' : 'hours'} ·{' '}
+          {fmt(r.active_minutes)} {r.active_minutes === 1 ? 'minute' : 'minutes'} with data
+          {r.cached ? ' · same result as a pull moments ago' : ''}
+        </StatusIndicator>
+        {partial && (
+          <Box color="text-status-warning" fontSize="body-s">
+            CloudWatch returned incomplete data for some series, so the peaks are lower bounds.
+          </Box>
+        )}
+        {r.active_minutes === 0 ? (
+          <Box color="text-body-secondary">
+            {partial ? 'CloudWatch data could not be established for this window. Try again.'
+              : 'No Bedrock requests reported for this model in this window.'}
+          </Box>
+        ) : (
+          <>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, alignItems: 'stretch' }}>
+              <MetricCard
+                title={r.burndown_rate > 1
+                  ? `Quota TPM per minute — ${r.burndown_rate}× output burndown`
+                  : 'Quota TPM per minute'}
+                seriesTitle="Quota TPM"
+                ariaLabel="Quota tokens per minute, live"
+                series={tpmSeries}
+                limit={tpmLimit ?? null}
+                routingUnknown={profileTraffic || !!quota.tpmRoutingUnknown}
+                peak={peak.quota_tpm?.value} peakAt={peak.quota_tpm?.at}
+                avg={seriesAverage(tpmSeries, !partial)} util={utilPct(peak.quota_tpm?.value, tpmLimit)}
+                lowerBound={tpmLower}
+                fmtVal={fmt}
+                xTickFormatter={fmtMinuteUTC}
+                emptyText="No quota TPM could be established in this window."
+                testId="live-tpm"
+              />
+              <MetricCard
+                title="Requests per minute"
+                seriesTitle="RPM"
+                ariaLabel="Requests per minute, live"
+                series={rpmSeries}
+                limit={rpmLimit ?? null}
+                limitDerived={rpmDerived ?? null}
+                routingUnknown={profileTraffic || !!quota.rpmRoutingUnknown}
+                peak={peak.rpm?.value} peakAt={peak.rpm?.at}
+                avg={seriesAverage(rpmSeries, !partial)} util={utilPct(peak.rpm?.value, rpmLimit ?? rpmDerived)}
+                lowerBound={rpmLower}
+                fmtVal={fmt}
+                xTickFormatter={fmtMinuteUTC}
+                emptyText="No request counts could be established in this window."
+                testId="live-rpm"
+              />
+            </div>
+            <Box color="text-body-secondary" fontSize="body-s">
+              <SpaceBetween size="xxs">
+                <span>
+                  Busiest minute for input: {fmt(peak.input_tokens?.value)} tokens
+                  {peak.input_tokens ? ` @ ${fmtAt(peak.input_tokens.at)}` : ''} · for
+                  output: {fmt(peak.output_tokens?.value)} tokens
+                  {peak.output_tokens ? ` @ ${fmtAt(peak.output_tokens.at)}` : ''}.
+                  Input counts input plus cache-write tokens.
+                </span>
+                {sourceParts.length > 0 && <span>Quota TPM source: {sourceParts.join('; ')}.</span>}
+                {r.has_application_profile && (
+                  <span>
+                    Combines direct calls with {r.identifiers.length - 1} application inference
+                    profile {r.identifiers.length - 1 === 1 ? 'identifier' : 'identifiers'} that
+                    resolve to this model ({(r.identifiers_with_data || []).length} with traffic).
+                  </span>
+                )}
+                {(tpmLower || rpmLower) && !partial && (
+                  <span>
+                    Some active minutes reported only part of their metrics; a peak marked ≥ is a
+                    lower bound.
+                  </span>
+                )}
+                <span>
+                  {partial
+                    ? 'Missing minutes are gaps; no average is shown for an incomplete series.'
+                    : 'Minutes with no reported activity are drawn as zero. Unknown active measurements are gaps.'}{' '}
+                  CloudWatch can take a few minutes to publish recent data.
+                </span>
+              </SpaceBetween>
+            </Box>
+          </>
+        )}
+      </SpaceBetween>
+    );
+  }
+
+  return (
+    <Container data-testid="live-pull" header={
+      <SectionHeader
+        title="Minute-by-minute (live)"
+        description="Per-minute quota TPM and RPM read on demand from CloudWatch for the selected account · model · Region. Nothing is stored."
+        actions={
+          <SpaceBetween direction="horizontal" size="xs" alignItems="center">
+            {onInfo && <InfoLink sectionId="quota-drilldown-live" onInfo={onInfo} />}
+            <SegmentedControl
+              label="Window"
+              selectedId={hours}
+              onChange={({ detail }) => setHours(detail.selectedId)}
+              options={LIVE_HOURS.map(h => ({ id: String(h), text: `${h}h` }))}
+            />
+            <Button
+              onClick={onPull}
+              loading={current.loading}
+              disabled={!!unavailable || cfg.loading}
+            >
+              Pull live data
+            </Button>
+          </SpaceBetween>
+        }
+      />
+    }>
+      {body}
     </Container>
   );
 }
 
 // -- Tab -------------------------------------------------------------------
 
-export default function QuotaDrillDownTab({ onInfo }) {
-  const opts = useApi('/quota-drilldown/options', { days: 14 }, []);
+export default function QuotaDrillDownTab({ onInfo, endpoint: selectedEndpoint = 'all' }) {
+  const opts = useApi('/quota-drilldown/options', { days: 14, endpoint: selectedEndpoint }, [selectedEndpoint]);
   const optionList = useMemo(() => {
-    const arr = (opts.data?.options || []).map(o => ({
+    const arr = (opts.data?.options || [])
+      .filter(o => selectedEndpoint === 'all' || o.endpoint === selectedEndpoint).map(o => ({
       label: o.label,
-      value: `${o.accountId}|${o.modelId}|${o.region}`,
+      value: `${o.accountId}|${o.modelId}|${o.region}|${o.endpoint}`,
       description: `${fmt(o.total_requests)} requests in last 14d`,
       _raw: o,
     }));
     return arr;
-  }, [opts.data]);
+  }, [opts.data, selectedEndpoint]);
 
   const [selected, setSelected] = useState(null);
 
   // Auto-pick the busiest combo on first load — most useful default for
   // an oncall who opens the tab cold during a paging incident.
-  const effective = selected || optionList[0] || null;
+  const effective = optionList.find(o => o.value === selected?.value) || optionList[0] || null;
 
   const account_id = effective?._raw?.accountId;
   const model_id   = effective?._raw?.modelId;
   const region     = effective?._raw?.region;
+  const endpoint   = effective?._raw?.endpoint || 'runtime';
+  const liveSelection = useMemo(
+    () => (account_id ? { account_id, model_id, region, endpoint } : null),
+    [account_id, model_id, region, endpoint]);
 
   // useApi() doesn't accept a null-params sentinel — it would Object.entries
   // through it and throw. Manage the conditional fetch manually so the
   // request only fires once a combination is picked.
-  const [data, setData] = useState(null);
+  const [response, setResponse] = useState(null);
+  const dataKey = effective?.value;
+  // Only the response for the current selection counts. Before any selection
+  // exists both keys are undefined, which must not read as a match.
+  const data = response && dataKey != null && response.key === dataKey ? response.data : null;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   useEffect(() => {
     if (!effective) {
-      setData(null); setLoading(false); setError(null);
+      setResponse(null); setLoading(false); setError(null);
       return;
     }
     let cancelled = false;
     setLoading(true); setError(null);
-    api('/quota-drilldown', { account_id, model_id, region, days: 14 })
-      .then(d => { if (!cancelled) { setData(d); setLoading(false); } })
+    api('/quota-drilldown', drilldownParams(effective._raw))
+      .then(d => { if (!cancelled) { setResponse({ key: dataKey, data: d }); setLoading(false); } })
       .catch(e => { if (!cancelled) { setError(e); setLoading(false); } });
     return () => { cancelled = true; };
-  }, [account_id, model_id, region, effective]);
+  }, [account_id, model_id, region, endpoint, dataKey, effective]);
 
   // LineChart needs [{ x: Date, y: number }, …]; series carries a few
   // metrics we slice client-side.
@@ -257,7 +498,7 @@ export default function QuotaDrillDownTab({ onInfo }) {
       <Container header={
         <SectionHeader
           title="Quota drill-down"
-          description="Per-(account · model · region) TPM and RPM versus the applied Service Quotas limit, hourly granularity over the last 14 days."
+          description="Hourly-average TPM and RPM versus the applied limit for the selected account · model · Region over the last 14 days. Use the live panel below for minute-by-minute measurements."
           sectionId="quota-drilldown"
           onInfo={onInfo}
         />
@@ -306,32 +547,55 @@ export default function QuotaDrillDownTab({ onInfo }) {
               ? `Tokens per minute (TPM) — ${data.burndown_rate}× output burndown`
               : "Tokens per minute (TPM)"}
             ariaLabel="Tokens per minute"
+            seriesTitle="Hourly average TPM"
             series={tpmSeries}
             limit={data?.tpm_limit ?? null}
             routingUnknown={data?.quota_tpm?.quota_routing_unknown}
             peak={k.peak_tpm} peakAt={k.peak_tpm_at}
+            peakLabel="Busiest-hour average"
+            peakLowerBound={false}
             avg={k.avg_tpm} util={k.util_pct_tpm}
             fmtVal={fmt}
             loading={loading || !effective}
+            lowerBound
             sectionId="quota-drilldown-tpm"
             onInfo={onInfo}
           />
           <MetricCard
             title="Requests per minute (RPM)"
             ariaLabel="Requests per minute"
+            seriesTitle="Hourly average RPM"
             series={rpmSeries}
             limit={data?.rpm_limit ?? null}
             routingUnknown={data?.quota_rpm?.quota_routing_unknown}
             limitDerived={data?.rpm_limit_derived ?? null}
             peak={k.peak_rpm} peakAt={k.peak_rpm_at}
+            peakLabel="Busiest-hour average"
+            peakLowerBound={false}
             avg={k.avg_rpm} util={k.util_pct_rpm}
             fmtVal={fmt}
             loading={loading || !effective}
+            lowerBound
             sectionId="quota-drilldown-rpm"
             onInfo={onInfo}
           />
         </div>
       </Container>
+
+      <LivePullPanel
+        selection={liveSelection}
+        // Limits come from the hourly response for the same selection; while
+        // that is reloading they are withheld rather than borrowed from the
+        // previous selection.
+        quota={loading || error ? {} : {
+          tpmLimit: data?.tpm_limit ?? null,
+          rpmLimit: data?.rpm_limit ?? null,
+          rpmLimitDerived: data?.rpm_limit_derived ?? null,
+          tpmRoutingUnknown: !!data?.quota_tpm?.quota_routing_unknown,
+          rpmRoutingUnknown: !!data?.quota_rpm?.quota_routing_unknown,
+        }}
+        onInfo={onInfo}
+      />
     </SpaceBetween>
   );
 }

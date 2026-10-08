@@ -1,12 +1,14 @@
 """Ops Insights tab — CRIS adoption, throttle hotspots, peak RPM, caching, etc."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends
 
 from .. import db, rate_catalog
 from ..filters import FilterSet, build_where, parse_filters
-from ..quota_match import family_hint_from_model_id, resolve_quota
-from ..units import (PER_MINUTE_BASIS, hourly_total_to_per_minute,
+from ..quota_match import QuotaResolution, family_hint_from_model_id, resolve_quota
+from ..units import (MEASURED_MINUTE_BASIS, PER_MINUTE_BASIS, hourly_total_to_per_minute,
                      utilization_pct)
 
 router = APIRouter()
@@ -127,26 +129,9 @@ async def ops_throttle_rate(f: FilterSet = Depends(parse_filters)):
 # Peak RPM / TPM (max-over-hour from f_hourly_peak)
 # ---------------------------------------------------------------------------
 @router.get("/ops-peak-rpm")
-async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
-    parts = ["event_date BETWEEN $1::date AND $2::date"]
-    params: list = [f.start, f.end]
-    if f.accounts:
-        parts.append(f"accountId = ANY(${len(params)+1}::text[])")
-        params.append(list(f.accounts))
-    if f.region != "all":
-        parts.append(f"region = ${len(params)+1}")
-        params.append(f.region)
-    if f.provider != "all":
-        from ..filters import PROVIDER_PREFIX
-        parts.append(f"modelId LIKE ${len(params)+1}")
-        params.append(PROVIDER_PREFIX[f.provider] + "%")
-    # Endpoint slice: f_hourly_peak carries the runtime/mantle endpoint column,
-    # so honor the tab's switcher here (else the Mantle sub-tab would show the
-    # combined runtime+mantle peak — identical to runtime).
-    if f.endpoint != "all":
-        parts.append(f"endpoint = ${len(params)+1}")
-        params.append(f.endpoint)
-    w = " AND ".join(parts)
+async def ops_peak_rpm(f: FilterSet = Depends(parse_filters), include_quotas: bool = False):
+    where = build_where(f, has_traffic_type=False)
+    w, params = where.sql, where.params
 
     # Fetch per-hour rows and reduce in Python so the output-token burndown
     # multiplier can be applied to each hour BEFORE the peak is taken (the rate
@@ -168,7 +153,7 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
     # (CacheRead excluded). total_input_tokens = InputTokenCount; add cache-write.
     rows = await db.fetch(
         f"""
-        SELECT accountId, modelId, region, event_date, has_application_profile,
+        SELECT accountId, modelId, region, endpoint, event_date, has_application_profile,
           total_requests,
           (total_input_tokens + COALESCE(total_cache_write_input_tokens, 0)) AS input_quota_tokens,
           total_output_tokens,
@@ -179,25 +164,24 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
         *params,
     )
 
-    is_mantle = (f.endpoint == "mantle")
     # One snapshot per request: a fleet with 500 models must not issue 500
     # `ingestion_meta` reads to price its multipliers.
     _cat = await rate_catalog.snapshot()
     agg: dict = {}
     for r in db.rows_to_dicts(rows):
         mid = r.get("modelid") or r.get("modelId")
-        key = (r.get("accountid") or r.get("accountId"), mid, r["region"])
+        endpoint = r["endpoint"]
+        key = (r.get("accountid") or r.get("accountId"), mid, r["region"], endpoint)
+        res = _cat.rate_for(mid, on_date=r.get("event_date"), is_mantle=endpoint == "mantle")
+        rate = res.rate
         a = agg.get(key)
         if a is None:
             # Burndown applies only to bedrock-runtime; Mantle has separate
             # input/output quotas (rate forced to 1 by is_mantle).
-            res = _cat.rate_for(mid, on_date=r.get("event_date"),
-                                is_mantle=is_mantle)
-            rate = res.rate
             a = agg[key] = {
                 "burndown_rate_source": res.source,
                 "burndown_rate_verified": res.verified,
-                "accountId": key[0], "modelId": mid, "region": key[2],
+                "accountId": key[0], "modelId": mid, "region": key[2], "endpoint": endpoint,
                 "burndown_rate": rate,
                 "peak_requests_hour": 0,
                 "has_application_profile": False,
@@ -210,13 +194,15 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
                 # app had mostly reconstructed itself.
                 "quota_tpm_source": "unavailable",
                 "_sources": set(),
+                "_active_dates": set(),
             }
         a["has_application_profile"] |= bool(r.get("has_application_profile", False))
-        rate = a["burndown_rate"]
         req = int(r["total_requests"] or 0)
         out = int(r["total_output_tokens"] or 0)
         inp = int(r["input_quota_tokens"] or 0)
         native = r.get("estimated_tpm_quota_usage")
+        if any(v > 0 for v in (req, out, inp, native or 0)):
+            a["_active_dates"].add(r["event_date"])
         a["peak_requests_hour"] = max(a["peak_requests_hour"], req)
         a["peak_output_tpm"] = max(a["peak_output_tpm"], out)
         a["peak_input_tpm"] = max(a["peak_input_tpm"], inp)
@@ -230,7 +216,11 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
             a["_sources"].add("aws_estimate")
         else:
             # Fallback reconstruction (per-hour, weighted before the peak).
-            a["peak_quota_tpm"] = max(a["peak_quota_tpm"], inp + out * rate)
+            if inp + out * rate >= a["peak_quota_tpm"]:
+                a["peak_quota_tpm"] = inp + out * rate
+                a["burndown_rate"] = rate
+                a["burndown_rate_source"] = res.source
+                a["burndown_rate_verified"] = res.verified
             a["_sources"].add("reconstructed")
 
     # Disclose the true composition of each series: native, formula, or mixed.
@@ -244,6 +234,72 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
     # overstated every rate by 60x. These are lower bounds on the true minute
     # peak (no minute-resolution source exists here) — `rate_basis` says so and
     # the field names avoid the word "peak" for the per-minute values.
+    # ---- measured busiest MINUTE (migration 014) --------------------------
+    # f_minute_peak is already resolved and summed per minute by the ingester,
+    # so it is keyed by the effective model and must NOT be re-aggregated across
+    # identifiers here. Rows are keyed identically to `agg`, and a model with no
+    # minute row keeps nulls rather than silently inheriting the hourly average
+    # under a minute-grain name.
+    minute_rows = await db.fetch(
+        f"""
+        SELECT accountId, modelId, region, endpoint,
+               MAX(peak_rpm)        AS peak_rpm,
+               MAX(peak_input_tpm)  AS peak_input_tpm,
+               MAX(peak_output_tpm) AS peak_output_tpm,
+               MAX(peak_quota_tpm)  AS peak_quota_tpm,
+               SUM(active_minutes)::BIGINT AS active_minutes,
+               BOOL_OR(resolution_stale)   AS resolution_stale,
+               BOOL_OR(has_application_profile) AS has_application_profile,
+               ARRAY_AGG(event_date) AS measured_dates,
+               BOOL_AND(peak_rpm IS NOT NULL OR active_minutes = 0)
+                   AS rpm_measurement_complete,
+               BOOL_AND(peak_input_tpm IS NOT NULL OR active_minutes = 0)
+                   AS input_measurement_complete,
+               BOOL_AND(peak_output_tpm IS NOT NULL OR active_minutes = 0)
+                   AS output_measurement_complete,
+               BOOL_AND(peak_quota_tpm IS NOT NULL OR active_minutes = 0)
+                   AS quota_measurement_complete,
+               COUNT(*)::INT               AS days_with_minute_data,
+               -- Provenance across the window: one native day plus one
+               -- reconstructed day is mixed, not whichever sorted last.
+               CASE WHEN COUNT(DISTINCT quota_tpm_source) > 1 THEN 'mixed'
+                    ELSE MIN(quota_tpm_source) END AS quota_tpm_source,
+               (ARRAY_AGG(peak_quota_tpm_at ORDER BY peak_quota_tpm DESC NULLS LAST))[1]
+                    AS peak_quota_tpm_at
+          FROM f_minute_peak
+         WHERE {w}
+          GROUP BY accountId, modelId, region, endpoint
+        """,
+        *params,
+    )
+    minute_by_key = {}
+    for r in db.rows_to_dicts(minute_rows):
+        key = (r.get("accountid") or r.get("accountId"),
+               r.get("modelid") or r.get("modelId"), r["region"], r["endpoint"])
+        minute_by_key[key] = r
+
+    # Collection coverage is tracked separately from active datapoints: a quiet
+    # application is legitimately sparse, which is not the same as a failed pull.
+    coverage_where = build_where(f, has_model=False, has_traffic_type=False)
+    cov_rows = await db.fetch(
+        f"""
+        SELECT accountId, region, endpoint,
+               COUNT(*)::INT                                        AS days_attempted,
+               COUNT(*) FILTER (WHERE status = 'complete')::INT      AS days_complete,
+               COUNT(*) FILTER (WHERE status <> 'complete')::INT     AS days_incomplete,
+               MAX(last_success_at)                                 AS last_success_at,
+               MAX(window_end)                                      AS collected_through,
+               BOOL_OR(partial_day)                                  AS includes_open_day
+          FROM f_minute_collection
+         WHERE {coverage_where.sql}
+         GROUP BY accountId, region, endpoint
+        """,
+        *coverage_where.params,
+    )
+    cov_by_key = {(r.get("accountid") or r.get("accountId"), r["region"], r["endpoint"]): r
+                  for r in db.rows_to_dicts(cov_rows)}
+    expected_days = max(0, (min(f.end, datetime.now(timezone.utc).date()) - f.start).days + 1)
+
     out_rows = []
     for a in agg.values():
         if a["peak_requests_hour"] <= 0:
@@ -266,9 +322,108 @@ async def ops_peak_rpm(f: FilterSet = Depends(parse_filters)):
         a["peak_input_tpm"] = a["busiest_hour_avg_input_tpm"]
         a["peak_output_tpm"] = a["busiest_hour_avg_output_tpm"]
         a["peak_quota_tpm"] = a["busiest_hour_avg_quota_tpm"]
+
+        # Measured minute, when collected. Absent stays absent.
+        m = minute_by_key.get((a["accountId"], a["modelId"], a["region"], a["endpoint"]))
+        cov = cov_by_key.get((a["accountId"], a["region"], a["endpoint"]))
+        stale = bool(m and m["resolution_stale"])
+        coverage_complete = bool(cov and expected_days
+                                 and cov["days_complete"] == expected_days
+                                 and not cov["days_incomplete"])
+        available = bool(m and not stale)
+        active_dates = a.pop("_active_dates")
+        dates_covered = bool(m and active_dates.issubset(set(m["measured_dates"])))
+        for metric in ("rpm", "input", "output", "quota"):
+            a[f"minute_{metric}_complete"] = bool(
+                available and coverage_complete and dates_covered
+                and m[f"{metric}_measurement_complete"])
+        # Successful API calls do not establish every metric. SQL MAX ignores
+        # NULL days, so its surviving value is only a lower bound when another
+        # active day could not measure the same metric.
+        measurement_complete = all(a[f"minute_{k}_complete"]
+                                   for k in ("rpm", "input", "output", "quota"))
+        a["has_application_profile"] |= bool(m and m["has_application_profile"])
+        a["measured_minute_available"] = available
+        a["minute_coverage_complete"] = measurement_complete
+        a["minute_rate_basis"] = MEASURED_MINUTE_BASIS if available else None
+        a["minute_coverage_status"] = (
+            "stale" if stale else "complete" if measurement_complete
+            else "partial" if cov or m else "not_collected")
+        # Partial coverage retains its observed peak, explicitly a lower bound.
+        # Consumers must check coverage before presenting quota headroom.
+        # Obsolete mappings are withheld because even the model may be wrong.
+        observed = m
+        m = m if available else None
+        a["peak_minute_rpm"] = int(m["peak_rpm"]) if m and m["peak_rpm"] is not None else None
+        a["peak_minute_input_tpm"] = (int(m["peak_input_tpm"])
+                                      if m and m["peak_input_tpm"] is not None else None)
+        a["peak_minute_output_tpm"] = (int(m["peak_output_tpm"])
+                                       if m and m["peak_output_tpm"] is not None else None)
+        # Named "estimated": EstimatedTPMQuotaUsage is an AWS approximation that
+        # excludes max_tokens reservation, so it is not the enforcement counter.
+        a["peak_minute_estimated_quota_tpm"] = (int(m["peak_quota_tpm"])
+                                                if m and m["peak_quota_tpm"] is not None else None)
+        a["peak_minute_quota_tpm_source"] = m["quota_tpm_source"] if m else "unavailable"
+        a["peak_minute_quota_tpm_at"] = (m["peak_quota_tpm_at"].isoformat()
+                                         if m and m.get("peak_quota_tpm_at") else None)
+        a["minute_active_minutes"] = int(observed["active_minutes"]) if observed else 0
+        a["minute_days_with_data"] = int(observed["days_with_minute_data"]) if observed else 0
+        a["minute_resolution_stale"] = stale
+        a["minute_collection"] = ({
+            "days_expected": expected_days,
+            "days_attempted": int(cov["days_attempted"]),
+            "days_complete": int(cov["days_complete"]),
+            "days_incomplete": int(cov["days_incomplete"]),
+            "days_missing": max(0, expected_days - int(cov["days_attempted"])),
+            "includes_open_day": bool(cov["includes_open_day"]),
+            "collected_through": cov["collected_through"].isoformat(),
+            "last_success_at": (cov["last_success_at"].isoformat()
+                                if cov.get("last_success_at") else None),
+        } if cov else {"days_expected": expected_days, "days_attempted": 0,
+                       "days_complete": 0, "days_incomplete": 0,
+                       "days_missing": expected_days, "last_success_at": None,
+                       "collected_through": None, "includes_open_day": False})
+        # How much the hourly average understates the measured minute. This is
+        # the burstiness the hourly grain cannot show at all.
+        hourly_avg = a["busiest_hour_avg_quota_tpm"]
+        minute_val = a["peak_minute_estimated_quota_tpm"]
+        a["quota_tpm_burstiness_x"] = (round(minute_val / hourly_avg, 1)
+                                       if minute_val and hourly_avg else None)
         out_rows.append(a)
-    out_rows.sort(key=lambda a: a["requests_busiest_hour_total"], reverse=True)
-    return out_rows[:200]
+    # Sort by the measured minute where available: that is the number that
+    # predicts throttling. Models without minute data fall back to hourly.
+    out_rows.sort(key=lambda a: (a["peak_minute_estimated_quota_tpm"] or 0,
+                                 a["requests_busiest_hour_total"]), reverse=True)
+    result = out_rows[:200]
+    if include_quotas:
+        await _attach_peak_quotas(result)
+    return result
+
+
+async def _attach_peak_quotas(rows: list[dict]) -> None:
+    """Use the same model/version/family resolver as the quota drill-down."""
+    accounts = sorted({r["accountId"] for r in rows if r["endpoint"] == "runtime"})
+    quotas = db.rows_to_dicts(await db.fetch(
+        """SELECT accountId, region, model_name, metric, traffic_type,
+                  quota_code, applied_value, default_value
+             FROM f_quotas WHERE accountId = ANY($1::text[])""",
+        accounts,
+    )) if accounts else []
+    by_scope: dict[tuple, list] = {}
+    for q in quotas:
+        key = (q.get("accountid") or q.get("accountId"), q["region"], q["metric"])
+        by_scope.setdefault(key, []).append(q)
+    for row in rows:
+        for metric in ("TPM", "RPM"):
+            q = QuotaResolution()
+            if row["endpoint"] == "runtime":
+                q = resolve_quota(
+                    by_scope.get((row["accountId"], row["region"], metric), []),
+                    row["accountId"], row["region"], row["modelId"], metric=metric,
+                    family_hint=family_hint_from_model_id(row["modelId"]),
+                    routing_unknown=row["has_application_profile"],
+                )
+            row[f"quota_{metric.lower()}"] = q.as_dict()
 
 
 # ---------------------------------------------------------------------------

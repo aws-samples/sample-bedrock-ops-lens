@@ -2,7 +2,7 @@
 import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, BarChart, LineChart, Grid, Box,
-  Button, Spinner, Alert, SegmentedControl, ColumnLayout, StatusIndicator,
+  Button, Spinner, Alert, SegmentedControl, ColumnLayout, StatusIndicator, Badge,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtPct, api as apiCall, accountName, useAccountNames } from '../api.js';
 import { ChartLoading, KpiCard, SectionHeader, InfoLink, CHART_I18N } from '../components/Common.jsx';
@@ -197,6 +197,9 @@ function RuntimeErrorsBody({ filters, onInfo }) {
   useAccountNames();   // resolve account names for the Account name cells
   const byModel = useApi('/errors-by-model', filters, [JSON.stringify(filters)]);
   const byAcct = useApi('/errors-by-account', filters, [JSON.stringify(filters)]);
+  // Per-profile detail. Empty for customers who do not use profiles, in
+  // which case the container below is not rendered at all.
+  const byProfile = useApi('/errors-by-profile', filters, [JSON.stringify(filters)]);
   const trend = useApi('/errors-daily-trend', filters, [JSON.stringify(filters)]);
   const statusCodes = useApi('/status-codes', filters, [JSON.stringify(filters)]);
 
@@ -466,7 +469,25 @@ function RuntimeErrorsBody({ filters, onInfo }) {
           <PaginatedTable
             items={(byModel.data || []).filter(r => Number(r.failed_requests) > 0)}
             columnDefinitions={[
-              { id: 'm',   header: 'Model',     cell: r => r.modelid || r.modelId, sortingField: 'modelid' },
+              // The model name, resolved. Customers invoking through an
+              // application inference profile used to see the profile's opaque
+              // 12-character id here; the lens_read projection resolves it, and
+              // the badge says the traffic arrived via a profile so two profiles
+              // on one model are not mistaken for a single direct caller.
+              { id: 'm', header: 'Model', sortingField: 'modelid',
+                cell: r => (
+                  <SpaceBetween size="xxs" direction="horizontal">
+                    <span>{r.modelid || r.modelId}</span>
+                    {r.has_application_profile ? (
+                      <Badge color="blue">
+                        {Number(r.profile_count) > 1
+                          ? `${r.profile_count} profiles`
+                          : 'via profile'}
+                      </Badge>
+                    ) : null}
+                  </SpaceBetween>
+                ),
+                exportValue: r => r.modelid || r.modelId },
               { id: 'rate', header: 'Error %', cell: (r) => {
                   const p = r.total_requests ? r.failed_requests * 100 / r.total_requests : 0;
                   const t = p > 5 ? 'error' : p > 1 ? 'warning' : 'success';
@@ -484,6 +505,41 @@ function RuntimeErrorsBody({ filters, onInfo }) {
           />
         }
       </Container>
+
+      {(byProfile.data || []).length > 0 && (
+        <Container header={
+          <Header variant="h2"
+            description="Detail behind the model rows above. Keyed by account, Region and profile id — profile NAMES are not unique. Summing a model's rows here reproduces its total above.">
+            Errors by application inference profile
+          </Header>}>
+          {byProfile.loading ? <ChartLoading height={200} /> :
+            <PaginatedTable
+              items={byProfile.data || []}
+              columnDefinitions={[
+                { id: 'm', header: 'Resolved model', cell: r => r.modelid || r.modelId },
+                { id: 'p', header: 'Profile',
+                  // Not "unresolved profile" — that reads as though the profile
+                  // itself is broken. It is not; Lens has no mapping for this
+                  // identifier yet.
+                  cell: r => r.application_profile_name
+                    || <Box color="text-status-inactive">
+                         Profile {r.invoked_model_id} — model not identified
+                       </Box>,
+                  exportValue: r => r.application_profile_name || r.invoked_model_id },
+                { id: 'pid', header: 'Invoked identifier', cell: r => r.invoked_model_id },
+                { id: 'a', header: 'Account ID', cell: r => r.accountid || r.accountId },
+                { id: 'r', header: 'Region', cell: r => r.region },
+                { id: 't', header: 'Total', cell: r => fmt(r.total_requests) },
+                { id: 'f', header: 'Failed', cell: r => fmt(r.failed_requests) },
+                { id: 'c9', header: '429', cell: r => fmt(r.status_429) },
+                { id: 'c4', header: '4xx*', cell: r => fmt(r.status_400) },
+                { id: 'c5', header: '5xx', cell: r => fmt(r.status_500) },
+              ]}
+              empty="No application inference profile traffic in window"
+            />
+          }
+        </Container>
+      )}
 
       <Container header={<Header variant="h2">Errors by account / model / region</Header>}>
         {byAcct.loading ? <ChartLoading height={200} /> :

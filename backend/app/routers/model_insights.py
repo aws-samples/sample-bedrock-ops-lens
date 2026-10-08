@@ -213,7 +213,11 @@ async def model_insights(f: FilterSet = Depends(parse_filters)):
 
         out.append({
             "modelId":          mid,
-            "public_name":      (f"Unresolved profile ({mid.rsplit('/', 1)[-1]})"
+            # Say what is missing rather than calling the profile "unresolved":
+            # the profile is working fine, Lens simply has no mapping for this
+            # identifier yet (typically a profile deleted before discovery first
+            # ran, or one in an account Lens cannot read).
+            "public_name":      (f"Profile {mid.rsplit('/', 1)[-1]} — model not identified"
                                  if unresolved_profile else _public_name(mid)),
             "provider":         provider,
             "unresolved_application_profile": unresolved_profile,

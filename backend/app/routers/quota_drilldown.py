@@ -6,7 +6,7 @@ Source data:
   - f_hourly_peak — hourly per (account, model, region) totals. Already
     populated by the CW metrics ingester. Hourly is the finest resolution
     we have today; we normalise to per-minute by dividing by 60 so the
-    chart shape matches the reference example a colleague shared.
+    chart compares directly with per-minute quota limits.
   - f_quotas — applied + default RPM/TPM limits per (account, region,
     model_name, traffic_type). model_name is human-friendly text
     ("Anthropic Claude Opus 4.7"), so we fuzz-match it against the

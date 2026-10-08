@@ -2,7 +2,7 @@
 import { useMemo, useState } from 'react';
 import {
   Container, Header, SpaceBetween, Grid, BarChart, LineChart, PieChart,
-  Spinner, Select, Box, ColumnLayout, StatusIndicator,
+  Spinner, Select, Box, ColumnLayout, StatusIndicator, Badge, Alert,
 } from '@cloudscape-design/components';
 import { useApi, fmt, fmtPct } from '../api.js';
 import {
@@ -111,6 +111,9 @@ function OverviewBody({ filters, onInfo }) {
   );
   const byModel = useApi('/requests-by-model', filters, [JSON.stringify(filters)]);
   const byTraffic = useApi('/traffic-types', filters, [JSON.stringify(filters)]);
+  // Application inference profiles. Returns nothing for customers who do not use
+  // them, in which case the panel below is not rendered at all.
+  const aipUsage = useApi('/inference-profile-usage', filters, [JSON.stringify(filters)]);
   const byAcct = useApi('/account-type-split', filters, [JSON.stringify(filters)]);
   const byOp = useApi('/operations', filters, [JSON.stringify(filters)]);
   // Regions container always shows all regions regardless of region filter.
@@ -545,6 +548,75 @@ function OverviewBody({ filters, onInfo }) {
           )
         }
       </Container>
+
+
+      {/* Application inference profiles — one table answering "which profile is
+          this, what model does it really run on, and how much is it using?".
+          Hidden entirely when there is no profile traffic. */}
+      {(aipUsage.error || (aipUsage.data || []).length > 0) && (
+        <Container header={
+          <Header variant="h2" counter={`(${(aipUsage.data || []).length})`}
+            description="Traffic sent through an application inference profile, with the foundation model it resolved to. Usage is already included in the model totals above; this breaks it out by profile.">
+            Application inference profiles
+          </Header>}>
+          {aipUsage.error ? <Alert type="error">Application profile usage could not be loaded. Try refreshing the page.</Alert>
+            : aipUsage.loading ? <ChartLoading height={200} /> :
+            <SpaceBetween size="s">
+            {(aipUsage.data || []).length === 500 && (
+              <Box color="text-body-secondary">Showing the 500 most active profiles for these filters.</Box>
+            )}
+            <PaginatedTable
+              items={aipUsage.data || []}
+              pageSize={10}
+              downloadFileName="bedrock-inference-profiles.csv"
+              columnDefinitions={[
+                { id: 'p', header: 'Profile',
+                  cell: r => r.application_profile_name
+                    ? <SpaceBetween size="xxs" direction="horizontal">
+                        <Box fontWeight="bold">{r.application_profile_name}</Box>
+                        {r.multi_region ? <Badge color="blue">multi-Region</Badge> : null}
+                        {r.api_visible === false ? <Badge color="grey">not currently listed</Badge> : null}
+                      </SpaceBetween>
+                    : <Box color="text-status-inactive">Name not discovered</Box>,
+                  exportValue: r => r.application_profile_name || '' },
+                // One row per profile: a caller may use the ARN in some code
+                // paths and the bare id in others, and both are listed here
+                // rather than split across two rows.
+                { id: 'id', header: 'Invoked as',
+                  cell: r => (
+                    <SpaceBetween size="xxxs">
+                      {(r.invoked_identifiers || []).map(v => (
+                        <Box key={v} fontSize="body-s">
+                          {v.includes('/') ? 'ARN' : 'short ID'}: {v.split('/').pop()}
+                        </Box>
+                      ))}
+                    </SpaceBetween>
+                  ),
+                  exportValue: r => (r.invoked_identifiers || []).join(' ') },
+                { id: 'm', header: 'Resolved model',
+                  cell: r => r.resolved
+                    ? r.modelid
+                    : <StatusIndicator type="pending">not identified yet</StatusIndicator>,
+                  exportValue: r => r.resolved ? r.modelid : '' },
+                { id: 'a', header: 'Account', cell: r => r.accountid,
+                  exportValue: r => r.accountid },
+                { id: 'r', header: 'Region', cell: r => r.region },
+                { id: 'rq', header: 'Requests', cell: r => fmt(r.total_requests),
+                  sortingField: 'total_requests', exportValue: r => r.total_requests },
+                { id: 'in', header: 'Input tokens', cell: r => fmt(r.total_input_tokens),
+                  exportValue: r => r.total_input_tokens },
+                { id: 'out', header: 'Output tokens', cell: r => fmt(r.total_output_tokens),
+                  exportValue: r => r.total_output_tokens },
+                { id: 'thr', header: 'Throttled', cell: r => fmt(r.throttled_requests),
+                  exportValue: r => r.throttled_requests },
+                { id: 'seen', header: 'Last seen', cell: r => r.last_seen || '—' },
+              ]}
+              empty="No application inference profile traffic in window"
+            />
+            </SpaceBetween>
+          }
+        </Container>
+      )}
 
       {/* 3. Health indicators */}
       <Container header={<SectionHeader title="Health indicators" sectionId="health-indicators" onInfo={onInfo} />}>
