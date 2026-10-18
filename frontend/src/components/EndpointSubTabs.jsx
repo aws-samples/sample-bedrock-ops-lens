@@ -19,6 +19,8 @@
 //                    think the switcher is broken when nothing changes.
 //   'none'         — Mantle does not publish this signal at all; render
 //                    an explicit "not available" empty state, NEVER zero
+//   'combined'     — the "All" segment (opt-in via `allowAll`): both
+//                    endpoints summed, so neither coverage label applies
 //
 // Design rule: never show a blank/zero chart for Mantle when the source
 // has no data — that's indistinguishable from "healthy" and would mislead
@@ -36,13 +38,21 @@ const COVERAGE_LABEL = {
   defaults:     { label: 'Defaults only',          type: 'info' },
   shared:       { label: 'Endpoint-agnostic',      type: 'info' },
   none:         { label: 'Not available',          type: 'warning' },
+  combined:     { label: 'runtime + mantle',       type: 'info' },
 };
 
 export default function EndpointSubTabs({
-  selected,                // 'runtime' | 'mantle'
+  selected,                // 'runtime' | 'mantle' | 'all' (with allowAll)
   onChange,                // (next) => void
   runtimeCoverage = 'full',
   mantleCoverage  = 'metric',
+  // When true, an "All" segment precedes the endpoint segments and sums
+  // both endpoints. Tabs whose figures add up across endpoints (cost,
+  // errors, latency, model mix) opt in, so a tab that opens on the
+  // combined picture highlights "All" instead of a runtime segment that
+  // doesn't match its numbers. Tabs whose figures don't combine (quota
+  // limits) leave it off.
+  allowAll = false,
   // When false, the bedrock-mantle segment is HIDDEN entirely — no
   // switcher, no coverage badge, just the runtime body. Use this for
   // tabs whose signal Mantle genuinely doesn't publish (and can't be
@@ -59,7 +69,7 @@ export default function EndpointSubTabs({
     return children({ endpoint: 'runtime', coverage: runtimeCoverage });
   }
 
-  const coverageMap = { runtime: runtimeCoverage, mantle: mantleCoverage };
+  const coverageMap = { runtime: runtimeCoverage, mantle: mantleCoverage, all: 'combined' };
   const activeCov = coverageMap[selected] || 'none';
   const meta = COVERAGE_LABEL[activeCov];
 
@@ -76,6 +86,7 @@ export default function EndpointSubTabs({
             selectedId={selected}
             onChange={({ detail }) => onChange(detail.selectedId)}
             options={[
+              ...(allowAll ? [{ id: 'all', text: 'All' }] : []),
               { id: 'runtime', text: 'bedrock-runtime' },
               { id: 'mantle',  text: 'bedrock-mantle' },
             ]}

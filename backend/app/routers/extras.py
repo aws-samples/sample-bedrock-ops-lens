@@ -90,7 +90,10 @@ async def account_type_split(f: FilterSet = Depends(parse_filters)):
     """Split by account_type. The internal version distinguished
     Internal/External; the customer version doesn't have that dimension —
     we group by accountId and label each as "Account <id>" so the pie still
-    has meaningful slices."""
+    has meaningful slices. Every account comes back, largest first: the pie
+    folds the tail into an "Other" slice itself, and a cap here would make
+    that slice silently omit accounts (an earlier LIMIT 8 did exactly that,
+    so twelve accounts rendered as six plus "Other (2 accts)")."""
     w = build_where(f)
     rows = await db.fetch(
         f"""
@@ -101,7 +104,6 @@ async def account_type_split(f: FilterSet = Depends(parse_filters)):
         WHERE {w.sql}
         GROUP BY accountId
         ORDER BY total_requests DESC
-        LIMIT 8
         """,
         *w.params,
     )

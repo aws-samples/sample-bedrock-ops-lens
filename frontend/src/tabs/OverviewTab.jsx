@@ -10,6 +10,7 @@ import {
 } from '../components/Common.jsx';
 import PaginatedTable from '../components/PaginatedTable.jsx';
 import EndpointSubTabs from '../components/EndpointSubTabs.jsx';
+import { accountSplitSlices } from '../accountSplit.js';
 import { utcDayOf, utcDayFromString, fmtDayUTC } from '../dates';
 
 function modelShort(id) {
@@ -86,9 +87,6 @@ export default function OverviewTab({ filters, onInfo }) {
 
 function OverviewBody({ filters, onInfo }) {
   const [groupBy, setGroupBy] = useState(GROUP_BY_OPTIONS[0]);
-  // Spend tile in-card toggle: on an endpoint sub-tab, flip between that
-  // endpoint's allocated slice ('endpoint') and the combined CE total ('total').
-  const [spendView, setSpendView] = useState('endpoint');
 
   const summary = useApi('/summary', filters, [JSON.stringify(filters)]);
   // Pass the SAME filters as the KPIs these deltas annotate (audit finding 10):
@@ -304,13 +302,8 @@ function OverviewBody({ filters, onInfo }) {
     return Array.from(buckets, ([title, value]) => ({ title, value }));
   }, [byTraffic.data]);
 
-  const accountTypeData = useMemo(() => {
-    if (!byAcct.data) return [];
-    return byAcct.data.map(r => ({
-      title: `${r.account_type} (${fmt(r.unique_accounts)} accts)`,
-      value: Number(r.total_requests),
-    }));
-  }, [byAcct.data]);
+  // Largest first, tail folded into "Other" (see accountSplit.js).
+  const accountTypeData = useMemo(() => accountSplitSlices(byAcct.data, fmt), [byAcct.data]);
 
   const opsData = useMemo(() => {
     if (!byOp.data) return [];
@@ -424,31 +417,30 @@ function OverviewBody({ filters, onInfo }) {
           const ep = filters.endpoint;
           const be = cost.data?.by_endpoint;
           const onEndpoint = (ep === 'runtime' || ep === 'mantle') && be;
-          // On an endpoint sub-tab, the in-card toggle picks which figure shows:
-          // that endpoint's allocated slice, or the combined CE total.
-          const showAlloc = onEndpoint && spendView === 'endpoint';
+          // The endpoint sub-tabs already pick the endpoint, so the tile has no
+          // toggle of its own. On an endpoint sub-tab the headline is that
+          // endpoint's allocated slice and the caption carries the exact CE
+          // total for the same window and accounts (`scope_total_all_endpoints`;
+          // the scoped response's `total_cost` is already the slice). The WoW
+          // badge describes the scoped total, so it stays off there.
           const cur = cost.data?.currency === 'USD' ? '$' : (cost.data?.currency || '') + ' ';
-          const amount = showAlloc ? Number(be[ep] || 0) : Number(cost.data?.total_cost || 0);
+          const amount = onEndpoint ? Number(be[ep] || 0) : Number(cost.data?.total_cost || 0);
+          const combined = cost.data?.scope_total_all_endpoints;
           const fmtUsd = (n) => `${cur}${n.toLocaleString(undefined, {
             minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
           return (
             <KpiCard title="Total spend"
-                     tabs={onEndpoint ? {
-                       selectedId: spendView,
-                       onChange: setSpendView,
-                       options: [
-                         { id: 'endpoint', text: ep === 'mantle' ? 'Mantle' : 'Runtime' },
-                         { id: 'total', text: 'Total' },
-                       ],
-                     } : undefined}
                      value={cost.data ? fmtUsd(amount) : '—'}
-                     wow={showAlloc ? undefined : [cost.data?.total_cost, cost.data?.previous_total_cost]}
+                     wow={onEndpoint ? undefined : [cost.data?.total_cost, cost.data?.previous_total_cost]}
                      invert
                      split={be && ep === 'all'
                        ? { runtime: fmtUsd(Number(be.runtime || 0)),
                            mantle: be.mantle != null ? fmtUsd(Number(be.mantle)) : null }
                        : undefined}
-                     note={showAlloc ? 'token-cost share' : undefined} />
+                     note={!onEndpoint ? undefined
+                       : combined != null
+                         ? `token-cost share of ${fmtUsd(Number(combined))} (Cost Explorer total)`
+                         : 'token-cost share'} />
           );
         })()}
       </Grid>
@@ -675,6 +667,10 @@ function OverviewBody({ filters, onInfo }) {
         <Container fitHeight header={<SectionHeader title="Account split" sectionId="internal-external" onInfo={onInfo} />}>
           {byAcct.loading ? <ChartLoading height={180} /> :
             <PieChart data={accountTypeData} size="small" hideFilter
+                      // Past a few slices the on-chart titles collide with
+                      // each other and the legend; the legend and hover
+                      // popover carry the names instead.
+                      hideTitles={accountTypeData.length > 4}
                       ariaLabel="Account split"
                       empty="No data" />
           }

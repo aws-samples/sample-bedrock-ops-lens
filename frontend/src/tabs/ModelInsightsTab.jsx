@@ -120,8 +120,9 @@ export default function ModelInsightsTab({ filters, onInfo }) {
   return (
     <SpaceBetween size="m">
       <EndpointSubTabs
-        selected={endpoint === 'all' ? 'runtime' : endpoint}
+        selected={endpoint}
         onChange={setEndpoint}
+        allowAll
         runtimeCoverage="full"
         mantleCoverage="metric"
         mantleAvailable={mantleAvailable}

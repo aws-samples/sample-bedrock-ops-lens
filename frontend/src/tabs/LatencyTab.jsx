@@ -47,8 +47,9 @@ export default function LatencyTab({ filters, onInfo }) {
   const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
   return (
     <EndpointSubTabs
-      selected={endpoint === 'all' ? 'runtime' : endpoint}
+      selected={endpoint}
       onChange={setEndpoint}
+      allowAll
       runtimeCoverage="full"
       mantleCoverage="log-derived"
       mantleAvailable={mantleAvailable}

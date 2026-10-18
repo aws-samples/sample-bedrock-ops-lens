@@ -66,8 +66,9 @@ export default function CostTab({ filters, onInfo }) {
   const filtersWithEp = useMemo(() => ({ ...filters, endpoint }), [filters, endpoint]);
   return (
     <EndpointSubTabs
-      selected={endpoint === 'all' ? 'runtime' : endpoint}
+      selected={endpoint}
       onChange={setEndpoint}
+      allowAll
       runtimeCoverage="metric"
       mantleCoverage="metric"
       mantleAvailable={mantleAvailable}
@@ -78,10 +79,6 @@ export default function CostTab({ filters, onInfo }) {
 }
 
 function CostBody({ filters, endpoint, onInfo }) {
-  // In-card toggle on the Total spend tile (endpoint sub-tabs only): flip
-  // between this endpoint's allocated slice and the combined CE total —
-  // mirrors the Overview tab's spend tile.
-  const [spendView, setSpendView] = useState('endpoint');
   const summary  = useApi('/cost-summary',           filters, [JSON.stringify(filters)]);
   const daily    = useApi('/cost-daily',             filters, [JSON.stringify(filters)]);
   const byAcct   = useApi('/cost-by-account',        filters, [JSON.stringify(filters)]);
@@ -152,31 +149,26 @@ function CostBody({ filters, endpoint, onInfo }) {
           the invoice-accurate Cost Explorer total apportioned per model/account/day
           by token-cost weight. AWS bills Bedrock without a runtime/mantle
           dimension, so this is an allocation, not a billed per-endpoint amount.
-          Switch to the combined view for exact CE dollars.
+          Select <strong>All</strong> for the exact Cost Explorer dollars.
         </Alert>
       )}
       {/* 1. KPI ribbon */}
       <Grid gridDefinition={[{ colspan: 3 }, { colspan: 3 }, { colspan: 3 }, { colspan: 3 }]}>
         {(() => {
           // CE gives an invoice-accurate TOTAL but no runtime-vs-mantle
-          // dimension. On an endpoint sub-tab, the in-card toggle picks which
-          // figure shows: that endpoint's ALLOCATED slice (total split by
-          // token-cost weight) or the combined CE total. On 'all' there's no
-          // toggle — just show the total plus the runtime·mantle split line.
+          // dimension. The endpoint sub-tabs above already pick the endpoint,
+          // so the tile carries no toggle of its own: on an endpoint sub-tab
+          // the headline is that endpoint's ALLOCATED slice (total split by
+          // token-cost weight) and the caption carries the exact CE total for
+          // the same window and accounts (`scope_total_all_endpoints`; the
+          // scoped response's `total_cost` is already the slice). On 'all' it
+          // is the total plus the runtime·mantle split line.
           const be = s.by_endpoint;
           const onEndpoint = (endpoint === 'runtime' || endpoint === 'mantle') && be;
-          const showAlloc = onEndpoint && spendView === 'endpoint';
-          const amount = showAlloc ? Number(be[endpoint] || 0) : Number(s.total_cost || 0);
+          const amount = onEndpoint ? Number(be[endpoint] || 0) : Number(s.total_cost || 0);
+          const combined = s.scope_total_all_endpoints;
           return (
             <KpiCard title={`Total spend (${s.window?.days || '—'}d)`}
-                     tabs={onEndpoint ? {
-                       selectedId: spendView,
-                       onChange: setSpendView,
-                       options: [
-                         { id: 'endpoint', text: endpoint === 'mantle' ? 'Mantle' : 'Runtime' },
-                         { id: 'total', text: 'Total' },
-                       ],
-                     } : undefined}
                      value={s.total_cost != null ? fmtCurrency(amount, currency) : '—'}
                      // Endpoint split line only on the combined 'all' view, and
                      // only when there's actual mantle spend to break out.
@@ -184,7 +176,10 @@ function CostBody({ filters, endpoint, onInfo }) {
                        ? { runtime: fmtCurrency(Number(be.runtime || 0), currency),
                            mantle: fmtCurrency(Number(be.mantle || 0), currency) }
                        : undefined}
-                     note={showAlloc ? 'token-cost share' : undefined} />
+                     note={!onEndpoint ? undefined
+                       : combined != null
+                         ? `token-cost share of ${fmtCurrency(Number(combined), currency)} (Cost Explorer total)`
+                         : 'token-cost share'} />
           );
         })()}
         <KpiCard title="WoW change"

@@ -1,5 +1,5 @@
 // Reusable presentational components shared across tabs.
-import { Container, Box, Header, Spinner, Link, StatusIndicator, SegmentedControl } from '@cloudscape-design/components';
+import { Container, Box, Header, Spinner, Link, StatusIndicator } from '@cloudscape-design/components';
 
 export function ChartLoading({ height = 220, label = 'Loading…' }) {
   return (
@@ -15,7 +15,7 @@ export function ChartLoading({ height = 220, label = 'Loading…' }) {
   );
 }
 
-export function KpiCard({ title, value, wow, invert, split, note, tabs }) {
+export function KpiCard({ title, value, wow, invert, split, note }) {
   // A KPI value is usually a short number ("547", "4.20%") but sometimes a
   // free-text string ("search-service"). Long strings at display-l wrap to two
   // lines and make one tile taller than its row-mates — the KPI ribbon then
@@ -33,18 +33,6 @@ export function KpiCard({ title, value, wow, invert, split, note, tabs }) {
   return (
     <Container fitHeight>
       <Box variant="awsui-key-label">{title}</Box>
-      {/* Optional in-card toggle — e.g. flip the spend tile between an
-          endpoint's allocated slice and the combined Total. */}
-      {tabs ? (
-        <Box padding={{ bottom: 'xxs' }}>
-          <SegmentedControl
-            selectedId={tabs.selectedId}
-            onChange={({ detail }) => tabs.onChange(detail.selectedId)}
-            options={tabs.options}
-            label={title}
-          />
-        </Box>
-      ) : null}
       <Box
         variant="h1"
         fontSize={valFontSize}
