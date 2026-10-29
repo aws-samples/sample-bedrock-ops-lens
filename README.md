@@ -127,6 +127,8 @@ existing_resources:
   waf: none
 ```
 
+> **Note:** All resource IDs and role ARNs above are illustrative placeholders, not actual deployment values. Replace them with your own before deploying.
+
 Each security group and execution role is independent: supply its ID/ARN to
 reuse it, or use `new` to create it. Omitted choices create resources on first
 deployment and preserve deployed choices on updates. For CloudFormation, keep
