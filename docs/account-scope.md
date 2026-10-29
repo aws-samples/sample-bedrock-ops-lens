@@ -20,9 +20,10 @@ AWS credentials. Setup finds the stack using `.deploy-stack-name`, or an explici
 | 4a | Explicit list, self-managed StackSets | No, including bootstrap | Yes |
 | 4b | Explicit list, roles deployed by account owners | No | No |
 
-The [README quick start](../README.md#quick-start) disables Organizations
-permissions and starts in single-account mode. For options 2 or 3, enable
-discovery in the central deployment first:
+The [README deployment steps](../README.md#deploy) cover both single-account and
+OU collection. If you started with the single-account flow, Organizations
+permissions are disabled. For options 2 or 3, enable discovery in the central
+deployment first:
 
 ```bash
 ENABLE_ORGANIZATIONS_DISCOVERY=true ./deploy.sh --yes

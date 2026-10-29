@@ -78,30 +78,77 @@ and Region.
 ### Choose your deployment
 
 **Use new resources, existing resources, or a mixture—all with `./deploy.sh`.**
-Configure these choices in the `existing_resources:` section of `config.yaml`;
-[the existing-resources guide](docs/existing-resources.md) has examples and
-the required network rules and role permissions.
 
-| Resource | Default for a new deployment | To use existing resources or opt out |
-|---|---|---|
-| VPC and subnets | Create a VPC, private subnets, and NAT gateway | Supply a VPC and at least two private subnets in different Availability Zones; Lens creates no VPC, NAT gateway, subnets, or routes |
-| Security groups | Create dedicated Lens groups | Supply each group independently; Lens leaves its rules unchanged |
-| Lambda execution roles | Create the required roles | Supply any or all execution-role ARNs; Lens creates only the roles not supplied |
-| CloudFormation service role | Use your deployment credentials | Supply a service-role ARN |
-| AWS WAF | Create a web ACL | Set `existing_resources.waf: none`, or supply an existing CloudFront-scope web ACL ARN |
+**Create new resources:** leave `existing_resources` commented out in
+`config.yaml` and continue to [Deploy](#deploy). The first interactive run asks
+what to create or reuse and saves your answers. If there is no terminal and no
+configured section, a first deployment creates its VPC, subnets, NAT gateway, security groups,
+execution roles, and WAF.
 
-If the section is absent, the first interactive run asks for these choices and
-saves them. A non-interactive first deployment without that section uses the
-defaults above. On updates, omitted choices preserve the stack's existing settings.
+#### Existing VPC and roles (no WAF)
 
-Lens still creates its application services, including Aurora and ElastiCache.
-Both deployment choices support the [account-scope options](#multi-account-data-pipeline)
-below, including OU-based reader rollout.
+**1. Choose a stack name.** Run this in the terminal you will use to deploy:
+
+```bash
+export STACK_NAME_SUFFIX=myteam
+```
+
+This makes the stack name `BedrockOpsLens-myteam`. Give that name and the
+deployment Region to your IAM team when preparing the
+[execution-role policies](infra/examples/existing-execution-roles.yaml).
+For OU collection, include the template's `EnableOrganizationsDiscovery=true`
+permissions.
+
+**2. Fill in `config.yaml`.** Replace its commented `existing_resources` example
+with this block. Replace every example ID and ARN with your actual values;
+keep only one active `existing_resources` block:
+
+```yaml
+existing_resources:
+  network:
+    vpc_id: vpc-0123456789abcdef0
+    private_subnet_ids:
+      - subnet-0123456789abcdef0
+      - subnet-0fedcba9876543210
+    lambda_security_group_id: sg-0123456789abcdef0
+    db_security_group_id: sg-0123456789abcdef1
+    cache_security_group_id: sg-0123456789abcdef2
+
+  roles:
+    backend: arn:aws:iam::123456789012:role/lens-backend
+    ingester: arn:aws:iam::123456789012:role/lens-ingester
+    schema_init: arn:aws:iam::123456789012:role/lens-schema-init
+    prewarm: arn:aws:iam::123456789012:role/lens-prewarm
+    pre_signup: arn:aws:iam::123456789012:role/lens-pre-signup
+    post_confirm: arn:aws:iam::123456789012:role/lens-post-confirm
+    edge: arn:aws:iam::123456789012:role/lens-edge
+
+  cloudformation_service_role_arn: none
+  waf: none
+```
+
+Each security group and execution role is independent: supply its ID/ARN to
+reuse it, or use `new` to create it. Omitted choices create resources on first
+deployment and preserve deployed choices on updates. For CloudFormation, keep
+`none` to use your deployment credentials or supply your service-role ARN.
+
+The two private subnets must be in different Availability Zones in the supplied
+VPC. Supplied security groups must already allow the Lambda group to reach
+Aurora on TCP **5432**, the cache on TCP **11211**, and the required AWS APIs.
+Lens leaves their rules unchanged. See the
+[network and IAM requirements](docs/existing-resources.md) for policy details.
+
+**3. Run one of the deployment commands below.** With the example above, Lens
+creates no VPC, subnets, NAT gateway, routes, security groups, execution roles,
+or WAF. It still creates its application services, including Aurora and
+ElastiCache, and a Lambda@Edge stack in **us-east-1**.
 
 ### Deploy
 
-The following first deployment starts in **single-account mode without AWS
-Organizations discovery**. Replace the email domain with your own:
+Use either resource choice above. Replace `yourcompany.com` with your email
+domain and choose **one** of these flows.
+
+**Single-account collection:**
 
 ```bash
 ALLOWED_EMAIL_DOMAINS=yourcompany.com \
@@ -109,9 +156,29 @@ ALLOWED_EMAIL_DOMAINS=yourcompany.com \
   ./deploy.sh --yes
 ```
 
+**OU collection:** use management-account credentials or a registered StackSets
+delegated administrator, with
+[service-managed StackSets prerequisites](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-prereqs-service-managed.html)
+completed. Supplied ingester roles must have Organizations read permissions.
+Replace the OU ID, and run both commands in the same terminal:
+
+```bash
+ALLOWED_EMAIL_DOMAINS=yourcompany.com \
+  ENABLE_ORGANIZATIONS_DISCOVERY=true \
+  SKIP_INITIAL_INGEST=1 \
+  ./deploy.sh --yes
+
+./setup-pipeline.sh --scope ou --ou-id ou-xxxx-yyyyyyyy
+```
+
+For a delegated administrator, add `--delegated-admin` to the second command.
+Setup rolls out member-account reader roles, selects only the OU's accounts
+(including child OUs), and then runs the first ingest. These reader roles are
+separate from the central execution roles supplied above.
+
 The script builds the application, provisions the central stack, initializes
-the database, and runs an initial ingest. It prints the dashboard URL and the
-`admin-create-user` and `admin-add-user-to-group` commands for your first admin.
+the database, and collects data in the order chosen above. It prints the dashboard
+URL and the `admin-create-user` and `admin-add-user-to-group` commands for your first admin.
 Complete both commands to add that user to `bedrock-lens-admins`.
 After changing group membership, sign out and back in.
 
@@ -120,9 +187,8 @@ set `COGNITO_SELF_SIGNUP=enabled` for deployment. Follow the
 [sign-in instructions](docs/deployment.md#sign-in) for the domain allowlist and
 first-admin behavior.
 
-[Verify the deployment](docs/deployment.md#verify), then choose the account
-scope below. For an Organizations-based rollout, the
-[account-scope guide](docs/account-scope.md) explains how to enable discovery.
+[Verify the deployment](docs/deployment.md#verify). Other collection options,
+including an explicit account list, are listed below.
 
 ## Multi-account data pipeline
 
