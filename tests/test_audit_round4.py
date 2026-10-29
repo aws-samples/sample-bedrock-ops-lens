@@ -645,7 +645,9 @@ def test_deploy_sh_passes_the_signup_mode_and_says_which_it_is():
     the dashboard URL and sign up" - so a first deploy ended with a login nobody
     could pass."""
     src = (ROOT / "deploy.sh").read_text()
-    assert '"ParameterKey":"CognitoSelfSignUp"' in src
+    # The parameter file is built from KEY=VALUE pairs handed to an inline
+    # python block; the pair is what proves the mode is passed through.
+    assert '"CognitoSelfSignUp=$COGNITO_SELF_SIGNUP"' in src
     assert "admin-create-user" in src, "it must print how to create the first user"
     readme = (ROOT / "README.md").read_text()
     assert "admin-create-only by default" in readme

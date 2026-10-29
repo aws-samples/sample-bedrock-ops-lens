@@ -574,7 +574,7 @@ def main() -> int:
     print(f"  Ensure the central stack's ReaderRoleName is {args.role_name!r}.")
     print("  For Lambda deployments, setup-pipeline.sh uses that parameter for both")
     print("  rollout and ingestion; deploy.sh changes it via BEDROCK_OPS_LENS_ROLE_NAME.")
-    print(f"  Update the central ingester to use mode='discover-org' or 'explicit'")
+    print(f"  Update the central ingester to use mode='discover-ou', 'discover-org' or 'explicit'")
     print(f"  with the relevant account list. Then trigger:")
     print(
         f"    aws lambda invoke --function-name BedrockOpsLens-<suffix>-ingester "

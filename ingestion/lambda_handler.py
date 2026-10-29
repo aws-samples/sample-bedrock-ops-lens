@@ -89,6 +89,20 @@ def _set_argv(argv: list[str]) -> None:
 async def _orchestrate(only: list[str] | None, days: int,
                        logs_budget_s: int = 0) -> dict:
     """Run ingesters in order. `only` filters to a subset by module name."""
+    from .accounts import discover_from_ous
+    from .config import load_config
+
+    # Resolve OU scope once, before even opening the database. Reuse the same
+    # membership for every collector in this invocation; an empty OU is a
+    # successful no-op, and an unavailable scope aborts before any work begins.
+    scope = load_config().monitored_accounts
+    ou_accounts = None
+    if scope.mode == "discover-ou":
+        ou_accounts = discover_from_ous(scope.ou_ids)
+        if not ou_accounts:
+            return {"runs": [], "skipped_reason": "empty_ou_scope"}
+    ou_csv = ",".join(a.accountId for a in ou_accounts) if ou_accounts is not None else None
+
     db_url = os.environ.get("DATABASE_URL", "")
     if not db_url:
         # Compose from DB_* env vars + Secrets Manager.
@@ -157,10 +171,13 @@ async def _orchestrate(only: list[str] | None, days: int,
             accounts = None
             accounts_config = None
             discover_org = False
-        try:
-            _accts = [a.accountId for a in _disc(_A())]
-        except Exception:
-            _accts = []
+        if ou_accounts is not None:
+            _accts = [a.accountId for a in ou_accounts]
+        else:
+            try:
+                _accts = [a.accountId for a in _disc(_A())]
+            except Exception:
+                _accts = []
         if not _accts:
             # Fall back to the running account so the module still does useful
             # work even if org discovery is unavailable.
@@ -244,6 +261,9 @@ async def _orchestrate(only: list[str] | None, days: int,
 
     results = []
     for name, mod_path, argv in schedule:
+        if ou_accounts is not None:
+            if name not in {"model_lifecycle", "invocation_logs"}:
+                argv += ["--accounts", ou_csv]
         import importlib
         mod = importlib.import_module(mod_path)
         _set_argv(argv)
@@ -252,7 +272,10 @@ async def _orchestrate(only: list[str] | None, days: int,
     # Account-name refresh (008): config map > org name > GetAccountInformation.
     # Best-effort — a name failure must never fail the ingest run.
     try:
-        await _refresh_account_names()
+        if ou_accounts is None:
+            await _refresh_account_names()
+        else:
+            await _refresh_account_names(ou_accounts)
     except Exception as e:  # noqa: BLE001
         print(f"[dim_account] refresh skipped: {type(e).__name__}: {e}")
 
@@ -290,7 +313,7 @@ async def _evaluate_findings() -> dict:
         await conn.close()
 
 
-async def _refresh_account_names() -> None:
+async def _refresh_account_names(monitored_accounts=None) -> None:
     """Resolve + upsert friendly names for every monitored account."""
     import asyncpg
     try:
@@ -307,7 +330,10 @@ async def _refresh_account_names() -> None:
         accounts_config = None
         discover_org = False
 
-    accounts = discover_accounts(_A())
+    accounts = (discover_accounts(_A()) if monitored_accounts is None
+                else monitored_accounts)
+    if not accounts:
+        return
     cfg_names = load_config().account_names
     resolved = resolve_account_names(accounts, cfg_names)
 
@@ -452,7 +478,8 @@ def handler(event, context):
     ]
     failed = [r for r in runs if r.get("rc") not in (0, None) and r not in incomplete]
     result["status"] = (
-        "partial" if failed or not runs else "incomplete" if incomplete else "ok"
+        "partial" if failed or (not runs and result.get("skipped_reason") != "empty_ou_scope")
+        else "incomplete" if incomplete else "ok"
     )
     result["failed_count"] = len(failed)
     result["incomplete_modules"] = [r["module"] for r in incomplete]

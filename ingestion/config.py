@@ -11,6 +11,7 @@ scripts, CDK stack inputs) gets the same expanded list.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,8 +70,9 @@ def _live_discover_regions(session=None) -> list[str]:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class MonitoredAccountsConfig:
-    mode: str = "single"            # "single" | "explicit" | "discover-org"
-    ids: tuple[str, ...] = ()
+    mode: str = "single"            # "single" | "explicit" | "discover-org" | "discover-ou"
+    ids: tuple[str, ...] = ()       # explicit: 12-digit account IDs
+    ou_ids: tuple[str, ...] = ()    # discover-ou: OU IDs (child OUs included at resolution time)
 
 
 @dataclass(frozen=True)
@@ -164,12 +166,21 @@ def load_config(path: str | Path | None = None) -> Config:
 
     accts_raw = raw.get("monitored_accounts") or {}
     accts_mode = _env_str("MONITORED_ACCOUNTS_MODE", accts_raw.get("mode", "single"))
-    accts_ids_env = os.environ.get("MONITORED_ACCOUNTS_IDS", "")
+    accts_ids_env = os.environ.get("MONITORED_ACCOUNTS_IDS")
     accts_ids = tuple(
-        a.strip() for a in (accts_ids_env.split(",") if accts_ids_env else accts_raw.get("ids", []))
-        if str(a).strip().isdigit() and len(str(a).strip()) == 12
+        str(a).strip() for a in (accts_ids_env.split(",") if accts_ids_env is not None else accts_raw.get("ids", []))
+        if str(a).strip()
     )
-    accts = MonitoredAccountsConfig(mode=accts_mode, ids=accts_ids)
+    if any(not re.fullmatch(r"[0-9]{12}", a) for a in accts_ids):
+        raise ValueError("monitored_accounts.ids must contain only 12-digit account IDs")
+    ou_ids_env = os.environ.get("MONITORED_OU_IDS")
+    ou_ids = tuple(
+        str(o).strip() for o in (ou_ids_env.split(",") if ou_ids_env is not None else accts_raw.get("ou_ids", []) or [])
+        if str(o).strip()
+    )
+    if any(not re.fullmatch(r"(ou-[0-9a-z]{4,32}-[0-9a-z]{8,32}|r-[0-9a-z]{4,32})", o) for o in ou_ids):
+        raise ValueError("monitored_accounts.ou_ids must contain valid OU/root IDs")
+    accts = MonitoredAccountsConfig(mode=accts_mode, ids=accts_ids, ou_ids=ou_ids)
 
     regs_raw = raw.get("monitored_regions") or {}
     regs_preset = _env_str("MONITORED_REGIONS_PRESET", regs_raw.get("preset", "us-eu-apac"))

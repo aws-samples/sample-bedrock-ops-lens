@@ -38,7 +38,8 @@ stack whose discovery parameter is disabled.
 ./setup-pipeline.sh --scope single
 ```
 
-No StackSet is used. This setup path deploys a local reader stack; ingestion
+No StackSet is used. This setup path deploys a local reader stack; use
+`--skip-rollout` to omit it when using existing execution roles. Ingestion
 normally uses the central Lambda's own credentials for its own account.
 
 ## Option 2: organizational units
@@ -48,6 +49,10 @@ or pass `--delegated-admin` from a registered delegated administrator. Complete
 [AWS's service-managed prerequisites](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/stacksets-prereqs-service-managed.html),
 including trusted access, before rollout.
 
+For an existing Lens installation, run `deploy.sh --yes` from this release
+first to upgrade the central template, permissions, and ingester image.
+OU setup rejects older central stacks before changing readers or collection.
+
 ```bash
 ./setup-pipeline.sh --scope ou --ou-id ou-xxxx-yyyyyyyy
 ```
@@ -55,9 +60,18 @@ including trusted access, before rollout.
 For multiple OUs, comma-separate their IDs. Auto-deployment is enabled so new
 accounts joining the targeted OUs receive the reader role.
 
-OU selection controls where the roles are deployed. The ingester is configured
-to use Organizations discovery, rather than an explicit OU account list. Use
-option 4 with an explicit list when you need a fixed collection scope.
+OU selection controls both where the roles are deployed and what is collected.
+The ingester is set to `discover-ou` with the same OU IDs: on every run it
+resolves the OU membership (child OUs included) with
+`organizations:ListAccountsForParent` and collects only from those accounts, so
+accounts elsewhere in the organization are neither contacted nor reported as
+failures, and new members are picked up without reconfiguration. A membership
+lookup failure fails the run rather than widening or narrowing the scope. The
+central credentials must be the management account or a registered delegated
+administrator (StackSets delegated-administrator registration grants the
+read-only Organizations access this needs). Cost Explorer data is filtered to
+the same accounts. Use option 4 with an explicit list when you need a fixed
+collection scope.
 
 ## Option 3: organization root
 
@@ -90,7 +104,7 @@ Tables show account ID and name separately; CSV exports retain both fields.
 Dropdown labels show “name (ID)”. Resolution order is:
 
 1. The optional `account_names` map in `config.yaml`.
-2. The Organizations account name when using `discover-org` mode.
+2. The Organizations account name when using `discover-org` or `discover-ou` mode.
 3. `account:GetAccountInformation` through the account's reader role, which
    works without Organizations.
 
@@ -101,15 +115,16 @@ If a name cannot be resolved, the account ID is still shown.
 1. Validates the central stack and resolves its ingester role and reader name.
 2. Uses existing readers with `--skip-rollout`, or deploys them through the
    selected CloudFormation scope.
-3. Sets the ingester to `single`, `explicit`, or `discover-org`, preserving
-   unrelated environment variables and using revision checks.
+3. Persists `single`, `explicit`, `discover-ou`, or `discover-org` and its IDs
+   in CloudFormation, preserving unrelated parameters and checking for drift.
 4. Invokes ingestion and checks the Lambda response and reported module results.
 
 Re-run with the **complete intended account list** when updating an explicit
 scope. Removing an account stops collection after reconfiguration; it does not
 delete IAM roles or historical rows. `--dry-run` validates inputs and reads the
 central configuration without writes. `--skip-ingest` leaves runtime collection
-unverified. Re-run setup after central redeployments that reset Lambda scope.
+unverified. Redeploying the central stack preserves the running ingester's
+scope. Empty OU membership collects nothing, and lookup errors fail the run.
 
 ## Scale
 

@@ -6,8 +6,11 @@
 # deployed by `scripts/setup-multi-account.py`:
 #
 #   1. Use existing reader roles (--skip-rollout), or deploy them.
-#   2. Ensure the central ingester Lambda is in `discover-org` mode (or
-#      `explicit` for --scope accounts), so it actually uses the new roles.
+#   2. Persist scope in the central stack and verify the ingester Lambda is in
+#      the matching collection mode
+#      (`discover-ou` for --scope ou, `discover-org` for --scope org-root,
+#      `explicit` for --scope accounts, `single`), so it actually uses the new
+#      roles — and collects from exactly the accounts they were rolled out to.
 #   3. Trigger one ingest run synchronously and report what landed.
 #
 # This is the "data pipeline" companion to deploy.sh:
@@ -65,11 +68,14 @@ Scopes:
         Pull data only from the account that owns this dashboard. No
         StackSet, no cross-account roles.
 
-  --scope ou --ou-id ou-xxxx-yyyyyyyy [--delegated-admin]
-        Service-managed StackSet across every account in the OU. Auto-deploy
-        is ON, so accounts joining the OU later are auto-onboarded. Run from
-        the management account, or pass --delegated-admin from a delegated
-        administrator account.
+  --scope ou --ou-id ou-xxxx-yyyyyyyy[,ou-...] [--delegated-admin]
+        Service-managed StackSet across every account in the OU(s), child OUs
+        included. Auto-deploy is ON, so accounts joining the OU later are
+        auto-onboarded. The ingester is set to `discover-ou`: it resolves the
+        OU membership on every run and collects ONLY from those accounts, so
+        accounts elsewhere in the organization are neither contacted nor
+        reported as failures. Run from the management account, or pass
+        --delegated-admin from a delegated administrator account.
 
   --scope org-root [--delegated-admin]
         Same as --scope ou but targets every account in the org root.
@@ -90,7 +96,7 @@ Options:
   --role-name NAME    Must match ReaderRoleName in the central stack.
                       If omitted, setup uses the deployed parameter's value.
   --skip-ingest       Skip the ingest run after configuring the pipeline.
-  --dry-run           Validate inputs and read central configuration; no writes.
+  --dry-run           Validate inputs and preview durable scope setup; no writes.
 
 Environment:
   DEPLOY_REGION       Override config.yaml deploy_region (else us-east-1).
@@ -182,6 +188,14 @@ case "$SCOPE" in
         ;;
     ou)
         if [[ -z "$OU_ID" ]]; then echo "ERROR: --scope ou requires --ou-id" >&2; exit 2; fi
+        OU_ID="$(printf '%s' "$OU_ID" | tr -d '[:space:]')"
+        IFS=',' read -r -a _ou_list <<< "$OU_ID"
+        for _ou in "${_ou_list[@]}"; do
+            if [[ ! "$_ou" =~ ^ou-[0-9a-z]{4,32}-[0-9a-z]{8,32}$ ]]; then
+                echo "ERROR: --ou-id must be one or more OU IDs like ou-xxxx-yyyyyyyy (got '$_ou')" >&2
+                exit 2
+            fi
+        done
         PY_ARGS+=( "--ou-id" "$OU_ID" )
         ;;
 esac
@@ -260,6 +274,42 @@ if [[ -n "$REQUESTED_ROLE_NAME" && "$REQUESTED_ROLE_NAME" != "$PIPELINE_ROLE_NAM
     exit 2
 fi
 
+# Determine template support before rollout. A partially upgraded template is
+# unsafe; legacy templates support only single, explicit, and whole-org setup.
+if ! PIPELINE_PARAMETER_KEYS="$(aws cloudformation describe-stacks \
+    --stack-name "$MAIN_STACK" --region "$PIPELINE_REGION" \
+    --query 'Stacks[0].Parameters[].ParameterKey' --output json 2>/dev/null)"; then
+    echo "ERROR: cannot determine central-stack scope support; resolve CloudFormation access before setup." >&2
+    exit 1
+fi
+PIPELINE_DURABLE_SCOPE="$(python3 - "$PIPELINE_PARAMETER_KEYS" <<'PY'
+import json
+import sys
+
+try:
+    keys = json.loads(sys.argv[1])
+    if not isinstance(keys, list) or any(not isinstance(key, str) for key in keys):
+        raise ValueError()
+except (TypeError, ValueError):
+    raise SystemExit("ERROR: cannot read central-stack parameter names")
+required = {"MonitoredAccountsMode", "MonitoredAccountIds", "MonitoredOuIds", "ReaderExternalId"}
+present = required.intersection(keys)
+if present and present != required:
+    raise SystemExit("ERROR: central template has incomplete scope parameters; apply the new deploy template before setup")
+print("true" if present == required else "false")
+PY
+)"
+if [[ "$PIPELINE_DURABLE_SCOPE" != "true" ]]; then
+    if [[ "$SCOPE" == "ou" ]]; then
+        echo "ERROR: --scope ou requires an upgraded central deployment; the legacy ingester may not enforce OU scope." >&2
+        echo "       Run ./deploy.sh --yes to upgrade the central template and ingester image; verify OU discovery permissions, then re-run this command." >&2
+        exit 1
+    fi
+    echo "WARNING: deployed template lacks durable scope parameters; using the legacy direct Lambda update." >&2
+    echo "         Apply the new deploy template, then re-run setup to persist scope and external ID." >&2
+    echo "         Until then, a central-stack redeploy can reset the collection scope." >&2
+fi
+
 # ---------------------------------------------------------------------------
 # Resolve the actual runtime principal before creating any cross-account trust.
 # ---------------------------------------------------------------------------
@@ -291,12 +341,17 @@ echo "    reader role:     $PIPELINE_ROLE_NAME"
 
 # Decide what MONITORED_ACCOUNTS_MODE we want the ingester to be in.
 # - single       -> single
-# - accounts     -> explicit (with MONITORED_ACCOUNTS_IDS)
-# - ou/org-root  -> discover-org
+# - accounts     -> explicit     (with MONITORED_ACCOUNTS_IDS)
+# - ou           -> discover-ou  (with MONITORED_OU_IDS; membership resolved per run)
+# - org-root     -> discover-org
+# The collection scope must match the rollout scope: an OU rollout that left the
+# ingester in discover-org would try every account in the organization, and the
+# ones outside the OU (no reader role) would fail every run.
 case "$SCOPE" in
-    single)            INGEST_MODE="single";      INGEST_IDS="";;
-    accounts)          INGEST_MODE="explicit";    INGEST_IDS="$ACCOUNTS";;
-    ou|org-root)       INGEST_MODE="discover-org"; INGEST_IDS="";;
+    single)            INGEST_MODE="single";       INGEST_IDS="";;
+    accounts)          INGEST_MODE="explicit";     INGEST_IDS="$ACCOUNTS";;
+    ou)                INGEST_MODE="discover-ou";  INGEST_IDS="$OU_ID";;
+    org-root)          INGEST_MODE="discover-org"; INGEST_IDS="";;
 esac
 
 if [[ -n "$DRY_RUN" ]]; then
@@ -311,7 +366,12 @@ if [[ -n "$DRY_RUN" ]]; then
         echo "    Trust only $INGESTER_ROLE_ARN"
         [[ -z "$PIPELINE_EXTERNAL_ID" ]] || echo "    Require the configured external ID on reader roles and ingester"
     fi
-    echo "    aws lambda update-function-configuration  (mode=$INGEST_MODE)"
+    if [[ "$PIPELINE_DURABLE_SCOPE" == "true" ]]; then
+        echo "    Persist CloudFormation scope (mode=$INGEST_MODE${INGEST_IDS:+, targets=$INGEST_IDS}) and verify live ingester"
+        echo "    Reuse deployed template, service role, and all other parameter values"
+    else
+        echo "    aws lambda update-function-configuration  (mode=$INGEST_MODE${INGEST_IDS:+, targets=$INGEST_IDS})"
+    fi
     [[ -z "$SKIP_INGEST" ]] && echo "    aws lambda invoke $INGESTER_FN"
     exit 0
 fi
@@ -330,7 +390,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3/4: Reconfigure the central ingester so it actually uses the new roles
+# 3/4: Persist scope in the stack, or use the guarded legacy Lambda update
 # ---------------------------------------------------------------------------
 echo
 echo "[3/4] reconfiguring ingester to mode=$INGEST_MODE..."
@@ -356,12 +416,16 @@ if config.get("Environment", {}).get("Error"):
 v = dict(config.get("Environment", {}).get("Variables", {}))
 v["MONITORED_ACCOUNTS_MODE"] = mode
 v["BEDROCK_OPS_LENS_ROLE_NAME"] = reader_role_name
+v.pop("MONITORED_ACCOUNTS_IDS", None)
+v.pop("MONITORED_OU_IDS", None)
 if mode == "explicit":
     if not ids:
         raise SystemExit("ERROR: refusing to configure explicit mode without account IDs")
     v["MONITORED_ACCOUNTS_IDS"] = ids
-else:
-    v.pop("MONITORED_ACCOUNTS_IDS", None)
+elif mode == "discover-ou":
+    if not ids:
+        raise SystemExit("ERROR: refusing to configure discover-ou mode without OU IDs")
+    v["MONITORED_OU_IDS"] = ids
 if external_id:
     v["BEDROCK_OPS_LENS_EXTERNAL_ID"] = external_id
 else:
@@ -371,14 +435,31 @@ with open(destination, "w") as stream:
 print(config["RevisionId"])
 PY
 )"
-aws lambda update-function-configuration \
+if [[ "$PIPELINE_DURABLE_SCOPE" == "true" ]]; then
+    python3 "$ROOT/scripts/persist-account-scope.py" \
+        --stack-name "$MAIN_STACK" --function-name "$INGESTER_FN" \
+        --region "$PIPELINE_REGION" \
+        --environment-file "$PIPELINE_TMP/environment.json" \
+        --expected-revision "$PIPELINE_REVISION" \
+        --expected-role-arn "$INGESTER_ROLE_ARN"
+else
+    if ! aws lambda update-function-configuration \
         --function-name "$INGESTER_FN" \
         --environment "file://$PIPELINE_TMP/environment.json" \
         --revision-id "$PIPELINE_REVISION" \
         --region "$PIPELINE_REGION" \
-        --query 'Environment.Variables.MONITORED_ACCOUNTS_MODE' --output text >/dev/null
-aws lambda wait function-updated --function-name "$INGESTER_FN" --region "$PIPELINE_REGION"
-echo "    ingester reconfigured."
+        --query 'Environment.Variables.MONITORED_ACCOUNTS_MODE' --output text \
+        >/dev/null 2>"$PIPELINE_TMP/update-error.txt"; then
+        echo "ERROR: ingester configuration update failed (possibly revision changed); inspect Lambda configuration before retrying." >&2
+        exit 1
+    fi
+    if ! aws lambda wait function-updated --function-name "$INGESTER_FN" \
+        --region "$PIPELINE_REGION" 2>"$PIPELINE_TMP/update-error.txt"; then
+        echo "ERROR: ingester configuration did not finish updating; inspect Lambda configuration before retrying." >&2
+        exit 1
+    fi
+    echo "    ingester reconfigured (legacy template; scope is not durable)."
+fi
 
 # ---------------------------------------------------------------------------
 # 4/4: Trigger one ingest run + report results
@@ -414,7 +495,7 @@ if [[ $RC -ne 0 ]]; then
 fi
 
 if ! python3 - "$PIPELINE_TMP/invoke.json" "$INGEST_OUT" \
-    "$PIPELINE_TMP/ingest-status.txt" <<'PY'
+    "$PIPELINE_TMP/ingest-status.txt" "$INGEST_MODE" <<'PY'
 import json
 import sys
 
@@ -426,7 +507,13 @@ try:
     print(json.dumps(result, indent=2))
     if invocation.get("StatusCode") != 200 or invocation.get("FunctionError"):
         raise ValueError("Lambda invocation returned a function error")
-    runs = result.get("runs", [])
+    runs = result.get("runs")
+    if not isinstance(runs, list):
+        raise ValueError("ingestion did not return a module run list")
+    empty_ou_scope = (
+        not runs and sys.argv[4] == "discover-ou"
+        and result.get("skipped_reason") == "empty_ou_scope"
+    )
     # Plain rc=2 is an error (including argparse failures and empty account
     # discovery). A resumable budget stop must carry the runner's explicit mark.
     incomplete = [
@@ -435,16 +522,18 @@ try:
     ]
     expected_status = "incomplete" if incomplete else "ok"
     if (result.get("status") != expected_status or result.get("failed_count") != 0
-            or not runs
+            or (not runs and not empty_ou_scope)
             or any(run.get("rc") not in (0, None) and run not in incomplete for run in runs)):
         raise ValueError("ingestion did not complete successfully in every reported module")
-    if incomplete:
+    if empty_ou_scope:
+        print("NOTE: selected OU scope is empty; no ingestion modules ran.")
+    elif incomplete:
         print("NOTE: ingestion reached its time budget; data coverage is incomplete for: "
               + ", ".join(str(run.get("module")) for run in incomplete))
         print("      Completed log objects are recorded. Re-run the ingester or wait "
               "for the existing schedule to resume the remaining work.")
     with open(sys.argv[3], "w") as stream:
-        stream.write(expected_status + "\n")
+        stream.write(("empty_ou_scope" if empty_ou_scope else expected_status) + "\n")
 except (OSError, ValueError, TypeError, AttributeError) as error:
     raise SystemExit(f"ERROR: {error}")
 PY
@@ -459,10 +548,12 @@ echo "==========================================================================
 IFS= read -r INGEST_STATUS < "$PIPELINE_TMP/ingest-status.txt"
 if [[ "$INGEST_STATUS" == "incomplete" ]]; then
     echo "⏳ PIPELINE CONFIGURED — ingestion incomplete; remaining log objects can resume"
+elif [[ "$INGEST_STATUS" == "empty_ou_scope" ]]; then
+    echo "✅ PIPELINE CONFIGURED — OU scope is empty; ingestion skipped"
 else
     echo "✅ PIPELINE CONFIGURED — ingestion modules completed successfully"
 fi
-echo "   Mode:     $INGEST_MODE"
+echo "   Mode:     $INGEST_MODE${INGEST_IDS:+ ($INGEST_IDS)}"
 echo "   Run took: $DURATION"
 echo "   Schedule: Uses the existing EventBridge ingestion schedule."
 echo "   Verify:   Check the expected accounts and Regions in Settings and the logs."

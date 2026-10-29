@@ -18,6 +18,30 @@ Parameters:
   StackNamePrefix:
     Type: String
     Description: Logical prefix used in resource names + the CW metric name.
+  EdgeRoleArn:
+    Type: String
+    Default: ''
+    # The effective ARN is also the version description (Lambda's 256-char limit).
+    MaxLength: 256
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$'
+    Description: |
+      Optional existing execution role for the Lambda@Edge function. It must
+      trust both lambda.amazonaws.com and edgelambda.amazonaws.com and carry
+      AWSLambdaBasicExecutionRole or equivalent. Empty creates the role.
+      Maximum 256 characters, including any IAM role path.
+
+  CreateWebAcl:
+    Type: String
+    Default: 'true'
+    AllowedValues: [ 'true', 'false' ]
+    Description: |
+      Create the CLOUDFRONT-scoped WAFv2 web ACL. Set to false when the
+      organization manages WAF centrally (pass the existing web ACL ARN to the
+      main stack) or when CloudFront should run without a web ACL.
+
+Conditions:
+  CreateEdgeRole: !Equals [ !Ref EdgeRoleArn, '' ]
+  CreateWebAcl:   !Equals [ !Ref CreateWebAcl, 'true' ]
 
 Resources:
   # ===========================================================================
@@ -35,6 +59,12 @@ Resources:
   # ===========================================================================
   EdgeShaRole:
     Type: AWS::IAM::Role
+    Condition: CreateEdgeRole
+    # A published version keeps its original execution role. CloudFront still
+    # uses that version until the main stack changes its association and the
+    # replicas retire, so removing this role from the stack must not delete it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -50,9 +80,16 @@ Resources:
 
   EdgeShaFunction:
     Type: AWS::Lambda::Function
+    # Retaining a Version alone does not protect it from DeleteFunction, which
+    # deletes every version. Keep the function too, including on stack deletion.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
+      # Changes $LATEST on the first upgrade from the original template even
+      # when the role is unchanged. PublishVersion refuses an unchanged snapshot.
+      Description: SHA-256 signer with role-bound version publishing.
       Runtime: nodejs20.x
-      Role: !GetAtt EdgeShaRole.Arn
+      Role: !If [ CreateEdgeRole, !GetAtt EdgeShaRole.Arn, !Ref EdgeRoleArn ]
       Handler: index.handler
       Timeout: 5
       MemorySize: 128
@@ -79,14 +116,31 @@ Resources:
 
   EdgeShaVersion:
     Type: AWS::Lambda::Version
+    # The edge stack updates before the main stack can change CloudFront's
+    # association. Deleting the previous version here would fail while attached.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       FunctionName: !Ref EdgeShaFunction
+      # Description requires replacement; use the same effective role as the
+      # function so every role change publishes a snapshot after its update.
+      Description: !If [ CreateEdgeRole, !GetAtt EdgeShaRole.Arn, !Ref EdgeRoleArn ]
+
+  # Lifecycle: before deploying over a legacy stack, prepare-edge-upgrade.py
+  # installs retention in a separate update of the deployed template, preserving
+  # its parameters, role and version. Run it before replacing a published version.
+  # Retained versions/functions/generated roles leave CloudFormation ownership;
+  # delete them manually only after removing ALL CloudFront associations and
+  # waiting for replicas to retire. Supplied roles must likewise remain usable
+  # until their old versions retire. Returning to an empty EdgeRoleArn creates a
+  # new generated role; it does not adopt a previously retained role.
 
   # ===========================================================================
   # WAF — CloudFront-scoped, AWS managed common rule set.
   # ===========================================================================
   WebAcl:
     Type: AWS::WAFv2::WebACL
+    Condition: CreateWebAcl
     Properties:
       Name: !Sub '${StackNamePrefix}-waf'
       Scope: CLOUDFRONT
@@ -123,8 +177,8 @@ Resources:
 
 Outputs:
   WebAclArn:
-    Description: ARN of the CLOUDFRONT-scoped Web ACL.
-    Value: !GetAtt WebAcl.Arn
+    Description: ARN of the CLOUDFRONT-scoped Web ACL, or empty when CreateWebAcl is false.
+    Value: !If [ CreateWebAcl, !GetAtt WebAcl.Arn, '' ]
   EdgeShaVersionArn:
     Description: Versioned ARN of the Lambda@Edge SHA-256 signer.
     Value: !Ref EdgeShaVersion

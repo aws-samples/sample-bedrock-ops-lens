@@ -22,18 +22,23 @@ deploy_region: us-east-1                                  # [DEPLOY_REGION]
 
 # -----------------------------------------------------------------------------
 # Monitored accounts — which AWS accounts the ingester pulls Bedrock data
-# from. The default is `discover-org`, which:
-#   - enumerates every ACTIVE account in your AWS Organization (no list to
-#     maintain — works whether you have 1 account or 1,000),
+# from. The default is `single`: only the deployment account.
 # Role deployment is separate from account discovery. Use the account owners'
 # IAM workflow or setup-pipeline.sh; changing this mode does not create roles.
 #
-# Three modes for customers who need something other than the default:
+# Other modes are opt-in:
 #
-#   discover-org   (default) Use AWS Organizations to enumerate every
+#   discover-org   Use AWS Organizations to enumerate every
 #                  ACTIVE account. Requires the central account to be the
 #                  management account or a delegated administrator for
 #                  Organizations.
+#
+#   discover-ou    Only the accounts under one or more OUs (child OUs
+#                  included), resolved on every run with
+#                  organizations:ListAccountsForParent. Set by
+#                  setup-pipeline.sh --scope ou; the OU IDs live in `ou_ids`
+#                  / MONITORED_OU_IDS. A membership lookup failure fails the
+#                  run instead of silently changing the scope.
 #
 #   explicit       A fixed list of account IDs. Useful when you only want
 #                  to monitor a subset of your org, or you don't have an
@@ -52,11 +57,14 @@ deploy_region: us-east-1                                  # [DEPLOY_REGION]
 # Lambda environment values take precedence over this file.
 # -----------------------------------------------------------------------------
 monitored_accounts:
-  mode: discover-org                                      # [MONITORED_ACCOUNTS_MODE]
+  mode: single                                            # [MONITORED_ACCOUNTS_MODE]
   # Used only when mode == "explicit":
   ids: []
     # - "111111111111"
     # - "222222222222"
+  # Used only when mode == "discover-ou":                  # [MONITORED_OU_IDS]
+  ou_ids: []
+    # - "ou-xxxx-yyyyyyyy"
 
 # -----------------------------------------------------------------------------
 # Optional: account names for accountIds, shown across the dashboard as
@@ -129,3 +137,40 @@ ops_review:
 iam:
   reader_role_name: BedrockOpsLensReader                  # [BEDROCK_OPS_LENS_ROLE_NAME]
   external_id: ""                                         # [BEDROCK_OPS_LENS_EXTERNAL_ID]
+
+# -----------------------------------------------------------------------------
+# Existing network and IAM roles (optional).
+#
+# Leave this section commented out and deploy.sh asks on the first deployment
+# whether to create the network and roles or use existing ones, then writes your
+# answers here. Uncomment and fill it in to deploy non-interactively.
+#
+# Only an existing network's VPC and subnet IDs are required. Optional blanks
+# create that resource on first deployment and preserve it on updates. Use
+# `new` explicitly to request a generated resource, or an ID/ARN to reuse one.
+# The network choice is fixed for the stack's life; role ARNs may change.
+# Set `waf: none` to create no WAF resources.
+#
+# infra/examples/existing-network.yaml shows what the network must provide and
+# infra/examples/existing-execution-roles.yaml lists the permissions each role
+# needs. Supplied resources are validated against the account before anything is
+# created. See docs/existing-resources.md.
+# -----------------------------------------------------------------------------
+# existing_resources:
+#   network:                                  # or `network: new`
+#     vpc_id: vpc-0123456789abcdef0
+#     private_subnet_ids: [subnet-0123456789abcdef0, subnet-0fedcba9876543210]
+#     lambda_security_group_id: new           # sg-… or new
+#     db_security_group_id: new               # sg-… (must admit TCP 5432 from the Lambda group) or new
+#     cache_security_group_id: new            # sg-… (must admit TCP 11211 from the Lambda group) or new
+#   roles:                                    # or `roles: new`
+#     backend: arn:aws:iam::123456789012:role/lens-backend
+#     ingester: arn:aws:iam::123456789012:role/lens-ingester
+#     schema_init: arn:aws:iam::123456789012:role/lens-schema-init
+#     prewarm: new
+#     pre_signup: new
+#     post_confirm: new
+#     edge: arn:aws:iam::123456789012:role/lens-edge   # must also trust edgelambda.amazonaws.com
+#   cloudformation_service_role_arn: none     # or an IAM role ARN trusting cloudformation.amazonaws.com
+#   waf: none                                 # new (AWS WAF web ACL in front of CloudFront), none, or an
+#                                             # existing CLOUDFRONT-scope web ACL ARN (us-east-1)

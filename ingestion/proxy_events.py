@@ -56,7 +56,9 @@ Writes:
   - dim_proxy_dimensions   distinct (dim_key, dim_value) pairs for the picker
 
 Resumability: a `(s3_key)` entry in `proxy_events_objects` records files already
-processed, so re-runs skip them.
+processed, so re-runs skip them. With --accounts, progress is recorded per
+account and object, allowing newly selected accounts to read the same files
+without adding previously collected accounts to the rollup again.
 
 Usage:
     python -m ingestion.proxy_events \\
@@ -68,6 +70,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gzip
+import hashlib
 import json
 import os
 import sys
@@ -78,6 +81,7 @@ import asyncpg
 import boto3
 
 from . import otel_normalize
+from .accounts import discover_from_list
 from botocore.config import Config
 
 DEFAULT_DB_URL = os.environ.get(
@@ -119,13 +123,31 @@ def _list_event_keys(s3, bucket: str, region: str,
     return keys
 
 
-async def _already_processed(conn: asyncpg.Connection, keys: list[str]) -> set[str]:
+def _account_marker_prefix(bucket: str, key: str) -> str:
+    """Stable object identity for account markers in the existing TEXT ledger."""
+    identity = json.dumps([bucket, key], separators=(",", ":")).encode()
+    return "account:" + hashlib.sha256(identity).hexdigest() + ":"
+
+
+async def _already_processed(
+    conn: asyncpg.Connection, keys: list[str], bucket: str | None = None,
+) -> set[str]:
     if not keys:
         return set()
-    rows = await conn.fetch(
-        "SELECT s3_key FROM proxy_events_objects WHERE s3_key = ANY($1::text[])",
-        keys,
-    )
+    if bucket is None:
+        rows = await conn.fetch(
+            "SELECT s3_key FROM proxy_events_objects WHERE s3_key = ANY($1::text[])",
+            keys,
+        )
+    else:
+        # Include legacy whole-object markers and all account markers, even in
+        # an unfiltered run following a scoped run. Hash prefixes contain no
+        # LIKE metacharacters, regardless of the customer's S3 object names.
+        rows = await conn.fetch(
+            "SELECT s3_key FROM proxy_events_objects WHERE s3_key = ANY($1::text[]) "
+            "OR s3_key LIKE ANY($2::text[])",
+            keys, [_account_marker_prefix(bucket, key) + "%" for key in keys],
+        )
     return {r["s3_key"] for r in rows}
 
 
@@ -363,7 +385,15 @@ async def main() -> int:
     ap.add_argument("--regions", default="us-east-1")
     ap.add_argument("--days", type=int, default=7)
     ap.add_argument("--db-url", default=DEFAULT_DB_URL)
+    ap.add_argument("--accounts", default=None,
+                    help="only persist these comma-separated account IDs; empty selects none")
     args = ap.parse_args()
+
+    only_accounts = (None if args.accounts is None else
+                     {a.accountId for a in discover_from_list(args.accounts)})
+    if only_accounts is not None and not only_accounts:
+        print("No monitored accounts resolved — skipping proxy reads and writes.")
+        return 0
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=args.days)
@@ -397,13 +427,21 @@ async def main() -> int:
         for region in regions:
             s3 = _s3_client(region)
             keys = _list_event_keys(s3, args.bucket, region, start, end)
-            already = await _already_processed(conn, keys)
-            pending = [k for k in keys if k not in already]
+            already = await _already_processed(conn, keys, args.bucket)
+            pending = [
+                k for k in keys if k not in already
+                and (only_accounts is None or any(
+                    _account_marker_prefix(args.bucket, k) + a not in already
+                    for a in only_accounts
+                ))
+            ]
             print(f"  [{region}] {len(keys)} proxy-event objects "
-                  f"({len(already)} already processed, {len(pending)} new)")
+                  f"({len(keys) - len(pending)} already processed, {len(pending)} new)")
 
             for key in pending:
                 obj_rows = 0
+                account_rows: dict[str, int] = defaultdict(int)
+                marker_prefix = _account_marker_prefix(args.bucket, key)
                 for e in _read_event_lines(s3, args.bucket, key):
                     parsed = _parse_event(e)
                     if not parsed:
@@ -412,7 +450,15 @@ async def main() -> int:
                      in_tok, out_tok, cache_read, cache_write, status, throttled,
                      latency_ms, ttft_ms, retry_attempts, cost_usd_est,
                      request_id) = parsed
+                    # Central objects may mix accounts. Filter before dedup,
+                    # raw inserts, rollups, and progress counts. Missing account
+                    # IDs cannot be attributed to an OU and are excluded.
+                    if only_accounts is not None and account not in only_accounts:
+                        continue
+                    if marker_prefix + account in already:
+                        continue
                     obj_rows += 1
+                    account_rows[account] += 1
 
                     # Deduplicate WITHIN this run first. Proxy callbacks and
                     # S3 event delivery are at-least-once, so the same request
@@ -443,7 +489,14 @@ async def main() -> int:
                     # are still ingested; they dedupe on re-read.
                     bad_objects.append((key, _OBJ_ERRORS[key]))
                 else:
-                    new_keys.append((key, obj_rows))
+                    if only_accounts is None:
+                        new_keys.append((key, obj_rows))
+                    else:
+                        new_keys.extend(
+                            (marker_prefix + account, account_rows[account])
+                            for account in sorted(only_accounts)
+                            if marker_prefix + account not in already
+                        )
                 total_events += obj_rows
 
         # --- write raw per-request rows (idempotent on request_id, ts) ------
@@ -594,8 +647,9 @@ async def main() -> int:
 
         # --- retention: trim raw events beyond the window ------------------
         await conn.execute(
-            "DELETE FROM f_request_events WHERE event_date < current_date - $1::int",
-            RAW_RETENTION_DAYS,
+            "DELETE FROM f_request_events WHERE event_date < current_date - $1::int "
+            "AND ($2::text[] IS NULL OR accountId = ANY($2::text[]))",
+            RAW_RETENTION_DAYS, sorted(only_accounts) if only_accounts is not None else None,
         )
 
         # --- refresh dim_proxy_dimensions dropdown source -------------------
@@ -606,11 +660,12 @@ async def main() -> int:
                    array_agg(DISTINCT endpoint)
             FROM f_proxy_dim_hourly
             WHERE event_date >= current_date - INTERVAL '30 days'
+              AND ($1::text[] IS NULL OR accountId = ANY($1::text[]))
               -- '__all__' is the whole-population accounting row, not an
               -- attribute a user can filter by (audit T09).
               AND dim_key <> '__all__'
             GROUP BY dim_key, dim_value
-        """)
+        """, sorted(only_accounts) if only_accounts is not None else None)
 
         await conn.execute(
             """

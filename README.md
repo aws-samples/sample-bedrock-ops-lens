@@ -54,14 +54,14 @@ Tier A has [limits on history, attribution, and analysis](mcp/README.md#tier-a-c
 Tier B supplies the stored data needed for those views.
 
 The full deployment uses Lambda, Aurora Serverless v2, ElastiCache, CloudFront,
-S3, Cognito, WAF, and EventBridge, with SNS for optional notifications.
+S3, Cognito, and EventBridge, with optional WAF and SNS notifications.
 
 ![Bedrock Ops Lens architecture](images/architecture.png)
 
 ## Quick start
 
-For the full dashboard, prepare AWS CLI v2 credentials, Python with `boto3`,
-Node.js/npm, and a running Docker engine with Buildx. See the
+For the full dashboard, prepare AWS CLI v2 credentials, Python 3.12 with `boto3`
+and `PyYAML`, Node.js/npm, and a running Docker engine with Buildx. See the
 [deployment prerequisites](docs/deployment.md#prerequisites) for details.
 
 ```bash
@@ -73,7 +73,34 @@ cp config.example.yaml config.yaml
 Edit `config.yaml` for your deployment Region and
 [monitored Regions](docs/deployment.md#choose-monitored-regions). One central
 deployment collects CloudWatch metrics and quotas from each configured account
-and Region. The following first deployment starts in **single-account mode without AWS
+and Region.
+
+### Choose your deployment
+
+**Use new resources, existing resources, or a mixture—all with `./deploy.sh`.**
+Configure these choices in the `existing_resources:` section of `config.yaml`;
+[the existing-resources guide](docs/existing-resources.md) has examples and
+the required network rules and role permissions.
+
+| Resource | Default for a new deployment | To use existing resources or opt out |
+|---|---|---|
+| VPC and subnets | Create a VPC, private subnets, and NAT gateway | Supply a VPC and at least two private subnets in different Availability Zones; Lens creates no VPC, NAT gateway, subnets, or routes |
+| Security groups | Create dedicated Lens groups | Supply each group independently; Lens leaves its rules unchanged |
+| Lambda execution roles | Create the required roles | Supply any or all execution-role ARNs; Lens creates only the roles not supplied |
+| CloudFormation service role | Use your deployment credentials | Supply a service-role ARN |
+| AWS WAF | Create a web ACL | Set `existing_resources.waf: none`, or supply an existing CloudFront-scope web ACL ARN |
+
+If the section is absent, the first interactive run asks for these choices and
+saves them. A non-interactive first deployment without that section uses the
+defaults above. On updates, omitted choices preserve the stack's existing settings.
+
+Lens still creates its application services, including Aurora and ElastiCache.
+Both deployment choices support the [account-scope options](#multi-account-data-pipeline)
+below, including OU-based reader rollout.
+
+### Deploy
+
+The following first deployment starts in **single-account mode without AWS
 Organizations discovery**. Replace the email domain with your own:
 
 ```bash
@@ -153,6 +180,7 @@ The commands in these guides are run from the repository root unless stated othe
 | Task | Guide |
 |---|---|
 | <a id="verify"></a><a id="tear-down"></a>Deploy, sign in, verify, or remove the stack | [Deployment](docs/deployment.md) |
+| Use an existing VPC, security groups, or IAM roles; configure optional WAF | [Existing resources](docs/existing-resources.md) |
 | <a id="wiring-up-the-mcp"></a>Connect an IDE using AWS credentials or Cognito | [MCP installation and authentication](mcp/README.md) |
 | Choose accounts, understand account names, or plan fleet size | [Account scope](docs/account-scope.md) |
 | <a id="daily-refresh"></a><a id="notifications-and-findings"></a>Refresh data and configure alerts | [Operations](docs/operations.md) |

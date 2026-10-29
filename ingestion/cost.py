@@ -82,10 +82,14 @@ def _ce_client(session: boto3.Session | None = None):
     )
 
 
-def _list_bedrock_services(ce, start: date, end: date) -> list[str]:
+def _list_bedrock_services(
+    ce, start: date, end: date, only_accounts: list[str] | None = None,
+) -> list[str]:
     """Discover the full set of Bedrock-related service names that show up
     in CE for the given window. Returns the SERVICE dimension values to
     pass into the subsequent GetCostAndUsage call."""
+    if only_accounts is not None and not only_accounts:
+        return []
     out: set[str] = set()
     next_token = None
     while True:
@@ -95,6 +99,11 @@ def _list_bedrock_services(ce, start: date, end: date) -> list[str]:
             Context="COST_AND_USAGE",
             MaxResults=1000,
         )
+        if only_accounts is not None:
+            kwargs["Filter"] = {"Dimensions": {
+                "Key": "LINKED_ACCOUNT", "Values": only_accounts,
+                "MatchOptions": ["EQUALS"],
+            }}
         if next_token:
             kwargs["NextPageToken"] = next_token
         resp = ce.get_dimension_values(**kwargs)
@@ -119,7 +128,7 @@ def _fetch_cost(
 ) -> list[dict]:
     """Issue GetCostAndUsage calls grouping by LINKED_ACCOUNT + SERVICE.
     Returns a flat list of {date, accountId, service, total_cost, currency}."""
-    if not service_filter:
+    if not service_filter or (only_accounts is not None and not only_accounts):
         return []
 
     flt = {
@@ -198,7 +207,7 @@ def _fetch_cost_by_usage_type(
     BrowserTool vs Evaluations...). The usage type IS the billed line item
     — no estimation, straight from Cost Explorer.
     """
-    if not service_filter:
+    if not service_filter or (only_accounts is not None and not only_accounts):
         return []
     flt = {"Dimensions": {"Key": "SERVICE", "Values": service_filter,
                           "MatchOptions": ["EQUALS"]}}
@@ -279,35 +288,43 @@ async def main() -> int:
     print(f"Cost Explorer: window {start} to {end} (inclusive), "
           f"CE region={CE_API_REGION}")
 
+    # Resolve scope before any CE or database access. None means unfiltered;
+    # an explicitly empty list must never mean the whole billing family.
+    only_accounts: list[str] | None = None
+    if args.accounts is not None:
+        only_accounts = [a.strip() for a in args.accounts.split(",")
+                         if a.strip().isdigit() and len(a.strip()) == 12]
+    else:
+        # Use config to scope. mode=discover-org → no filter (CE will return
+        # every linked account in this billing family). mode=discover-ou →
+        # the OU members resolved right now. mode=explicit → the configured
+        # list. mode=single → just the running account.
+        cfg = load_config()
+        if cfg.monitored_accounts.mode == "discover-ou":
+            from .accounts import discover_from_ous   # strict: raises on failure
+            only_accounts = [a.accountId for a in discover_from_ous(cfg.monitored_accounts.ou_ids)]
+        elif cfg.monitored_accounts.mode == "explicit":
+            only_accounts = list(cfg.monitored_accounts.ids)
+        elif cfg.monitored_accounts.mode == "single":
+            only_accounts = [session_cache().self_account]
+        elif cfg.monitored_accounts.mode != "discover-org":
+            raise ValueError(f"Unknown monitored accounts mode: {cfg.monitored_accounts.mode}")
+        # discover-org → leave unfiltered, CE returns the whole org
+
+    if only_accounts is not None and not only_accounts:
+        print("No monitored accounts resolved — skipping cost reads and writes.")
+        return 0
+
     # 1) Service discovery — figure out which Bedrock services to filter on.
     ce = _ce_client()
     print("[1/3] discovering Bedrock service names in CE...")
-    services = _list_bedrock_services(ce, start, end_excl)
+    services = _list_bedrock_services(ce, start, end_excl, only_accounts)
     print(f"      found {len(services)} services:")
     for s in services:
         print(f"        - {s}")
     if not services:
         print("      (no Bedrock spend in this window — nothing to do)")
         return 0
-
-    # 2) Decide which accounts to scope to.
-    only_accounts: list[str] | None = None
-    if args.accounts:
-        only_accounts = [a.strip() for a in args.accounts.split(",")
-                         if a.strip().isdigit() and len(a.strip()) == 12]
-    else:
-        # Use config to scope. mode=discover-org → no filter (CE will return
-        # every linked account in this billing family). mode=explicit → use
-        # the configured list. mode=single → just the running account.
-        try:
-            cfg = load_config()
-            if cfg.monitored_accounts.mode == "explicit" and cfg.monitored_accounts.ids:
-                only_accounts = list(cfg.monitored_accounts.ids)
-            elif cfg.monitored_accounts.mode == "single":
-                only_accounts = [session_cache().self_account]
-            # discover-org → leave unfiltered, CE returns the whole org
-        except Exception:
-            pass
 
     # 3) Fetch + upsert.
     print("[2/3] fetching daily cost data...")

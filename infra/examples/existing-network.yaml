@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Ops Lens — EXAMPLE network that satisfies the existing-network
+  deployment path. Use it to test that path, or as a specification of what a
+  pre-existing VPC must provide: two private subnets in distinct Availability
+  Zones with outbound reachability to AWS APIs (here a NAT gateway), an S3
+  gateway endpoint on their route table, and three security groups where the
+  database and cache groups admit the Lambda group on 5432 and 11211.
+  Lens never modifies resources from this template; it only uses their IDs.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.60.0.0/16
+    AllowedPattern: '^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'
+    Description: IPv4 CIDR for the VPC. Split into four /22 blocks below.
+  NamePrefix:
+    Type: String
+    Default: lens-customer-network
+    Description: Name tag prefix for the created resources.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-vpc' } ]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-igw' } ]
+  AttachIgw:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [ 0, !Cidr [ !Ref VpcCidr, 4, 10 ] ]
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-private-1' } ]
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [ 1, !Cidr [ !Ref VpcCidr, 4, 10 ] ]
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-private-2' } ]
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [ 2, !Cidr [ !Ref VpcCidr, 4, 10 ] ]
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-public-1' } ]
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [ 3, !Cidr [ !Ref VpcCidr, 4, 10 ] ]
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-public-2' } ]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-public' } ]
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIgw
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachIgw
+    Properties: { Domain: vpc }
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-nat' } ]
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-private' } ]
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable }
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable }
+
+  # Keeps the schema-init CloudFormation callback (a presigned S3 URL) and the
+  # invocation-log reads on the AWS network, independent of the NAT gateway.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [ !Ref PrivateRouteTable ]
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bedrock Ops Lens Lambdas (backend, ingester, schema-init, pre-warm)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Outbound to AWS APIs, VPC endpoints, Bedrock
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-lambda' } ]
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bedrock Ops Lens Aurora PostgreSQL
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: PostgreSQL from the Lens Lambdas
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VpcCidr
+          Description: PostgreSQL within the VPC only
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-db' } ]
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Bedrock Ops Lens ElastiCache Memcached
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 11211
+          ToPort: 11211
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Memcached from the Lens Lambdas
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Default egress (no outbound traffic expected)
+      Tags: [ { Key: Name, Value: !Sub '${NamePrefix}-cache' } ]
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  VpcCidr:
+    Value: !Ref VpcCidr
+  PrivateSubnetIds:
+    Description: Comma-separated, for existing_resources.network.private_subnet_ids
+    Value: !Join [ ',', [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+  DbSecurityGroupId:
+    Value: !Ref DbSecurityGroup
+  CacheSecurityGroupId:
+    Value: !Ref CacheSecurityGroup

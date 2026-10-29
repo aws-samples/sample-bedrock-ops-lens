@@ -10,9 +10,10 @@ Run commands from the repository root unless a step says otherwise.
 
 - AWS CLI v2 with credentials for the account that will host Lens. The operator
   needs deployment permissions for the resources in the CloudFormation templates,
-  including IAM; the scripts do not grant permissions to their caller.
+  including `iam:PassRole` (and role creation when Lens creates roles); the
+  scripts do not grant permissions to their caller.
 - A running Docker engine with Buildx, Node.js/npm for the frontend build, and
-  Python 3.12 with `boto3` for the deployment and account-setup tooling.
+  Python 3.12 with `boto3` and `PyYAML` for the deployment and account-setup tooling.
 - A local checkout and `config.yaml` copied from `config.example.yaml`.
 - An allowed email domain for users of the dashboard.
 
@@ -33,17 +34,25 @@ other settings. `DEPLOY_REGION` overrides `deploy_region`; otherwise deployment
 falls back to `us-east-1`. The script deliberately ignores a leftover
 `AWS_REGION` or `AWS_DEFAULT_REGION` when choosing the deployment Region.
 
-The quick start explicitly sets `ENABLE_ORGANIZATIONS_DISCOVERY=false`, starting
-in single-account mode. Without that override, a new central stack defaults to
-Organizations discovery. Lambda environment settings take precedence over
-`config.yaml` for account selection. Follow the [account-scope guide](account-scope.md)
+The quick start explicitly sets `ENABLE_ORGANIZATIONS_DISCOVERY=false`, omitting
+Organizations permissions. The example configuration starts in single-account
+mode whether those permissions are enabled or disabled. Enabling the permissions
+does not select organization-wide collection. Follow the [account-scope guide](account-scope.md)
 to configure an explicit list or an Organizations rollout after deployment.
 
-The script builds the frontend and Lambda image, provisions the VPC, Aurora,
-ElastiCache, Cognito, CloudFront, WAF, ingestion schedule, and other resources,
-initializes the schema, and runs an initial ingest. Allow time for image builds
-and AWS resource creation; use the reported CloudFormation status to judge
-completion. It prints the dashboard URL and sign-in commands when it finishes.
+Configure existing networking, individual execution roles, and optional WAF in
+`config.yaml` under `existing_resources:`. If that section is absent, the first
+interactive deployment asks for your choices; a new non-interactive deployment
+uses the defaults, creating the network, roles, and WAF. See
+[existing resources](existing-resources.md) for examples and prerequisites.
+
+The script builds the frontend and Lambda image, uses your selected network and
+roles or creates them, and provisions Aurora, ElastiCache, Cognito, CloudFront,
+the ingestion schedule, and other application resources. WAF follows your
+selected setting. It initializes the schema and runs an initial ingest. Allow
+time for image builds and AWS resource creation; use the reported CloudFormation
+status to judge completion. It prints the dashboard URL and sign-in commands
+when it finishes.
 
 ### Deployment settings
 
@@ -57,11 +66,13 @@ completion. It prints the dashboard URL and sign-in commands when it finishes.
 | `BEDROCK_OPS_LENS_ROLE_NAME` | Set the central `ReaderRoleName`; target roles must match |
 | `SKIP_INITIAL_INGEST=1` | Defer the initial ingest while preparing target roles or data sources |
 | `STACK_NAME_SUFFIX` | Select the central stack suffix instead of `.deploy-stack-name` |
+| `EXISTING_RESOURCES=new` | Skip the first-run network/roles question and create everything |
 
 `ENABLE_ORGANIZATIONS_DISCOVERY` and `ReaderRoleName` are preserved on redeploy
-when their environment overrides are omitted. Central redeployment can reset
-Lambda's explicit account list, so rerun the appropriate account-setup command
-afterward. For custom roles, follow the
+when their environment overrides are omitted. Account/OU scope and the reader
+external ID are preserved from the running ingester and persisted as stack
+parameters. New deployments use `monitored_accounts` from `config.yaml`;
+the example starts in single-account mode. For custom roles, follow the
 [reader-name instructions](multi-account-setup.md#custom-reader-role-name).
 
 ### Choose monitored Regions
@@ -88,8 +99,8 @@ Regions. `us-major` selects the three Regions above. See
 Collection still requires access to each selected account and Region.
 
 `config.yaml` is copied into the Lambda image during deployment. After changing
-it, rerun `deploy.sh` to rebuild and deploy the image, then restore your account
-scope as described above. Lambda environment overrides
+it, rerun `deploy.sh` to rebuild and deploy the image; the existing account
+scope is preserved. Lambda environment overrides
 `MONITORED_REGIONS_PRESET` and `MONITORED_REGIONS_LIST`, if set, take precedence
 over the file.
 

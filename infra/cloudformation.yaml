@@ -116,6 +116,31 @@ Parameters:
       Reader role name used in every target account. Configures both the
       ingester's sts:AssumeRole permission and its runtime role-name setting.
       Must match RoleName in the target reader template.
+  MonitoredAccountsMode:
+    Type: String
+    Default: single
+    AllowedValues: [single, explicit, discover-org, discover-ou]
+    Description: Account scope. Permission to discover Organizations does not select the whole organization.
+  MonitoredAccountIds:
+    Type: String
+    Default: ''
+    Description: Comma-separated accounts when MonitoredAccountsMode is explicit.
+  MonitoredOuIds:
+    Type: String
+    Default: ''
+    Description: Comma-separated OU or root IDs when MonitoredAccountsMode is discover-ou.
+  ReaderExternalId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Optional external ID required by the monitored accounts' reader roles.
+  StableResourceNames:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Set on first deployment when pre-created roles need predictable secret
+      and queue names. Keep unchanged on updates, including role replacements.
   EdgeShaVersionArn:
     Type: String
     Description: |
@@ -124,20 +149,144 @@ Parameters:
       viewer-request handler on the /api/* behaviour.
   WebAclArn:
     Type: String
+    Default: ''
     Description: |
       ARN of the CLOUDFRONT-scoped WAFv2 WebACL, output by the
-      edge-bootstrap stack (us-east-1). CloudFront uses this to gate
-      requests with the AWS Managed Common Rule Set.
+      edge-bootstrap stack (us-east-1) or supplied by the operator. CloudFront
+      uses this to gate requests with the AWS Managed Common Rule Set. Empty
+      deploys the distribution without a web ACL (existing_resources.waf: none).
+
+  # ---------------------------------------------------------------------------
+  # Existing resources. Every parameter below is optional. Empty means Lens
+  # creates that resource exactly as before; a value means Lens uses the
+  # supplied resource and never modifies it. deploy.sh fills these from the
+  # `existing_resources:` block in config.yaml (or its first-run prompts) only
+  # after scripts/validate-existing-resources.py has checked them against the
+  # account. Choices are independent: an existing VPC with Lens-created roles,
+  # existing roles in a Lens-created VPC, or any mixture all work.
+  # ---------------------------------------------------------------------------
+  ExistingVpcId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^vpc-[0-9a-f]{8,17}$'
+    Description: |
+      Existing VPC to deploy into. When set, no VPC, subnets, internet gateway,
+      NAT gateway, route tables, or VPC endpoints are created, and
+      ExistingPrivateSubnetIds is required. Empty creates the Lens network.
+  ExistingVpcCidr:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$'
+    Description: |
+      IPv4 CIDR of ExistingVpcId. deploy.sh fills this in from the VPC; it
+      scopes the egress rule of a Lens-created database security group.
+  ExistingPrivateSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: |
+      Two or more private subnet IDs inside ExistingVpcId, in distinct
+      Availability Zones. Lambda, Aurora, and ElastiCache are placed here.
+      They need a route to Amazon S3 (the schema-init callback) and to the AWS
+      APIs Lens calls; see docs/existing-resources.md.
+  ExistingLambdaSecurityGroupId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^sg-[0-9a-f]{8,17}$'
+    Description: Existing security group for the Lambdas. Empty creates one.
+  ExistingDbSecurityGroupId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^sg-[0-9a-f]{8,17}$'
+    Description: |
+      Existing security group for Aurora. Its rules are not modified, so it
+      must already allow TCP 5432 from the Lambda security group. Empty
+      creates one with that rule.
+  ExistingCacheSecurityGroupId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^sg-[0-9a-f]{8,17}$'
+    Description: |
+      Existing security group for ElastiCache. Its rules are not modified, so
+      it must already allow TCP 11211 from the Lambda security group. Empty
+      creates one with that rule.
+  BackendRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$'
+    Description: Existing execution role for the backend Lambda. Empty creates one.
+  IngesterRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$'
+    Description: |
+      Existing execution role for the ingester Lambda. This is the principal
+      that target reader roles must trust. Empty creates one.
+  SchemaInitRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$'
+    Description: Existing execution role for the schema-init Lambda. Empty creates one.
+  PrewarmRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$'
+    Description: Existing execution role for the pre-warm Lambda. Empty creates one.
+  PreSignUpRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$'
+    Description: Existing execution role for the Cognito pre-sign-up trigger. Empty creates one.
+  PostConfirmRoleArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:[a-z0-9-]+:iam::[0-9]{12}:role/.+$'
+    Description: Existing execution role for the Cognito post-confirmation trigger. Empty creates one.
 
 # =============================================================================
 # Conditions
 # =============================================================================
 Conditions:
+  # Existing-resource switches. "Create*" is the historical behaviour.
+  UseExistingNetwork:  !Not [ !Equals [ !Ref ExistingVpcId, '' ] ]
+  CreateNetwork:       !Equals [ !Ref ExistingVpcId, '' ]
+  UseExistingLambdaSg: !Not [ !Equals [ !Ref ExistingLambdaSecurityGroupId, '' ] ]
+  CreateLambdaSg:      !Equals [ !Ref ExistingLambdaSecurityGroupId, '' ]
+  UseExistingDbSg:     !Not [ !Equals [ !Ref ExistingDbSecurityGroupId, '' ] ]
+  CreateDbSg:          !Equals [ !Ref ExistingDbSecurityGroupId, '' ]
+  UseExistingCacheSg:  !Not [ !Equals [ !Ref ExistingCacheSecurityGroupId, '' ] ]
+  CreateCacheSg:       !Equals [ !Ref ExistingCacheSecurityGroupId, '' ]
+  CreateBackendRole:     !Equals [ !Ref BackendRoleArn, '' ]
+  CreateIngesterRole:    !Equals [ !Ref IngesterRoleArn, '' ]
+  CreateSchemaInitRole:  !Equals [ !Ref SchemaInitRoleArn, '' ]
+  CreatePrewarmRole:     !Equals [ !Ref PrewarmRoleArn, '' ]
+  CreatePreSignUpRole:   !Equals [ !Ref PreSignUpRoleArn, '' ]
+  CreatePostConfirmRole: !Equals [ !Ref PostConfirmRoleArn, '' ]
+  UseStableResourceNames: !Equals [ !Ref StableResourceNames, 'true' ]
   OrganizationsDiscoveryEnabled: !Equals [ !Ref EnableOrganizationsDiscovery, 'true' ]
   AdminOnlySignUp:    !Equals [ !Ref CognitoSelfSignUp, 'disabled' ]
   HasBedrockLogsBkt:  !Not [ !Equals [ !Ref BedrockLogsBucket, '' ] ]
   HasProxyEventsBkt:  !Not [ !Equals [ !Ref ProxyEventsBucket, '' ] ]
   HasCognitoDomain:   !Not [ !Equals [ !Ref CognitoDomainPrefix, '' ] ]
+  HasWebAcl:          !Not [ !Equals [ !Ref WebAclArn, '' ] ]
+
+Rules:
+  OrganizationScopeNeedsPermission:
+    RuleCondition: !Or
+      - !Equals [!Ref MonitoredAccountsMode, discover-org]
+      - !Equals [!Ref MonitoredAccountsMode, discover-ou]
+    Assertions:
+      - Assert: !Equals [!Ref EnableOrganizationsDiscovery, 'true']
+        AssertDescription: Enable Organizations discovery before choosing an organization or OU scope.
+  OuScopeNeedsIds:
+    RuleCondition: !Equals [!Ref MonitoredAccountsMode, discover-ou]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref MonitoredOuIds, '']]
+        AssertDescription: Supply MonitoredOuIds for OU discovery.
+  ExplicitScopeNeedsIds:
+    RuleCondition: !Equals [!Ref MonitoredAccountsMode, explicit]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref MonitoredAccountIds, '']]
+        AssertDescription: Supply MonitoredAccountIds for explicit scope.
 
 # =============================================================================
 # Resources
@@ -149,9 +298,14 @@ Resources:
   # Lambda + Aurora + Memcached all live in the private subnets. NAT is
   # the only public-IP-attached thing, used for Lambda outbound calls
   # (Cognito IDP, ECR, etc.) since VPC-attached Lambdas need a route out.
+  #
+  # Every resource in this section carries Condition: CreateNetwork. When
+  # ExistingVpcId is set none of it is created and the subnet/SG references
+  # below resolve to the supplied IDs instead (see the !If expressions).
   # ===========================================================================
   Vpc:
     Type: AWS::EC2::VPC
+    Condition: CreateNetwork
     Properties:
       CidrBlock: 10.50.0.0/16
       EnableDnsHostnames: true
@@ -160,8 +314,10 @@ Resources:
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Condition: CreateNetwork
   AttachIgw:
     Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateNetwork
     Properties:
       VpcId: !Ref Vpc
       InternetGatewayId: !Ref InternetGateway
@@ -171,24 +327,28 @@ Resources:
   # regardless of value, so the safest fix is to rely on the secure default.
   PublicSubnet1:
     Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.50.0.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
   PublicSubnet2:
     Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.50.1.0/24
       AvailabilityZone: !Select [1, !GetAZs '']
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.50.16.0/22
       AvailabilityZone: !Select [0, !GetAZs '']
   PrivateSubnet2:
     Type: AWS::EC2::Subnet
+    Condition: CreateNetwork
     Properties:
       VpcId: !Ref Vpc
       CidrBlock: 10.50.20.0/22
@@ -196,9 +356,11 @@ Resources:
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
     Properties: { VpcId: !Ref Vpc }
   DefaultPublicRoute:
     Type: AWS::EC2::Route
+    Condition: CreateNetwork
     DependsOn: AttachIgw
     Properties:
       RouteTableId: !Ref PublicRouteTable
@@ -206,35 +368,43 @@ Resources:
       GatewayId: !Ref InternetGateway
   PublicSubnet1Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
     Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
   PublicSubnet2Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
     Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
 
   NatEip:
     Type: AWS::EC2::EIP
+    Condition: CreateNetwork
     DependsOn: AttachIgw
     Properties: { Domain: vpc }
   NatGateway:
     Type: AWS::EC2::NatGateway
+    Condition: CreateNetwork
     Properties:
       AllocationId: !GetAtt NatEip.AllocationId
       SubnetId: !Ref PublicSubnet1
 
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
+    Condition: CreateNetwork
     Properties: { VpcId: !Ref Vpc }
   DefaultPrivateRoute:
     Type: AWS::EC2::Route
+    Condition: CreateNetwork
     Properties:
       RouteTableId: !Ref PrivateRouteTable
       DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NatGateway
   PrivateSubnet1Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
     Properties: { SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable }
   PrivateSubnet2Assoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateNetwork
     Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable }
 
   # S3 Gateway VPC Endpoint — gives private-subnet Lambdas a route to Amazon S3
@@ -250,6 +420,7 @@ Resources:
   # also doesn't add to the slow ENI cleanup on delete.
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
+    Condition: CreateNetwork
     Properties:
       VpcId: !Ref Vpc
       ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
@@ -265,18 +436,20 @@ Resources:
   # but inheriting the default keeps the policy uniform.
   LambdaSg:
     Type: AWS::EC2::SecurityGroup
+    Condition: CreateLambdaSg
     Properties:
       GroupDescription: Backend / Ingester / Pre-warm Lambdas
-      VpcId: !Ref Vpc
+      VpcId: !If [ UseExistingNetwork, !Ref ExistingVpcId, !Ref Vpc ]
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: 0.0.0.0/0
           Description: Allow all outbound (AWS APIs, VPC endpoints, Bedrock)
   DbSg:
     Type: AWS::EC2::SecurityGroup
+    Condition: CreateDbSg
     Properties:
       GroupDescription: Aurora postgres
-      VpcId: !Ref Vpc
+      VpcId: !If [ UseExistingNetwork, !Ref ExistingVpcId, !Ref Vpc ]
       # Egress restricted to TCP/5432 within the VPC CIDR only — avoids
       # all-protocols ('-1') egress (SECURITY_GROUP_EGRESS_ALL_PROTOCOLS_RULE).
       # Aurora has no legitimate outbound traffic to the public internet;
@@ -285,34 +458,39 @@ Resources:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
-          CidrIp: 10.50.0.0/16
+          CidrIp: !If [ UseExistingNetwork, !Ref ExistingVpcCidr, 10.50.0.0/16 ]
           Description: Restrict egress to PostgreSQL within VPC CIDR only
   CacheSg:
     Type: AWS::EC2::SecurityGroup
+    Condition: CreateCacheSg
     Properties:
       GroupDescription: ElastiCache Memcached
-      VpcId: !Ref Vpc
+      VpcId: !If [ UseExistingNetwork, !Ref ExistingVpcId, !Ref Vpc ]
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: 0.0.0.0/0
           Description: Allow all outbound (no real outbound expected)
 
+  # Ingress rules are only added to security groups Lens creates. A supplied
+  # group is used as-is; its owner keeps the 5432 / 11211 rules current.
   DbSgFromLambda:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: CreateDbSg
     Properties:
       GroupId: !GetAtt DbSg.GroupId
       IpProtocol: tcp
       FromPort: 5432
       ToPort: 5432
-      SourceSecurityGroupId: !GetAtt LambdaSg.GroupId
+      SourceSecurityGroupId: !If [ UseExistingLambdaSg, !Ref ExistingLambdaSecurityGroupId, !GetAtt LambdaSg.GroupId ]
   CacheSgFromLambda:
     Type: AWS::EC2::SecurityGroupIngress
+    Condition: CreateCacheSg
     Properties:
       GroupId: !GetAtt CacheSg.GroupId
       IpProtocol: tcp
       FromPort: 11211
       ToPort: 11211
-      SourceSecurityGroupId: !GetAtt LambdaSg.GroupId
+      SourceSecurityGroupId: !If [ UseExistingLambdaSg, !Ref ExistingLambdaSecurityGroupId, !GetAtt LambdaSg.GroupId ]
 
   # ===========================================================================
   # Aurora PostgreSQL Serverless v2
@@ -321,7 +499,7 @@ Resources:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
       DBSubnetGroupDescription: Bedrock Ops Lens Aurora subnets
-      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      SubnetIds: !If [ UseExistingNetwork, !Ref ExistingPrivateSubnetIds, [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
 
   # Customer-managed KMS CMK so the DbSecret is not encrypted with the
   # AWS-managed aws/secretsmanager key (CKV_AWS_149). Gives us key-policy
@@ -384,6 +562,11 @@ Resources:
   DbSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
+      # A pre-existing execution role has to name this secret in its policy
+      # before the stack exists, so give it a predictable name in that case.
+      # Lens-created roles reference the generated ARN, so nothing changes for
+      # existing deployments (a Name change would replace the secret).
+      Name: !If [ UseStableResourceNames, !Sub '${AWS::StackName}/db', !Ref AWS::NoValue ]
       Description: !Sub 'Aurora master credentials for ${StackNamePrefix}'
       KmsKeyId: !GetAtt SecretsKey.Arn
       GenerateSecretString:
@@ -423,7 +606,7 @@ Resources:
       MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
       MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
       DBSubnetGroupName: !Ref DbSubnetGroup
-      VpcSecurityGroupIds: [ !Ref DbSg ]
+      VpcSecurityGroupIds: [ !If [ UseExistingDbSg, !Ref ExistingDbSecurityGroupId, !Ref DbSg ] ]
       DatabaseName: bedrock_lens
       StorageEncrypted: true
       # Enable IAM DB authentication (CKV_AWS_162) so DB access can be
@@ -477,7 +660,7 @@ Resources:
     Type: AWS::ElastiCache::SubnetGroup
     Properties:
       Description: Bedrock Ops Lens Memcached subnets
-      SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+      SubnetIds: !If [ UseExistingNetwork, !Ref ExistingPrivateSubnetIds, [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
 
   CacheCluster:
     Type: AWS::ElastiCache::CacheCluster
@@ -486,7 +669,7 @@ Resources:
       Engine: memcached
       EngineVersion: '1.6.22'
       NumCacheNodes: 1
-      VpcSecurityGroupIds: [ !GetAtt CacheSg.GroupId ]
+      VpcSecurityGroupIds: [ !If [ UseExistingCacheSg, !Ref ExistingCacheSecurityGroupId, !GetAtt CacheSg.GroupId ] ]
       CacheSubnetGroupName: !Ref CacheSubnetGroup
 
   # ===========================================================================
@@ -601,6 +784,7 @@ Resources:
   # ===========================================================================
   PreSignUpFnRole:
     Type: AWS::IAM::Role
+    Condition: CreatePreSignUpRole
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -615,7 +799,7 @@ Resources:
     Properties:
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt PreSignUpFnRole.Arn
+      Role: !If [ CreatePreSignUpRole, !GetAtt PreSignUpFnRole.Arn, !Ref PreSignUpRoleArn ]
       Timeout: 5
       MemorySize: 128
       # Reserved concurrency caps blast radius for sign-up bursts / abuse.
@@ -652,6 +836,7 @@ Resources:
 
   PostConfirmFnRole:
     Type: AWS::IAM::Role
+    Condition: CreatePostConfirmRole
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -677,7 +862,7 @@ Resources:
     Properties:
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt PostConfirmFnRole.Arn
+      Role: !If [ CreatePostConfirmRole, !GetAtt PostConfirmFnRole.Arn, !Ref PostConfirmRoleArn ]
       Timeout: 10
       MemorySize: 128
       Description: Auto-promotes the first sign-up to bedrock-lens-admins.
@@ -850,6 +1035,7 @@ Resources:
   # ===========================================================================
   BackendLambdaRole:
     Type: AWS::IAM::Role
+    Condition: CreateBackendRole
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -903,22 +1089,22 @@ Resources:
 
   BackendLambda:
     Type: AWS::Lambda::Function
-    DependsOn: SchemaInit
     Properties:
       FunctionName: !Sub '${AWS::StackName}-backend'
       PackageType: Image
       Code:
         ImageUri: !Ref BackendImageUri
-      Role: !GetAtt BackendLambdaRole.Arn
+      Role: !If [ CreateBackendRole, !GetAtt BackendLambdaRole.Arn, !Ref BackendRoleArn ]
       # 120s (not 60): Ops Review synthesis via Bedrock takes 40-90s end to end.
       Timeout: 120
       MemorySize: 1024
       Architectures: [ x86_64 ]
       VpcConfig:
-        SecurityGroupIds: [ !Ref LambdaSg ]
-        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+        SecurityGroupIds: [ !If [ UseExistingLambdaSg, !Ref ExistingLambdaSecurityGroupId, !Ref LambdaSg ] ]
+        SubnetIds: !If [ UseExistingNetwork, !Ref ExistingPrivateSubnetIds, [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
       Environment:
         Variables:
+          SCHEMA_READY: !If [UseExistingNetwork, !Ref SchemaInitExistingNetwork, !Ref SchemaInit]
           AUTH_ENABLED: 'true'
           # Cognito refs — these don't depend on the Distribution.
           COGNITO_USER_POOL_ID: !Ref UserPool
@@ -961,11 +1147,16 @@ Resources:
   SchemaInitDlq:
     Type: AWS::SQS::Queue
     Properties:
+      # Same reasoning as DbSecret.Name: Lambda checks sqs:SendMessage on the
+      # execution role at create time, so a pre-existing role must be able to
+      # name this queue in advance.
+      QueueName: !If [ UseStableResourceNames, !Sub '${AWS::StackName}-schema-init-dlq', !Ref AWS::NoValue ]
       MessageRetentionPeriod: 1209600
       KmsMasterKeyId: alias/aws/sqs
 
   SchemaInitLambdaRole:
     Type: AWS::IAM::Role
+    Condition: CreateSchemaInitRole
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1001,7 +1192,7 @@ Resources:
         ImageUri: !Ref BackendImageUri
       ImageConfig:
         Command: [ 'app.schema_init.handler' ]
-      Role: !GetAtt SchemaInitLambdaRole.Arn
+      Role: !If [ CreateSchemaInitRole, !GetAtt SchemaInitLambdaRole.Arn, !Ref SchemaInitRoleArn ]
       Timeout: 300
       MemorySize: 512
       Architectures: [ x86_64 ]
@@ -1009,8 +1200,8 @@ Resources:
       DeadLetterConfig:
         TargetArn: !GetAtt SchemaInitDlq.Arn
       VpcConfig:
-        SecurityGroupIds: [ !Ref LambdaSg ]
-        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+        SecurityGroupIds: [ !If [ UseExistingLambdaSg, !Ref ExistingLambdaSecurityGroupId, !Ref LambdaSg ] ]
+        SubnetIds: !If [ UseExistingNetwork, !Ref ExistingPrivateSubnetIds, [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
       Environment:
         Variables:
           DB_HOST: !GetAtt DbCluster.Endpoint.Address
@@ -1025,6 +1216,10 @@ Resources:
   # than CloudFormation's one-hour default.
   SchemaInit:
     Type: Custom::SchemaInit
+    # Only when Lens owns the network. DependsOn cannot be conditional, and the
+    # egress resources listed below do not exist in an existing VPC, so the
+    # existing-network path uses SchemaInitExistingNetwork further down.
+    Condition: CreateNetwork
     # The egress dependencies are load-bearing for stack DELETE, not create.
     #
     # CloudFormation deletes a resource's dependencies AFTER the resource
@@ -1076,6 +1271,20 @@ Resources:
       # never actually set — which is why the hang cost 60 minutes, not 5.
       ServiceTimeout: 300
 
+  # Existing-network twin of SchemaInit. The customer's network outlives the
+  # stack, so the DELETE-ordering dependencies above are not needed (and cannot
+  # be expressed, because those resources are not created). The callback still
+  # needs a route to S3 from the supplied subnets, which
+  # scripts/validate-existing-resources.py checks before deployment.
+  SchemaInitExistingNetwork:
+    Type: Custom::SchemaInit
+    Condition: UseExistingNetwork
+    DependsOn: DbWriter
+    Properties:
+      ServiceToken: !GetAtt SchemaInitLambda.Arn
+      SchemaVersion: !Ref BackendImageUri
+      ServiceTimeout: 300
+
   # ===========================================================================
   # Ingester Lambda — pulls Bedrock CW metrics, invocation logs, cost,
   # quotas, model-lifecycle into Aurora. Same container image as Backend;
@@ -1084,6 +1293,7 @@ Resources:
   # ===========================================================================
   IngesterLambdaRole:
     Type: AWS::IAM::Role
+    Condition: CreateIngesterRole
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1162,6 +1372,7 @@ Resources:
                     - organizations:ListAccounts
                     - organizations:DescribeOrganization
                     - organizations:ListAccountsForParent
+                    - organizations:ListOrganizationalUnitsForParent
                   Resource: '*'
                 - !Ref AWS::NoValue
               # Identity introspection (used to derive self-account context)
@@ -1212,7 +1423,7 @@ Resources:
         ImageUri: !Ref BackendImageUri
       ImageConfig:
         Command: [ 'ingestion.live_pull.handler' ]
-      Role: !GetAtt IngesterLambdaRole.Arn
+      Role: !If [ CreateIngesterRole, !GetAtt IngesterLambdaRole.Arn, !Ref IngesterRoleArn ]
       Timeout: 60
       MemorySize: 512
       Architectures: [ x86_64 ]
@@ -1225,7 +1436,6 @@ Resources:
 
   IngesterLambda:
     Type: AWS::Lambda::Function
-    DependsOn: SchemaInit
     Properties:
       FunctionName: !Sub '${AWS::StackName}-ingester'
       PackageType: Image
@@ -1233,7 +1443,7 @@ Resources:
         ImageUri: !Ref BackendImageUri
       ImageConfig:
         Command: [ 'ingestion.lambda_handler.handler' ]
-      Role: !GetAtt IngesterLambdaRole.Arn
+      Role: !If [ CreateIngesterRole, !GetAtt IngesterLambdaRole.Arn, !Ref IngesterRoleArn ]
       # 15 min — enough for a multi-region cw_metrics + invocation_logs run
       # in a small org. If a customer's run exceeds 15 min they should split
       # via the `only:[...]` event payload across multiple invokes.
@@ -1241,10 +1451,11 @@ Resources:
       MemorySize: 1024
       Architectures: [ x86_64 ]
       VpcConfig:
-        SecurityGroupIds: [ !Ref LambdaSg ]
-        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+        SecurityGroupIds: [ !If [ UseExistingLambdaSg, !Ref ExistingLambdaSecurityGroupId, !Ref LambdaSg ] ]
+        SubnetIds: !If [ UseExistingNetwork, !Ref ExistingPrivateSubnetIds, [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
       Environment:
         Variables:
+          SCHEMA_READY: !If [UseExistingNetwork, !Ref SchemaInitExistingNetwork, !Ref SchemaInit]
           DB_HOST: !GetAtt DbCluster.Endpoint.Address
           DB_PORT: !GetAtt DbCluster.Endpoint.Port
           DB_USER: bedrock_lens
@@ -1255,10 +1466,12 @@ Resources:
           BEDROCK_REGION: !Ref AWS::Region
           INGESTER_DAYS_DEFAULT: '14'
           BEDROCK_OPS_LENS_ROLE_NAME: !Ref ReaderRoleName
-          # Restricted deployments start in single-account mode before any
-          # invocation can call Organizations. setup-pipeline.sh can then
-          # select explicit accounts after their reader roles are in place.
-          MONITORED_ACCOUNTS_MODE: !If [ OrganizationsDiscoveryEnabled, discover-org, single ]
+          # Scope is persisted in stack parameters so redeploying the image
+          # cannot reset an OU or explicit selection to the whole organization.
+          MONITORED_ACCOUNTS_MODE: !Ref MonitoredAccountsMode
+          MONITORED_ACCOUNTS_IDS: !Ref MonitoredAccountIds
+          MONITORED_OU_IDS: !Ref MonitoredOuIds
+          BEDROCK_OPS_LENS_EXTERNAL_ID: !Ref ReaderExternalId
           # Region scope for cw_metrics + invocation_logs comes from
           # config.yaml's `monitored_regions` (baked into the Lambda image
           # at build time). We intentionally do NOT set MONITORED_REGIONS_*
@@ -1474,7 +1687,7 @@ Resources:
         Enabled: true
         DefaultRootObject: index.html
         HttpVersion: http2
-        WebACLId: !Ref WebAclArn
+        WebACLId: !If [ HasWebAcl, !Ref WebAclArn, !Ref AWS::NoValue ]
         # Access logging (CKV_AWS_86) — viewer requests delivered to a
         # dedicated logs bucket for audit + forensic analysis.
         Logging:
@@ -1537,6 +1750,7 @@ Resources:
   # ===========================================================================
   PrewarmLambdaRole:
     Type: AWS::IAM::Role
+    Condition: CreatePrewarmRole
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -1552,12 +1766,12 @@ Resources:
       FunctionName: !Sub '${AWS::StackName}-prewarm'
       Runtime: python3.12
       Handler: index.handler
-      Role: !GetAtt PrewarmLambdaRole.Arn
+      Role: !If [ CreatePrewarmRole, !GetAtt PrewarmLambdaRole.Arn, !Ref PrewarmRoleArn ]
       Timeout: 300
       MemorySize: 256
       VpcConfig:
-        SecurityGroupIds: [ !Ref LambdaSg ]
-        SubnetIds: [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ]
+        SecurityGroupIds: [ !If [ UseExistingLambdaSg, !Ref ExistingLambdaSecurityGroupId, !Ref LambdaSg ] ]
+        SubnetIds: !If [ UseExistingNetwork, !Ref ExistingPrivateSubnetIds, [ !Ref PrivateSubnet1, !Ref PrivateSubnet2 ] ]
       Environment:
         Variables:
           MEMCACHED_HOST: !GetAtt CacheCluster.ConfigurationEndpoint.Address
@@ -1624,6 +1838,12 @@ Resources:
 # Outputs
 # =============================================================================
 Outputs:
+  NetworkMode:
+    Description: Whether the stack deployed into an existing VPC or created its own.
+    Value: !If [ UseExistingNetwork, existing, created ]
+  VpcId:
+    Description: VPC hosting Lambda, Aurora, and ElastiCache.
+    Value: !If [ UseExistingNetwork, !Ref ExistingVpcId, !Ref Vpc ]
   DashboardUrl:
     Value: !Sub 'https://${Distribution.DomainName}'
   CognitoDomain:

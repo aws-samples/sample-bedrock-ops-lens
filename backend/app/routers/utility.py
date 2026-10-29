@@ -1,12 +1,17 @@
 """Health, freshness, and metadata endpoints."""
 from __future__ import annotations
 
+import asyncio
+import logging
+from types import SimpleNamespace
+
 from fastapi import APIRouter, Request
 
 from .. import db
 from ..config import settings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.get("/me")
@@ -49,6 +54,22 @@ async def system_config():
         return {"error": str(e)}
 
 
+async def _configured_accounts():
+    """Discover with ingester credentials in Lambda, or local credentials in dev."""
+    from ingestion.accounts import MonitoredAccount, discover_accounts
+    from . import live_pull
+
+    function_name = live_pull._function_name()
+    if function_name:
+        result = await asyncio.to_thread(
+            live_pull._invoke, function_name, {"action": "list-accounts"},
+        )
+        if result.get("ok") is not True or not isinstance(result.get("accounts"), list):
+            raise RuntimeError("The live-pull function could not list configured accounts")
+        return [MonitoredAccount.from_dict(a) for a in result["accounts"]]
+    return await asyncio.to_thread(discover_accounts, SimpleNamespace())
+
+
 @router.get("/accounts")
 async def list_accounts():
     """All accounts in scope for the dashboard, with volume and last-seen.
@@ -56,9 +77,9 @@ async def list_accounts():
     Returns the UNION of:
       1. Accounts with at least one row in f_daily over the last 30 days
          (= accounts where the ingester found traffic).
-      2. Accounts the ingester is configured to monitor (from
-         config.yaml — could be the org list, an explicit list, or just
-         the central account). These appear with zero counts when they
+      2. Accounts the ingester is currently configured to monitor, resolved
+         through the live-pull function (local config/credentials in dev).
+         These appear with zero counts when they
          have no traffic yet, so the customer can SEE that those accounts
          are in scope even though they're idle.
 
@@ -91,22 +112,11 @@ async def list_accounts():
 
     # Configured accounts (whether active or not).
     try:
-        # Lazy-import — config + accounts modules pull boto3, no need if
-        # the API is just listing what's already in the DB.
-        from ingestion.config import load_config
-        from ingestion.accounts import discover_from_org, MonitoredAccount
-        cfg = load_config()
-        configured: list[MonitoredAccount] = []
-        if cfg.monitored_accounts.mode == "discover-org":
-            try:
-                configured = discover_from_org()
-            except Exception:
-                configured = []
-        elif cfg.monitored_accounts.mode == "explicit":
-            configured = [MonitoredAccount(accountId=a) for a in cfg.monitored_accounts.ids]
-        # mode=single → caller's account, but we don't know its ID server-side
-        # without an extra STS call; the active set covers it.
-    except Exception:
+        configured = await _configured_accounts()
+    except Exception as exc:
+        # Preserve traffic history when metadata is unavailable, without
+        # substituting stale config or granting the backend Organizations access.
+        logger.warning("Configured account discovery failed (%s)", type(exc).__name__)
         configured = []
 
     for m in configured:

@@ -3,7 +3,7 @@
 Account discovery + cross-account session helper for Bedrock Ops Lens
 ingestion.
 
-Three account sources, picked by argv:
+Four account sources, picked by argv:
 
   1. --accounts ID,ID,...    Explicit comma-separated list (testing, small fleets).
   2. --accounts-config FILE  JSON file: {"accounts": [{"accountId": "123", "name": "..."}]}
@@ -11,6 +11,12 @@ Three account sources, picked by argv:
                              credentials. Requires the central account to be
                              the AWS Organizations management account, or a
                              delegated administrator for Organizations.
+  4. --discover-ou OU,OU     Calls organizations:ListAccountsForParent for each
+                             OU (and its child OUs). Same credential requirement
+                             as --discover-org, but collection stays inside the
+                             OUs the reader roles were rolled out to. Resolution
+                             failure is an error, never a silent widening to the
+                             whole organization or narrowing to one account.
 
 For each discovered accountId, the ingester needs a boto3.Session that
 makes API calls AS that account. The session is constructed via:
@@ -98,9 +104,41 @@ def discover_from_org() -> list[MonitoredAccount]:
     paginator = org.get_paginator("list_accounts")
     for page in paginator.paginate():
         for a in page.get("Accounts", []) or []:
-            if a.get("Status") == "ACTIVE":
+            if a.get("State", a.get("Status")) == "ACTIVE":
                 out.append(MonitoredAccount(accountId=a["Id"], name=a.get("Name", "")))
     return out
+
+
+def discover_from_ous(ou_ids: Iterable[str]) -> list[MonitoredAccount]:
+    """List ACTIVE accounts under the given OUs, including nested child OUs.
+
+    Membership is resolved on every run, so accounts that join or leave an OU
+    are picked up without reconfiguration (service-managed StackSets with
+    auto-deployment add the reader role to joiners the same way). Raises on
+    any Organizations error: scope must never silently change."""
+    ids = [o.strip() for o in ou_ids if o and o.strip()]
+    if not ids:
+        raise ValueError("discover-ou needs at least one OU ID (MONITORED_OU_IDS / monitored_accounts.ou_ids)")
+    org = boto3.client(
+        "organizations",
+        config=Config(retries={"max_attempts": 5, "mode": "adaptive"}),
+    )
+    out: dict[str, MonitoredAccount] = {}
+    seen_parents: set[str] = set()
+    pending = list(ids)
+    while pending:
+        parent = pending.pop(0)
+        if parent in seen_parents:
+            continue
+        seen_parents.add(parent)
+        for page in org.get_paginator("list_accounts_for_parent").paginate(ParentId=parent):
+            for a in page.get("Accounts", []) or []:
+                if a.get("State", a.get("Status")) == "ACTIVE":
+                    out.setdefault(a["Id"], MonitoredAccount(accountId=a["Id"], name=a.get("Name", "")))
+        for page in org.get_paginator("list_organizational_units_for_parent").paginate(ParentId=parent):
+            for ou in page.get("OrganizationalUnits", []) or []:
+                pending.append(ou["Id"])
+    return list(out.values())
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +248,11 @@ def _add_common_args(ap: argparse.ArgumentParser) -> None:
         "--discover-org", action="store_true",
         help="enumerate every ACTIVE account via organizations:ListAccounts",
     )
+    src.add_argument(
+        "--discover-ou", metavar="OU_ID[,OU_ID]",
+        help="enumerate ACTIVE accounts under these OUs (and child OUs) via "
+             "organizations:ListAccountsForParent",
+    )
     ap.add_argument(
         "--role-name", default=DEFAULT_ROLE_NAME,
         help=f"cross-account role name (default: {DEFAULT_ROLE_NAME}; env BEDROCK_OPS_LENS_ROLE_NAME)",
@@ -226,9 +269,12 @@ def discover_accounts(args) -> list[MonitoredAccount]:
     Precedence (first match wins):
       1. --accounts CSV         (explicit args override everything)
       2. --accounts-config FILE (explicit args override everything)
-      3. --discover-org         (explicit args override everything)
-      4. config.yaml monitored_accounts.mode + ids
+      3. --discover-org / --discover-ou (explicit args override everything)
+      4. config.yaml monitored_accounts.mode + ids / ou_ids
       5. Default: just the running credentials' account.
+
+    discover-ou never falls back: a membership lookup failure raises, so the
+    run fails visibly instead of collecting from a different set of accounts.
     """
     if getattr(args, "accounts", None):
         return discover_from_list(args.accounts)
@@ -236,20 +282,23 @@ def discover_accounts(args) -> list[MonitoredAccount]:
         return discover_from_file(args.accounts_config)
     if getattr(args, "discover_org", False):
         return discover_from_org()
+    if getattr(args, "discover_ou", None):
+        return discover_from_ous(str(args.discover_ou).split(","))
 
-    # Fall back to config.yaml. Lazy-import to keep this module importable
-    # without PyYAML when only the CLI flags are used.
-    try:
-        from .config import load_config
-        cfg = load_config()
-        m = cfg.monitored_accounts.mode
-        if m == "explicit" and cfg.monitored_accounts.ids:
-            return [MonitoredAccount(accountId=a) for a in cfg.monitored_accounts.ids]
-        if m == "discover-org":
+    # Missing config is handled by load_config's defaults. Invalid config must
+    # propagate: its intended scope may only be declared in the YAML file.
+    from .config import load_config
+    cfg = load_config()
+    if cfg.monitored_accounts.mode == "discover-ou":
+        return discover_from_ous(cfg.monitored_accounts.ou_ids)   # strict: no fallback
+    m = cfg.monitored_accounts.mode
+    if m == "explicit" and cfg.monitored_accounts.ids:
+        return [MonitoredAccount(accountId=a) for a in cfg.monitored_accounts.ids]
+    if m == "discover-org":
+        try:
             return discover_from_org()
-        # m == "single" or unknown -> fallthrough
-    except Exception:
-        pass
+        except Exception:
+            pass  # Preserve the legacy discover-org fallback.
 
     sc = session_cache()
     return [MonitoredAccount(accountId=sc.self_account, name="(running creds)")]
@@ -308,6 +357,8 @@ def resolve_account_names(accounts: list[MonitoredAccount],
     Failures are per-account and non-fatal — name resolution must never
     break ingestion.
     """
+    if not accounts:
+        return []
     config_names = config_names or {}
     out: list[tuple[str, str, str]] = []
     sc = session_cache()

@@ -66,8 +66,8 @@ def resolve(value, tpl, parameters):
     return {key: resolve(item, tpl, parameters) for key, item in value.items()}
 
 
-@pytest.mark.parametrize("enabled,mode", [("false", "single"), ("true", "discover-org")])
-def test_organizations_setting_controls_initial_mode_and_iam_grants(enabled, mode):
+@pytest.mark.parametrize("enabled,mode", [("false", "single"), ("true", "single")])
+def test_organizations_permission_does_not_select_whole_org_scope(enabled, mode):
     tpl = template(ROOT / "infra/cloudformation.yaml")
     parameters = {
         name: item["Default"] for name, item in tpl["Parameters"].items() if "Default" in item
@@ -86,6 +86,8 @@ def test_organizations_setting_controls_initial_mode_and_iam_grants(enabled, mod
     assert organization_actions == ({
         "organizations:ListAccounts", "organizations:DescribeOrganization",
         "organizations:ListAccountsForParent",
+        # discover-ou walks child OUs, which needs the OU listing call too.
+        "organizations:ListOrganizationalUnitsForParent",
     } if enabled == "true" else set())
     assert "sts:AssumeRole" in actions
     assert "cloudwatch:GetMetricData" in actions
@@ -161,9 +163,10 @@ def deployment_settings(tmp_path):
         "# -----------------------------------------------------------------------------", 1
     )[0]
     setting = "# Organizations discovery policy." + setting
-    parameters = 'cat > "$PARAMS_JSON" <<EOF\n' + source.split(
-        'cat > "$PARAMS_JSON" <<EOF\n', 1
-    )[1].split("\nEOF", 1)[0] + "\nEOF\n"
+    # The parameter file is now built by an inline python block (so existing-
+    # resource parameters can switch between a value and UsePreviousValue).
+    marker = "# Existing-resource parameters:"
+    parameters = marker + source.split(marker, 1)[1].split("\nPYPARAMS\n", 1)[0] + "\nPYPARAMS\n"
     script = tmp_path / "settings.sh"
     script.write_text("set -euo pipefail\nROOT=\"$1\"\nREGION=us-east-1\n" + setting + parameters)
     bin_dir = tmp_path / "bin"
@@ -188,6 +191,13 @@ raise SystemExit(int(os.environ.get(prefix + "_RC", "0")))
 ''')
     aws.chmod(0o755)
     result_file = tmp_path / "parameters.json"
+    scope_file = tmp_path / "scope.json"
+    scope_file.write_text(json.dumps([
+        {"ParameterKey": "MonitoredAccountsMode", "ParameterValue": "single"},
+        {"ParameterKey": "MonitoredAccountIds", "ParameterValue": ""},
+        {"ParameterKey": "MonitoredOuIds", "ParameterValue": ""},
+        {"ParameterKey": "ReaderExternalId", "ParameterValue": ""},
+    ]))
     environment = {
         "PATH": f"{bin_dir}:/usr/bin:/bin", "FAKE_CALLS": str(calls),
         "PARAMS_JSON": str(result_file), "ALLOWED_EMAIL_DOMAINS": "example.com",
@@ -197,6 +207,7 @@ raise SystemExit(int(os.environ.get(prefix + "_RC", "0")))
         "BEDROCK_LOGS_REGION": "", "COGNITO_DOMAIN_PREFIX": "lens-example",
         "COGNITO_SELF_SIGNUP": "disabled", "MAIN_STACK": "BedrockOpsLens-example",
         "EDGE_SHA_VERSION_ARN": "fixture-edge-arn", "WEB_ACL_ARN": "fixture-waf-arn",
+        "SCOPE_PARAMS_JSON": str(scope_file), "ER_STABLE_NAMES": "false",
     }
 
     def run(**overrides):

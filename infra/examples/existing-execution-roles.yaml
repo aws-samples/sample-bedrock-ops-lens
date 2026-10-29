@@ -1,0 +1,307 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Ops Lens — EXAMPLE pre-existing execution roles. This is the
+  authoritative statement of the permissions each Lens Lambda needs when the
+  roles are created ahead of the stack by an IAM team. Deploy it (or copy the
+  policies into your own role tooling), then pass the output ARNs through
+  existing_resources.roles in config.yaml. Resource ARNs are written as
+  patterns because the stack does not exist yet; the main template gives the
+  secret and the dead-letter queue deterministic names for exactly this case.
+  Requires CAPABILITY_NAMED_IAM.
+
+Parameters:
+  LensStackName:
+    Type: String
+    AllowedPattern: '^[A-Za-z][A-Za-z0-9-]{0,40}$'
+    Description: >
+      Name the central stack will have, for example BedrockOpsLens-20260101-0900.
+      deploy.sh prints it as "stacks:" during pre-flight; with STACK_NAME_SUFFIX=x
+      it is BedrockOpsLens-x. Role names and policy resource patterns derive from it.
+  ReaderRoleName:
+    Type: String
+    Default: BedrockOpsLensReader
+    AllowedPattern: '^[A-Za-z0-9+=,.@_-]{1,64}$'
+    Description: Reader role name in monitored accounts (must match the central ReaderRoleName).
+  EnableOrganizationsDiscovery:
+    Type: String
+    Default: 'false'
+    AllowedValues: [ 'true', 'false' ]
+    Description: Grant the ingester read-only AWS Organizations discovery.
+  BedrockLogsBucket:
+    Type: String
+    Default: ''
+    Description: Optional Bedrock invocation-logs bucket the ingester may read.
+  ProxyEventsBucket:
+    Type: String
+    Default: ''
+    Description: Optional GenAI proxy events bucket the ingester may read.
+
+Conditions:
+  OrganizationsDiscoveryEnabled: !Equals [ !Ref EnableOrganizationsDiscovery, 'true' ]
+  HasBedrockLogsBkt: !Not [ !Equals [ !Ref BedrockLogsBucket, '' ] ]
+  HasProxyEventsBkt: !Not [ !Equals [ !Ref ProxyEventsBucket, '' ] ]
+
+Resources:
+  BackendRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LensStackName}-backend'
+      Description: Bedrock Ops Lens backend Lambda (FastAPI) execution role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: AppPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DatabaseSecret
+                Effect: Allow
+                Action: [ secretsmanager:GetSecretValue, secretsmanager:DescribeSecret ]
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LensStackName}/db-*'
+              - Sid: DecryptSecretViaSecretsManager
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+              - Sid: OpsReviewModel
+                Effect: Allow
+                Action: [ bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream ]
+                Resource: '*'
+              - Sid: CognitoUserPool
+                Effect: Allow
+                Action: [ cognito-idp:InitiateAuth, cognito-idp:AdminInitiateAuth,
+                          cognito-idp:SignUp, cognito-idp:ConfirmSignUp,
+                          cognito-idp:ResendConfirmationCode,
+                          cognito-idp:ForgotPassword, cognito-idp:ConfirmForgotPassword,
+                          cognito-idp:AdminCreateUser, cognito-idp:AdminGetUser,
+                          cognito-idp:AdminListGroupsForUser,
+                          cognito-idp:AdminAddUserToGroup ]
+                Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+              - Sid: AppClientIdParameter
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bedrock-ops-lens/${LensStackName}/*'
+              - Sid: Notifications
+                Effect: Allow
+                Action: [ sns:Publish, sns:Subscribe ]
+                Resource: !Sub 'arn:${AWS::Partition}:sns:*:${AWS::AccountId}:*'
+              # The backend invokes the read-only live-pull entry point, never
+              # the ingester or its maintenance actions.
+              - Sid: LivePull
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LensStackName}-live-pull'
+
+  IngesterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LensStackName}-ingester'
+      Description: Bedrock Ops Lens ingester Lambda execution role; monitored-account reader roles trust this principal.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: IngesterPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DatabaseSecret
+                Effect: Allow
+                Action: [ secretsmanager:GetSecretValue, secretsmanager:DescribeSecret ]
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LensStackName}/db-*'
+              - Sid: DecryptSecretViaSecretsManager
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action: [ cloudwatch:GetMetricData, cloudwatch:GetMetricStatistics, cloudwatch:ListMetrics ]
+                Resource: '*'
+              - Sid: ServiceQuotas
+                Effect: Allow
+                Action: [ servicequotas:ListServiceQuotas, servicequotas:GetServiceQuota,
+                          servicequotas:GetAWSDefaultServiceQuota, servicequotas:ListAWSDefaultServiceQuotas ]
+                Resource: '*'
+              - Sid: CostExplorer
+                Effect: Allow
+                Action: [ ce:GetCostAndUsage, ce:GetDimensionValues ]
+                Resource: '*'
+              - Sid: BedrockCatalog
+                Effect: Allow
+                # List/GetInferenceProfile also resolve application inference
+                # profiles for account-scoped metrics and quota drill-down.
+                Action: [ bedrock:ListFoundationModels, bedrock:GetFoundationModel,
+                          bedrock:ListInferenceProfiles, bedrock:GetInferenceProfile ]
+                Resource: '*'
+              - Sid: AssumeReaderRoles
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/${ReaderRoleName}'
+              # LivePullFunction shares this role and reads the ingester's
+              # current account scope, reader-role name, and external ID.
+              - Sid: IngesterConfiguration
+                Effect: Allow
+                Action: lambda:GetFunctionConfiguration
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${LensStackName}-ingester'
+              - Sid: Notifications
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Sub 'arn:${AWS::Partition}:sns:*:${AWS::AccountId}:*'
+              - !If
+                - OrganizationsDiscoveryEnabled
+                - Sid: OrganizationsDiscovery
+                  Effect: Allow
+                  Action: [ organizations:ListAccounts, organizations:DescribeOrganization,
+                            organizations:ListAccountsForParent,
+                            organizations:ListOrganizationalUnitsForParent ]
+                  Resource: '*'
+                - !Ref AWS::NoValue
+              - Sid: Identity
+                Effect: Allow
+                Action: [ sts:GetCallerIdentity, account:GetAccountInformation ]
+                Resource: '*'
+              - !If
+                - HasBedrockLogsBkt
+                - Sid: InvocationLogs
+                  Effect: Allow
+                  Action: [ s3:ListBucket, s3:GetObject ]
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${BedrockLogsBucket}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${BedrockLogsBucket}/*'
+                - !Ref AWS::NoValue
+              - !If
+                - HasProxyEventsBkt
+                - Sid: ProxyEvents
+                  Effect: Allow
+                  Action: [ s3:ListBucket, s3:GetObject ]
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${ProxyEventsBucket}'
+                    - !Sub 'arn:${AWS::Partition}:s3:::${ProxyEventsBucket}/*'
+                - !Ref AWS::NoValue
+
+  SchemaInitRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LensStackName}-schema-init'
+      Description: Bedrock Ops Lens schema-init Lambda execution role (runs during stack creation).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: SchemaInitDb
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DatabaseSecret
+                Effect: Allow
+                Action: [ secretsmanager:GetSecretValue, secretsmanager:DescribeSecret ]
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${LensStackName}/db-*'
+              - Sid: DecryptSecretViaSecretsManager
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+              # Lambda verifies this at function creation when a DLQ is configured.
+              - Sid: DeadLetterQueue
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub 'arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${LensStackName}-schema-init-dlq'
+
+  PrewarmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LensStackName}-prewarm'
+      Description: Bedrock Ops Lens pre-warm Lambda execution role (Memcached only).
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+
+  PreSignUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LensStackName}-pre-signup'
+      Description: Bedrock Ops Lens Cognito pre-sign-up trigger execution role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+  PostConfirmRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LensStackName}-post-confirm'
+      Description: Bedrock Ops Lens Cognito post-confirmation trigger execution role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CognitoGroupOps
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ cognito-idp:ListUsersInGroup, cognito-idp:AdminAddUserToGroup ]
+                Resource: !Sub 'arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*'
+
+  # Lambda@Edge: must trust edgelambda.amazonaws.com as well. IAM is global,
+  # so this role can be created in any Region and used by the us-east-1 edge stack.
+  EdgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${LensStackName}-edge'
+      Description: Bedrock Ops Lens Lambda@Edge body-hash signer execution role.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com, edgelambda.amazonaws.com ]
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+
+Outputs:
+  BackendRoleArn:     { Value: !GetAtt BackendRole.Arn }
+  IngesterRoleArn:    { Value: !GetAtt IngesterRole.Arn }
+  SchemaInitRoleArn:  { Value: !GetAtt SchemaInitRole.Arn }
+  PrewarmRoleArn:     { Value: !GetAtt PrewarmRole.Arn }
+  PreSignUpRoleArn:   { Value: !GetAtt PreSignUpRole.Arn }
+  PostConfirmRoleArn: { Value: !GetAtt PostConfirmRole.Arn }
+  EdgeRoleArn:        { Value: !GetAtt EdgeRole.Arn }

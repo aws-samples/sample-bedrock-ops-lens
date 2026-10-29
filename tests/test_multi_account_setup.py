@@ -22,6 +22,7 @@ TARGET_A = "111111111111"
 TARGET_B = "222222222222"
 INGESTER_ROLE = f"arn:aws:iam::{CENTRAL}:role/lens-ingester"
 ADMIN_ROLE = f"arn:aws:iam::{CENTRAL}:role/AWSCloudFormationStackSetAdministrationRole"
+SCOPE_KEYS = ["MonitoredAccountsMode", "MonitoredAccountIds", "MonitoredOuIds", "ReaderExternalId"]
 
 
 @pytest.fixture
@@ -246,6 +247,7 @@ def pipeline(tmp_path):
     (root / "scripts").mkdir()
     shutil.copyfile(ROOT / "setup-pipeline.sh", root / "setup-pipeline.sh")
     shutil.copyfile(ROOT / "scripts/setup-multi-account.py", root / "scripts/setup-multi-account.py")
+    shutil.copyfile(ROOT / "scripts/persist-account-scope.py", root / "scripts/persist-account-scope.py")
     (root / ".deploy-stack-name").write_text("example")
     (root / "config.yaml").write_text("deploy_region: us-east-1\n")
     bin_dir = tmp_path / "bin"
@@ -276,6 +278,8 @@ elif args[:2] == ["cloudformation", "describe-stacks"]:
     if "`ReaderRoleName`" in value("--query"):
         print(json.dumps(os.environ.get("FAKE_READER_NAME")))
         raise SystemExit(int(os.environ.get("FAKE_READER_RC", "0")))
+    elif value("--query") == "Stacks[0].Parameters[].ParameterKey":
+        print(os.environ.get("FAKE_PARAMETER_KEYS", "[]"))
     else:
         print(os.environ.get("FAKE_ORG_DISCOVERY", "None"))
 elif args[:2] == ["lambda", "get-function-configuration"]:
@@ -322,6 +326,8 @@ elif args[:2] == ["lambda", "invoke"]:
         payload["runs"][0].update({"rc": 1, "incomplete_reason": "time_budget"})
     elif case == "empty":
         payload["runs"] = []
+    if "FAKE_INGEST_PAYLOAD" in os.environ:
+        payload = json.loads(os.environ["FAKE_INGEST_PAYLOAD"])
     Path(args[-1]).write_text("not JSON" if case == "malformed" else json.dumps(payload))
     print(json.dumps(metadata))
 else:
@@ -331,11 +337,22 @@ else:
     python = bin_dir / "python3"
     python.write_text(f"#!{sys.executable}\n" + r'''
 import json, os, sys
+from pathlib import Path
 args = sys.argv[1:]
 if args and args[0].endswith("setup-multi-account.py") and "--print-account-ids" not in args:
     with open(os.environ["FAKE_CALLS"], "a") as stream:
         stream.write(json.dumps({"kind": "rollout", "args": args}) + "\n")
     raise SystemExit(int(os.environ.get("FAKE_ROLLOUT_RC", "0")))
+if args and args[0].endswith("persist-account-scope.py"):
+    with open(os.environ["FAKE_CALLS"], "a") as stream:
+        stream.write(json.dumps({"kind": "persist", "args": args}) + "\n")
+    if os.environ.get("FAKE_PERSIST_RC"):
+        print("ERROR: CloudFormation scope update failed", file=sys.stderr)
+        raise SystemExit(int(os.environ["FAKE_PERSIST_RC"]))
+    environment = Path(args[args.index("--environment-file") + 1]).read_text()
+    Path(os.environ["FAKE_WRITTEN_ENV"]).write_text(environment)
+    print("scope persisted in CloudFormation; live ingester scope verified.")
+    raise SystemExit(0)
 os.execv(sys.executable, [sys.executable, *args])
 ''')
     python.chmod(0o755)
@@ -707,12 +724,51 @@ def test_wrapper_skip_ingest_discloses_unverified_ingestion(pipeline):
     assert not any(c["args"][:2] == ["lambda", "invoke"] for c in calls)
 
 
-@pytest.mark.parametrize("mode,args", [("single", []), ("ou", ["--ou-id", "ou-example-12345678"])])
-def test_switching_from_explicit_removes_stale_ids(pipeline, mode, args):
-    completed, _, env = pipeline.run("--scope", mode, *args, "--skip-ingest")
+@pytest.mark.parametrize("mode,args,expected", [
+    ("single", [], "single"),
+    ("ou", ["--ou-id", "ou-example-12345678"], "discover-ou"),
+    ("org-root", [], "discover-org"),
+])
+def test_switching_from_explicit_removes_stale_ids(pipeline, mode, args, expected):
+    completed, _, env = pipeline.run(
+        "--scope", mode, *args, "--skip-ingest",
+        extra_env={"FAKE_PARAMETER_KEYS": json.dumps(SCOPE_KEYS if mode == "ou" else [])},
+    )
     assert completed.returncode == 0, completed.stderr
-    assert env["MONITORED_ACCOUNTS_MODE"] == ("single" if mode == "single" else "discover-org")
+    assert env["MONITORED_ACCOUNTS_MODE"] == expected
     assert "MONITORED_ACCOUNTS_IDS" not in env
+    if mode != "ou":
+        assert "MONITORED_OU_IDS" not in env
+
+
+def test_ou_scope_collects_only_from_the_rolled_out_ous(pipeline):
+    """An OU rollout used to leave the ingester in discover-org, so every account
+    in the organization OUTSIDE the OU (no reader role) failed each run and the
+    wrapper reported the pipeline as failed. Rollout scope and collection scope
+    must be the same OUs."""
+    ous = "ou-example-12345678,ou-example-87654321"
+    completed, calls, env = pipeline.run(
+        "--scope", "ou", "--ou-id", ous,
+        extra_env={"FAKE_PARAMETER_KEYS": json.dumps(SCOPE_KEYS)},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert env["MONITORED_ACCOUNTS_MODE"] == "discover-ou"
+    assert env["MONITORED_OU_IDS"] == ous
+    assert "MONITORED_ACCOUNTS_IDS" not in env
+    rollout = [c["args"] for c in calls if c["kind"] == "rollout"]
+    assert len(rollout) == 1
+    assert rollout[0][rollout[0].index("--ou-id") + 1] == ous
+    assert rollout[0][rollout[0].index("--scope") + 1] == "ou"
+    assert "discover-ou (" + ous + ")" in completed.stdout
+
+
+@pytest.mark.parametrize("bad", ["ou-123", "r-vigr", "ou-example-12345678,bogus", "111111111111"])
+def test_ou_scope_rejects_malformed_ou_ids_before_aws(pipeline, bad):
+    completed, calls, env = pipeline.run("--scope", "ou", "--ou-id", bad)
+    assert completed.returncode != 0
+    assert "--ou-id must be" in completed.stderr
+    assert calls == []
+    assert env is None
 
 
 @pytest.mark.parametrize("old,new,expected", [

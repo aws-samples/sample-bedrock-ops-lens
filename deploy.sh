@@ -11,6 +11,12 @@
 #     ./deploy.sh              # dry-run (validate templates + show plan)
 #     ./deploy.sh --yes        # actually deploy
 #     ./deploy.sh destroy      # tear down
+#
+# Existing network / IAM roles: on the first deployment of a stack the script
+# asks whether to create the network and roles or use existing ones, validates
+# anything you supply, shows the plan, and saves the answers to config.yaml
+# under `existing_resources:`. See scripts/existing-resources.sh and
+# docs/existing-resources.md.
 # ============================================================================
 set -euo pipefail
 
@@ -477,6 +483,21 @@ if [[ "$ACTION" == "destroy" ]]; then
 fi
 
 # -----------------------------------------------------------------------------
+# Resource choices: create the network and IAM roles, or use existing ones.
+# First deployment: config.yaml `existing_resources:` block, or prompts at a
+# terminal. Later deployments: read back from the stack. Supplied resources
+# are validated against the account before anything is created.
+# -----------------------------------------------------------------------------
+# shellcheck disable=SC1091
+source "$ROOT/scripts/existing-resources.sh"
+existing_resources_plan
+SCOPE_PARAMS_JSON="$(mktemp -t bol-scope.XXXXXX)"
+trap 'rm -f "${PARAMS_JSON:-}" "$SCOPE_PARAMS_JSON" "$ER_STACK_FILE" "${ER_FACTS_FILE:-}"' EXIT
+"$ER_PY" "$ROOT/scripts/deployment-scope.py" --config "$ROOT/config.yaml" \
+    --stack-file "$ER_STACK_FILE" --region "$REGION" \
+    --organizations-enabled "$ENABLE_ORGANIZATIONS_DISCOVERY" --output "$SCOPE_PARAMS_JSON"
+
+# -----------------------------------------------------------------------------
 # Validate templates
 # `validate-template --template-body` rejects bodies >51200 bytes. Once the
 # security-hardening pass added KMS keys / WAF rules / scoped IAM, the main
@@ -487,7 +508,7 @@ fi
 echo "[2/8] validating templates..."
 
 CFN_STAGING_BUCKET="bedrock-ops-lens-cfn-staging-${ACCOUNT_ID}-${REGION}"
-if ! aws s3api head-bucket --bucket "$CFN_STAGING_BUCKET" --region "$REGION" 2>/dev/null; then
+if ! aws s3api head-bucket --bucket "$CFN_STAGING_BUCKET" --region "$REGION" >/dev/null 2>&1; then
     if [[ "$REGION" == "us-east-1" ]]; then
         aws s3api create-bucket --bucket "$CFN_STAGING_BUCKET" --region "$REGION" >/dev/null
     else
@@ -538,7 +559,13 @@ else
     echo "    https://docs.aws.amazon.com/cfn-guard/ for other platforms."
 fi
 
-# Dry-run stops here.
+# Dry-run stops here. (The WAF line is precomputed: bash 3.2 cannot parse a
+# `case` statement inside $(...) within a heredoc.)
+case "${ER_WAF:-new}" in
+    none)  WAF_SUMMARY_LINE="- CloudFront: only public surface; NO web ACL (existing_resources.waf: none)" ;;
+    arn:*) WAF_SUMMARY_LINE="✓ CloudFront: only public surface, fronted by your web ACL $ER_WAF" ;;
+    *)     WAF_SUMMARY_LINE="✓ CloudFront: only public surface, fronted by AWS WAF" ;;
+esac
 if [[ "$ACTION" != "--yes" ]]; then
     cat <<EOF
 
@@ -547,17 +574,18 @@ DRY RUN COMPLETE.
 
 Estimated monthly cost (idle, Aurora paused):
     Aurora Serverless v2 (paused)        ~ \$0–\$45
-    NAT Gateway (single AZ)              ~ \$32
+    NAT Gateway (single AZ)              $([[ "$ER_NETWORK_MODE" == "existing" ]] && echo "   n/a (existing network)" || echo "~ \$32")
     ElastiCache Memcached (t4g.micro)    ~ \$13
     Lambda (backend + ingester)          ~ \$0–\$2
     CloudFront / S3 / Cognito / WAF      ~ \$5
     Total idle                           ~ \$50–\$97 / month
+    Network: $([[ "$ER_NETWORK_MODE" == "existing" ]] && echo "existing VPC $ER_VPC_ID" || echo "created by Lens")
 
 Security defaults:
     ✓ All S3 buckets: block-public-access = ALL
     ✓ Aurora + Memcached + Lambda: PRIVATE subnets only
     ✓ Lambda Function URL: AuthType=AWS_IAM (CloudFront-OAC-only)
-    ✓ CloudFront: only public surface, fronted by AWS WAF
+    $WAF_SUMMARY_LINE
     ✓ Cognito User Pool: MFA optional, allowed email domains: $ALLOWED_EMAIL_DOMAINS (sign-up: $COGNITO_SELF_SIGNUP)
     ✓ IAM: least-privilege per Lambda role
 
@@ -576,21 +604,34 @@ fi
 # stack as input parameters.
 # -----------------------------------------------------------------------------
 echo "[3/8] deploying edge bootstrap stack ($EDGE_STACK in $EDGE_REGION)..."
+"$ER_PY" "$ROOT/scripts/prepare-edge-upgrade.py" --stack-name "$EDGE_STACK" \
+    --region "$EDGE_REGION" ${ER_CFN_ROLE_ARGS[@]+"${ER_CFN_ROLE_ARGS[@]}"}
+# ER_EDGE_PARAMS carries EdgeRoleArn=... when an existing Lambda@Edge role was
+# chosen; ER_CFN_ROLE_ARGS carries --role-arn when a CloudFormation service role
+# was chosen. Both are empty arrays otherwise (bash 3.2-safe expansion).
 aws cloudformation deploy \
     --stack-name "$EDGE_STACK" \
     --template-file infra/edge-bootstrap.yaml \
     --capabilities CAPABILITY_IAM \
-    --parameter-overrides "StackNamePrefix=$EDGE_STACK" \
+    --parameter-overrides "StackNamePrefix=$EDGE_STACK" ${ER_EDGE_PARAMS[@]+"${ER_EDGE_PARAMS[@]}"} \
     --tags "app=bedrock-ops-lens" "stack=$EDGE_STACK" \
     --region "$EDGE_REGION" \
+    ${ER_CFN_ROLE_ARGS[@]+"${ER_CFN_ROLE_ARGS[@]}"} \
     --no-fail-on-empty-changeset
 
 EDGE_SHA_VERSION_ARN="$(aws cloudformation describe-stacks --stack-name "$EDGE_STACK" --region "$EDGE_REGION" \
     --query 'Stacks[0].Outputs[?OutputKey==`EdgeShaVersionArn`].OutputValue' --output text)"
 WEB_ACL_ARN="$(aws cloudformation describe-stacks --stack-name "$EDGE_STACK" --region "$EDGE_REGION" \
     --query 'Stacks[0].Outputs[?OutputKey==`WebAclArn`].OutputValue' --output text)"
+[[ "$WEB_ACL_ARN" == "None" ]] && WEB_ACL_ARN=""
+# existing_resources.waf: 'none' -> no web ACL; an ARN -> attach the operator's
+# CLOUDFRONT-scope web ACL; 'new'/'previous' -> whatever the edge stack reports.
+case "${ER_WAF:-new}" in
+    none)  WEB_ACL_ARN="" ;;
+    arn:*) WEB_ACL_ARN="$ER_WAF" ;;
+esac
 echo "    edge sha-256 fn: $EDGE_SHA_VERSION_ARN"
-echo "    web acl:        $WEB_ACL_ARN"
+echo "    web acl:        ${WEB_ACL_ARN:-(none — CloudFront deploys without a web ACL)}"
 
 # -----------------------------------------------------------------------------
 # Pass 1b: ECR bootstrap (in $REGION)
@@ -603,6 +644,7 @@ aws cloudformation deploy \
     --parameter-overrides "StackNamePrefix=$ECR_STACK" \
     --tags "app=bedrock-ops-lens" "stack=$ECR_STACK" \
     --region "$REGION" \
+    ${ER_CFN_ROLE_ARGS[@]+"${ER_CFN_ROLE_ARGS[@]}"} \
     --no-fail-on-empty-changeset
 
 ECR_URI="$(aws cloudformation describe-stacks --stack-name "$ECR_STACK" --region "$REGION" \
@@ -657,24 +699,99 @@ echo "    pushed: $BACKEND_IMAGE_URI"
 echo "[7/8] deploying main stack ($MAIN_STACK)..."
 
 PARAMS_JSON="$(mktemp -t bol-params.XXXXXX.json)"
-trap 'rm -f "$PARAMS_JSON"' EXIT
-cat > "$PARAMS_JSON" <<EOF
-[
-  {"ParameterKey":"AllowedEmailDomains","ParameterValue":"$ALLOWED_EMAIL_DOMAINS"},
-  {"ParameterKey":"BackendImageUri","ParameterValue":"$BACKEND_IMAGE_URI"},
-  {"ParameterKey":"BedrockLogsBucket","ParameterValue":"$BEDROCK_LOGS_BUCKET"},
-  {"ParameterKey":"BedrockLogsRegion","ParameterValue":"$BEDROCK_LOGS_REGION"},
-  {"ParameterKey":"ProxyEventsBucket","ParameterValue":"${PROXY_EVENTS_BUCKET:-}"},
-  {"ParameterKey":"ProxyEventsRegions","ParameterValue":"${PROXY_EVENTS_REGIONS:-}"},
-  {"ParameterKey":"CognitoDomainPrefix","ParameterValue":"$COGNITO_DOMAIN_PREFIX"},
-  {"ParameterKey":"CognitoSelfSignUp","ParameterValue":"$COGNITO_SELF_SIGNUP"},
-  {"ParameterKey":"EnableOrganizationsDiscovery","ParameterValue":"$ENABLE_ORGANIZATIONS_DISCOVERY"},
-  {"ParameterKey":"ReaderRoleName","ParameterValue":"$BEDROCK_OPS_LENS_ROLE_NAME"},
-  {"ParameterKey":"StackNamePrefix","ParameterValue":"$MAIN_STACK"},
-  {"ParameterKey":"EdgeShaVersionArn","ParameterValue":"$EDGE_SHA_VERSION_ARN"},
-  {"ParameterKey":"WebAclArn","ParameterValue":"$WEB_ACL_ARN"}
-]
-EOF
+trap 'rm -f "$PARAMS_JSON" "$SCOPE_PARAMS_JSON" "$ER_STACK_FILE" "${ER_FACTS_FILE:-}"' EXIT
+# Re-read scope immediately before the stack update; building the image may
+# have taken minutes while setup-pipeline changed the account selection.
+"$ER_PY" "$ROOT/scripts/deployment-scope.py" --config "$ROOT/config.yaml" \
+    --stack-file "$ER_STACK_FILE" --region "$REGION" \
+    --organizations-enabled "$ENABLE_ORGANIZATIONS_DISCOVERY" --output "$SCOPE_PARAMS_JSON"
+# Existing-resource parameters: values from the resource plan on a first
+# deployment; UsePreviousValue on later runs (only for keys the stack already
+# has, so upgrading a stack created by an older template still works).
+STACK_PARAM_KEYS=""
+if [[ "${ER_USE_PREVIOUS:-0}" == "1" ]]; then
+    STACK_PARAM_KEYS="$("$ER_PY" - "$ER_STACK_FILE" <<'PYKEYS'
+import json, sys
+stack = json.load(open(sys.argv[1]))["Stacks"][0]
+print(",".join(p["ParameterKey"] for p in stack.get("Parameters", [])))
+PYKEYS
+)"
+fi
+STACK_PARAM_KEYS="$STACK_PARAM_KEYS" python3 - "$PARAMS_JSON" "$SCOPE_PARAMS_JSON" \
+    "AllowedEmailDomains=$ALLOWED_EMAIL_DOMAINS" \
+    "BackendImageUri=$BACKEND_IMAGE_URI" \
+    "BedrockLogsBucket=$BEDROCK_LOGS_BUCKET" \
+    "BedrockLogsRegion=$BEDROCK_LOGS_REGION" \
+    "ProxyEventsBucket=${PROXY_EVENTS_BUCKET:-}" \
+    "ProxyEventsRegions=${PROXY_EVENTS_REGIONS:-}" \
+    "CognitoDomainPrefix=$COGNITO_DOMAIN_PREFIX" \
+    "CognitoSelfSignUp=$COGNITO_SELF_SIGNUP" \
+    "EnableOrganizationsDiscovery=$ENABLE_ORGANIZATIONS_DISCOVERY" \
+    "ReaderRoleName=$BEDROCK_OPS_LENS_ROLE_NAME" \
+    "StableResourceNames=$ER_STABLE_NAMES" \
+    "StackNamePrefix=$MAIN_STACK" \
+    "EdgeShaVersionArn=$EDGE_SHA_VERSION_ARN" \
+    "WebAclArn=$WEB_ACL_ARN" <<'PYPARAMS'
+import json, os, sys
+out_path, scope_path, *pairs = sys.argv[1:]
+params = [{"ParameterKey": k, "ParameterValue": v} for k, v in (p.split("=", 1) for p in pairs)]
+params.extend(json.load(open(scope_path)))
+existing = {
+    "ExistingVpcId": "ER_VPC_ID", "ExistingVpcCidr": "ER_VPC_CIDR",
+    "ExistingPrivateSubnetIds": "ER_SUBNET_IDS",
+    "ExistingLambdaSecurityGroupId": "ER_LAMBDA_SG", "ExistingDbSecurityGroupId": "ER_DB_SG",
+    "ExistingCacheSecurityGroupId": "ER_CACHE_SG",
+    "BackendRoleArn": "ER_ROLE_BACKEND", "IngesterRoleArn": "ER_ROLE_INGESTER",
+    "SchemaInitRoleArn": "ER_ROLE_SCHEMA_INIT", "PrewarmRoleArn": "ER_ROLE_PREWARM",
+    "PreSignUpRoleArn": "ER_ROLE_PRE_SIGNUP", "PostConfirmRoleArn": "ER_ROLE_POST_CONFIRM",
+}
+stack_keys = set(k for k in os.environ.get("STACK_PARAM_KEYS", "").split(",") if k)
+use_previous = os.environ.get("ER_USE_PREVIOUS", "0") == "1"
+for key, env in existing.items():
+    if use_previous and key in stack_keys:
+        params.append({"ParameterKey": key, "UsePreviousValue": True})
+    else:
+        params.append({"ParameterKey": key, "ParameterValue": os.environ.get(env, "")})
+# A re-run without resource choices keeps the stack's web ACL (possibly an
+# operator-supplied one) rather than re-deriving it from the edge stack.
+if use_previous and "WebAclArn" in stack_keys:
+    params[:] = [p for p in params if p["ParameterKey"] != "WebAclArn"]
+    params.append({"ParameterKey": "WebAclArn", "UsePreviousValue": True})
+with open(out_path, "w") as fh:
+    json.dump(params, fh)
+PYPARAMS
+
+# Published Lambda versions can still use a generated role while the main
+# update switches $LATEST to a supplied role. Install retention before the
+# update removes that role from the stack.
+RETAIN_MAIN_ROLES="$("$ER_PY" - "$ER_STACK_FILE" "$PARAMS_JSON" <<'PYRETENTION'
+import json, sys
+stacks = json.load(open(sys.argv[1])).get("Stacks", [])
+previous = {p["ParameterKey"]: p.get("ParameterValue", "")
+            for p in stacks[0].get("Parameters", [])} if stacks else {}
+planned = {p["ParameterKey"]: p.get("ParameterValue", "")
+           for p in json.load(open(sys.argv[2]))}
+roles = {
+    "BackendLambdaRole": "BackendRoleArn", "IngesterLambdaRole": "IngesterRoleArn",
+    "SchemaInitLambdaRole": "SchemaInitRoleArn", "PrewarmLambdaRole": "PrewarmRoleArn",
+    "PreSignUpFnRole": "PreSignUpRoleArn", "PostConfirmFnRole": "PostConfirmRoleArn",
+}
+if stacks:
+    for role, parameter in roles.items():
+        if planned.get(parameter) and not previous.get(parameter):
+            print(role)
+PYRETENTION
+)"
+if [[ -n "$RETAIN_MAIN_ROLES" ]]; then
+    RETAIN_MAIN_ARGS=()
+    while IFS= read -r role; do
+        RETAIN_MAIN_ARGS+=(--retain-role "$role")
+    done <<< "$RETAIN_MAIN_ROLES"
+    "$ER_PY" "$ROOT/scripts/prepare-edge-upgrade.py" --kind main \
+        --stack-name "$MAIN_STACK" --region "$REGION" \
+        --template-bucket "$CFN_STAGING_BUCKET" "${RETAIN_MAIN_ARGS[@]}" \
+        ${ER_CFN_ROLE_ARGS[@]+"${ER_CFN_ROLE_ARGS[@]}"}
+fi
 
 # `aws cloudformation deploy` accepts file:// only for tags and template-body —
 # not parameters. Use create-change-set + execute-change-set, which do.
@@ -712,24 +829,28 @@ if [[ "$EXISTING_STATUS" == "NONE" || "$EXISTING_STATUS" == "ROLLBACK_COMPLETE" 
         --tags "Key=app,Value=bedrock-ops-lens" \
                "Key=stack,Value=$MAIN_STACK" \
         --region "$REGION" \
+        ${ER_CFN_ROLE_ARGS[@]+"${ER_CFN_ROLE_ARGS[@]}"} \
         --query 'StackId' --output text
     echo "    waiting for create-complete (this is the long pole — Aurora ~5 min, CloudFront ~5 min)"
     aws cloudformation wait stack-create-complete --stack-name "$MAIN_STACK" --region "$REGION"
 else
     echo "    updating existing stack (status was $EXISTING_STATUS)"
-    UPDATE_OUT="$(aws cloudformation update-stack \
+    if UPDATE_OUT="$(aws cloudformation update-stack \
         --stack-name "$MAIN_STACK" \
         --template-url "$MAIN_TEMPLATE_URL" \
         --capabilities CAPABILITY_IAM CAPABILITY_AUTO_EXPAND \
         --parameters "file://$PARAMS_JSON" \
         --tags "Key=app,Value=bedrock-ops-lens" \
                "Key=stack,Value=$MAIN_STACK" \
-        --region "$REGION" 2>&1)" || true   # non-zero on "No updates" — must not kill the script (set -e)
-    if echo "$UPDATE_OUT" | grep -q "No updates are to be performed"; then
-        echo "    (no template diff — skipping wait)"
-    else
+        --region "$REGION" \
+        ${ER_CFN_ROLE_ARGS[@]+"${ER_CFN_ROLE_ARGS[@]}"} 2>&1)"; then
         echo "    waiting for update-complete"
         aws cloudformation wait stack-update-complete --stack-name "$MAIN_STACK" --region "$REGION"
+    elif [[ "$UPDATE_OUT" == *"No updates are to be performed"* ]]; then
+        echo "    (no template diff — skipping wait)"
+    else
+        echo "ERROR: main stack update was rejected: $UPDATE_OUT" >&2
+        exit 1
     fi
 fi
 

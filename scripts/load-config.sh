@@ -9,8 +9,9 @@
 #
 # After sourcing, these vars are exported:
 #   DEPLOY_REGION
-#   MONITORED_ACCOUNTS_MODE       single|explicit|discover-org
+#   MONITORED_ACCOUNTS_MODE       single|explicit|discover-org|discover-ou
 #   MONITORED_ACCOUNTS_IDS_CSV    "111,222,..." (only when mode=explicit)
+#   MONITORED_OU_IDS_CSV          "ou-...,ou-..." (only when mode=discover-ou)
 #   MONITORED_REGIONS_PRESET      us-major|us-eu-apac|all|explicit
 #   MONITORED_REGIONS_CSV         "us-east-1,us-west-2,..." (resolved)
 #   INVOCATION_LOGGING_ENABLED    true|false
@@ -36,6 +37,7 @@ def out(k, v): print(f'export {k}="{v}"')
 out("DEPLOY_REGION", cfg.deploy_region)
 out("MONITORED_ACCOUNTS_MODE", cfg.monitored_accounts.mode)
 out("MONITORED_ACCOUNTS_IDS_CSV", ",".join(cfg.monitored_accounts.ids))
+out("MONITORED_OU_IDS_CSV", ",".join(cfg.monitored_accounts.ou_ids))
 out("MONITORED_REGIONS_PRESET", cfg.monitored_regions.preset)
 out("MONITORED_REGIONS_CSV", ",".join(cfg.resolved_regions()))
 out("INVOCATION_LOGGING_ENABLED", str(cfg.invocation_logging.enabled).lower())
